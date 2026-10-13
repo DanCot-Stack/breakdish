@@ -1557,6 +1557,23 @@ td:first-child {
   margin-top: 18px;
 }
 
+.logout-button {
+  background: #1e181e;
+  border-color: rgba(213, 177, 107, .55);
+  color: var(--cream);
+}
+
+.logout-button:hover {
+  background: rgba(213, 177, 107, .12);
+  border-color: var(--gold);
+  color: var(--gold-light);
+}
+
+.logout-button:focus-visible {
+  outline: 3px solid var(--gold-light);
+  outline-offset: 3px;
+}
+
 .account-panel [hidden] {
   display: none;
 }
