@@ -36,7 +36,8 @@ test("Better Auth registration, login, persistent sessions, own-profile access a
     ...options,
     headers: { origin: "http://localhost:5500", "x-forwarded-for": testIp, ...(options.headers || {}) }
   });
-  const cookieFrom = (response) => (response.headers.getSetCookie?.() || [])
+  const setCookiesFrom = (response) => response.headers.getSetCookie?.() || [];
+  const cookieFrom = (response) => setCookiesFrom(response)
     .map((cookie) => cookie.split(";", 1)[0])
     .join("; ");
 
@@ -111,22 +112,52 @@ test("Better Auth registration, login, persistent sessions, own-profile access a
     response = await fetchFromSite("/api/auth/sign-in/email", {
       method: "POST",
       headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password: "correct-horse-battery-staple", rememberMe: false })
+    });
+    assert.equal(response.status, 200);
+    const sessionCookie = setCookiesFrom(response).find((setCookie) => /session_token=/i.test(setCookie));
+    assert.ok(sessionCookie, "Login with Remember me unchecked should set a session cookie.");
+    assert.doesNotMatch(sessionCookie, /(?:max-age|expires)=/i,
+      "Unchecked Remember me must use a browser-session cookie without a persistent expiry.");
+    cookie = cookieFrom(response);
+    response = await fetchFromSite("/api/me", { headers: { cookie } });
+    assert.equal(response.status, 200, "A browser-session cookie should authenticate subsequent requests.");
+    response = await fetchFromSite("/api/auth/sign-out", {
+      method: "POST", headers: { cookie, "content-type": "application/json" }, body: "{}"
+    });
+    assert.equal(response.status, 200, "Logout should invalidate a non-persistent session normally.");
+    response = await fetchFromSite("/api/me", { headers: { cookie } });
+    assert.equal(response.status, 401);
+
+    response = await fetchFromSite("/api/auth/sign-in/email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ email, password: "incorrect-password" })
     });
     assert.ok(response.status >= 400 && response.status < 500, "Invalid credentials must be rejected.");
     assert.equal(cookieFrom(response), "", "Failed login must not establish a session.");
 
+    const loginStartedAt = Date.now();
     response = await fetchFromSite("/api/auth/sign-in/email", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email, password: "correct-horse-battery-staple" })
+      body: JSON.stringify({ email, password: "correct-horse-battery-staple", rememberMe: true })
     });
     assert.equal(response.status, 200);
+    const persistentSessionCookie = setCookiesFrom(response).find((setCookie) => /session_token=/i.test(setCookie));
+    assert.ok(persistentSessionCookie, "Login with Remember me checked should set a session cookie.");
+    assert.match(persistentSessionCookie, /(?:^|;\s*)max-age=1209600(?:;|$)/i,
+      "Remembered login cookies should persist for the configured 14 days.");
     cookie = cookieFrom(response);
     assert.ok(cookie, "Login should establish a session.");
 
     response = await fetchFromSite("/api/me", { headers: { cookie } });
     assert.equal(response.status, 200);
+    const loggedInSession = (await response.json()).session;
+    const sessionExpiry = Date.parse(loggedInSession.expiresAt);
+    const fourteenDays = 60 * 60 * 24 * 14 * 1000;
+    assert.ok(Math.abs(sessionExpiry - (loginStartedAt + fourteenDays)) < 15_000,
+      "The authenticated database session should expire 14 days after login.");
 
     response = await fetchFromSite("/api/me/profile", { headers: { cookie } });
     assert.equal(response.status, 200);

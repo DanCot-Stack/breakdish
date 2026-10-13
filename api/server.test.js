@@ -1,5 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+
+test("login page sends the checked state of Remember me as a boolean", async () => {
+  const loginHtml = await readFile(new URL("../login.html", import.meta.url), "utf8");
+  const frontendScript = await readFile(new URL("../script.js", import.meta.url), "utf8");
+
+  assert.match(loginHtml, /<label class="remember-me-label" for="login-remember-me">[\s\S]*?<input id="login-remember-me" name="rememberMe" type="checkbox" checked>[\s\S]*?<span>Remember me<\/span>/);
+  assert.match(frontendScript, /rememberMe:\s*form\.elements\.namedItem\("rememberMe"\)\?\.checked === true/,
+    "Checked maps to true and unchecked maps to false for Better Auth.");
+  assert.match(frontendScript, /body:\s*JSON\.stringify\(payload\)/);
+  assert.doesNotMatch(frontendScript, /\b(?:localStorage|sessionStorage)\b/,
+    "The frontend must not persist passwords or session credentials in browser storage.");
+});
 
 const sentEmails = [];
 const providerResponses = [];
@@ -165,7 +178,7 @@ test("contact API emails accepted submissions and safely handles failures, abuse
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("access-control-allow-credentials"), "true");
 
-    const authPayload = JSON.stringify({ email: "player@example.com", password: "correct-horse-battery-staple" });
+    const authPayload = JSON.stringify({ email: "player@example.com", password: "correct-horse-battery-staple", rememberMe: true });
     response = await fetch(`${endpoint}/api/auth/sign-in/email`, {
       method: "POST",
       headers: { origin: "http://localhost:5500", "content-type": "application/json" },
@@ -173,6 +186,15 @@ test("contact API emails accepted submissions and safely handles failures, abuse
     });
     assert.equal(response.status, 200);
     assert.equal(receivedAuthBody, authPayload, "The size guard should preserve the body Better Auth receives.");
+
+    const noRememberPayload = JSON.stringify({ email: "player@example.com", password: "correct-horse-battery-staple", rememberMe: false });
+    response = await fetch(`${endpoint}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { origin: "http://localhost:5500", "content-type": "application/json" },
+      body: noRememberPayload
+    });
+    assert.equal(response.status, 200);
+    assert.equal(receivedAuthBody, noRememberPayload, "The API must forward Remember me unchecked unchanged to Better Auth.");
 
     const authCallsBeforeOversizedBodies = authHandlerCalls;
     response = await fetch(`${endpoint}/api/auth/sign-in/email`, {

@@ -75,6 +75,10 @@ export function createAuth({ env = process.env, database, resendClient } = {}) {
     secret,
     trustedOrigins: parseTrustedOrigins(env),
     database,
+    session: {
+      expiresIn: 60 * 60 * 24 * 14,
+      disableSessionRefresh: true
+    },
     emailAndPassword: {
       enabled: true,
       minPasswordLength: 12,

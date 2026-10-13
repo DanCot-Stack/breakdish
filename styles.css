@@ -1404,6 +1404,32 @@ td:first-child {
   color: #9b8b94;
 }
 
+.contact-form .remember-me-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  min-height: 44px;
+  margin: 8px 0 0;
+  color: #ddd0d6;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.contact-form .remember-me-label input[type="checkbox"] {
+  flex: 0 0 20px;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--gold);
+}
+
+.contact-form .remember-me-label input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--gold-light);
+  outline-offset: 3px;
+}
+
 .contact-form [type="submit"]:disabled {
   cursor: wait;
   opacity: .72;

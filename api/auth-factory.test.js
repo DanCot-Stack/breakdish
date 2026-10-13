@@ -22,3 +22,24 @@ test("production authentication requires email delivery for verification and rec
   assert.throws(() => createAuth({ env: { ...baseEnv, NODE_ENV: "production", BETTER_AUTH_URL: "https://api.example.test" }, database }), /email delivery/);
   assert.throws(() => createAuth({ env: { ...baseEnv, NODE_ENV: "production", BETTER_AUTH_URL: "http://api.example.test" }, database }), /HTTPS/);
 });
+
+test("production authentication uses a fixed 14-day session and secure cookies", async () => {
+  const auth = createAuth({
+    env: {
+      NODE_ENV: "production",
+      BETTER_AUTH_SECRET: "x".repeat(32),
+      BETTER_AUTH_URL: "https://api.break-dish.com",
+      ALLOWED_ORIGINS: "https://break-dish.com",
+      RESEND_API_KEY: "test-key",
+      CONTACT_FROM_EMAIL: "noreply@break-dish.com"
+    },
+    database: {},
+    resendClient: { emails: { async send() { return { data: { id: "test" }, error: null }; } } }
+  });
+
+  assert.equal(auth.options.session.expiresIn, 60 * 60 * 24 * 14);
+  assert.equal(auth.options.session.disableSessionRefresh, true);
+  assert.equal(auth.options.advanced.useSecureCookies, true,
+    "Remember me must preserve Better Auth's secure production-cookie configuration.");
+  await auth.$context.catch(() => null);
+});

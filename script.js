@@ -234,7 +234,7 @@ document.querySelectorAll("[data-auth-form]").forEach((form) => {
     const values = new FormData(form);
     const payload = kind === "signup"
       ? { name: values.get("name").trim(), email: values.get("email").trim(), password: values.get("password"), callbackURL: window.location.origin + "/" }
-      : { email: values.get("email").trim(), password: values.get("password"), rememberMe: true };
+      : { email: values.get("email").trim(), password: values.get("password"), rememberMe: form.elements.namedItem("rememberMe")?.checked === true };
     const originalText = submitButton?.textContent;
     if (submitButton) {
       submitButton.disabled = true;
