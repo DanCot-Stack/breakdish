@@ -1,0 +1,35 @@
+{
+  "name": "break-dish-contact-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BREAK DISH API for contact and member authentication",
+  "type": "module",
+  "main": "server.js",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "auth:migrate": "pnpm exec auth migrate --config ./auth.js --yes",
+    "auth:check": "pnpm exec auth check --config ./auth.js",
+    "auth:secret": "auth secret",
+    "db:up": "node migrate.js up",
+    "db:down": "node migrate.js down",
+    "test:integration": "node --test server.integration.test.js"
+  },
+  "engines": {
+    "node": ">=22.12.0 <25.0.0"
+  },
+  "dependencies": {
+    "better-auth": "^1.7.7",
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "node-pg-migrate": "^9.0.0",
+    "pg": "^8.23.1",
+    "resend": "^6.5.2"
+  },
+  "devDependencies": {
+    "auth": "1.7.7"
+  }
+}

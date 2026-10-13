@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#100e11">
+  <meta name="description" content="Privacy information for the BREAK DISH website and contact form.">
+  <meta name="breakdish-api-url" content="">
+  <title>Privacy & Cookies | BREAK DISH</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header legal-header">
+    <a class="brand" href="index.html#home" aria-label="Break Dish Pool League home">
+      <img class="brand-emblem" src="assets/break-dish-pool-league-emblem.png" alt="Break Dish Pool League">
+      <span class="brand-tagline">Home of Pool</span>
+    </a>
+    <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav" aria-label="Open navigation"><span></span><span></span><span></span></button>
+    <nav id="primary-nav" class="primary-nav" aria-label="Main navigation">
+      <a href="index.html#home">Home</a><a href="index.html#fixtures">Fixtures</a><a href="index.html#results">Results</a><a href="index.html#tables">League Tables</a><a href="index.html#leagues">Leagues</a><a href="index.html#players">Teams & Players</a><a href="index.html#news">News</a><a href="join-league.html">Join a League</a><a href="create-league.html">Create a League</a><a href="login.html">Log In</a><a href="signup.html">Sign Up</a><a class="nav-cta" href="index.html#contact">Contact Us <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+  <main class="legal-main" id="main">
+    <div class="legal-heading">
+      <div class="section-kicker">BREAK DISH / PRIVACY</div>
+      <h1>PRIVACY &<br><em>COOKIES.</em></h1>
+      <p>This page describes the current website, email-only contact form and player account features. It is a pre-launch draft because the project does not identify the website operator or provide a privacy contact.</p>
+    </div>
+    <aside class="legal-notice"><strong>Details needed before launch</strong>The website operator must add their real name and contact details, confirm the lawful basis and retention arrangements, and provide a working way for people to exercise their rights. Those facts are not present in this project, so they are not guessed here.</aside>
+    <div class="legal-content">
+      <section>
+        <h2>Who is responsible?</h2>
+        <p>The current project does not state the legal name or contact details of the person or organisation responsible for this website and its contact-form data. This information must be supplied by the operator before the notice is treated as complete.</p>
+      </section>
+      <section>
+        <h2>Information sent through the contact form</h2>
+        <p>The form asks for your name, email address, enquiry topic and message. When the API handles a request, it also uses the connection IP address temporarily for rate limiting. The API's rate-limit window is 15 minutes; its counters are held in process memory and are not message storage.</p>
+        <p>The API sends accepted enquiries to the configured inbox through Resend. It does not save messages to a database or local files. Resend and the recipient's email service may process or retain the email under their own service settings. This project does not define a retention period for those copies.</p>
+      </section>
+      <section>
+        <h2>Player accounts and profiles</h2>
+        <p>When you register, the account service processes your name, email address and password credential. The password is handled by Better Auth and stored as a password hash in the PostgreSQL account database, not as plain text. When you open your account page, BREAK DISH creates or updates a player profile containing your display name and any location or biography you choose to provide. The current API exposes these profile fields only to the signed-in account; public player pages are not available yet.</p>
+        <p>The account service uses a session cookie to keep you signed in. Account and profile data is stored in PostgreSQL. This project does not yet provide an account deletion or profile deletion feature, so the operator must set and publish a retention and deletion process before launch.</p>
+      </section>
+      <section>
+        <h2>Why information is used</h2>
+        <p>The form information is used to receive and respond to the enquiry you choose to send. Account details are used to create and authenticate your account and maintain the player profile you edit. The website operator has not documented the lawful basis for these uses in the project; the operator must determine and state the applicable basis before launch.</p>
+      </section>
+      <section>
+        <h2>Service providers and other requests</h2>
+        <p>Resend is used by the API to deliver contact emails and, when configured, account verification and password recovery emails. The site requests its typefaces from Google Fonts, so a visitor's browser connects to Google to retrieve those font files. PostgreSQL stores account, session and profile data. The API is intended to run as a separate Render Web Service; if that deployment is used, Render will also host the API and database. Confirm the actual hosting arrangement and any international-transfer details before launch.</p>
+        <p>This project does not include an analytics or advertising script, and it does not use browser local storage or session storage. The Better Auth API sets a session cookie when a visitor signs in. Check the final hosting and provider configuration for any additional cookies, logs or tracking before publication.</p>
+      </section>
+      <section>
+        <h2>Retention</h2>
+        <p>The contact API has no database or file archive for submitted messages. Emails may remain in the email provider or receiving mailbox according to the relevant account settings. Account and profile information remains in PostgreSQL; this project does not currently define a retention period or offer account deletion. The operator must choose and explain retention and deletion arrangements for account data and email copies before launch. Hosting and security-log retention also needs to be confirmed for the final deployment.</p>
+      </section>
+      <section>
+        <h2>Your privacy rights</h2>
+        <p>Depending on the circumstances and lawful basis, UK data-protection law provides rights concerning personal information. The operator must publish a real contact route for privacy requests and confirm which rights apply. Information about rights and making a complaint is available from the <a href="https://ico.org.uk/for-the-public/">Information Commissioner's Office</a>.</p>
+      </section>
+      <section id="cookies">
+        <h2>Cookies and similar technologies</h2>
+        <p>No cookie banner, analytics code, advertising tracker or first-party cookie code was found in the current project files. This page therefore has no optional cookie controls. Recheck the live site and all hosting or third-party integrations before launch; if they add non-essential storage or tracking, update this notice and implement the required choice controls.</p>
+      </section>
+      <section>
+        <h2>Changes to this notice</h2>
+        <p>Update this page when the website's data use, providers or contact process changes. The website operator and an appropriate adviser should review this draft before it is used as the final privacy notice.</p>
+      </section>
+    </div>
+  </main>
+  <footer class="site-footer">
+    <div class="footer-main"><a class="brand footer-brand" href="index.html#home" aria-label="Break Dish Pool League home"><img class="brand-emblem" src="assets/break-dish-pool-league-emblem.png" alt="Break Dish Pool League"><span class="brand-tagline">Home of Pool</span></a><p>One game. A thousand stories.<br>Welcome to Break Dish.</p><div class="footer-links"><a href="index.html#about">About</a><a href="index.html#leagues">Leagues</a><a href="index.html#contact">Contact</a></div></div>
+    <div class="footer-bottom"><span>© <span id="year"></span> BREAK DISH. ALL RIGHTS RESERVED.</span><span>BUILT FOR THE UK POOL COMMUNITY.</span><span><a href="privacy.html" aria-current="page">Privacy</a> · <a href="terms.html">Terms</a> · <a href="privacy.html#cookies">Cookies</a></span></div>
+  </footer>
+</body>
+</html>
