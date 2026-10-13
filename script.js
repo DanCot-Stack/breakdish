@@ -57,14 +57,12 @@ if (contactForm && formStatus) {
     formStatus.textContent = "Sending your enquiry…";
 
     try {
-      const endpoint = `${getApiBaseUrl()}/api/contact`;
-      const response = await fetch(endpoint, {
+      const { response, payload: result } = await apiRequest("/api/contact", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
         credentials: "omit"
       });
-      const result = await response.json().catch(() => ({}));
 
       if (!response.ok) {
         throw new Error(result.error || "We couldn't send your enquiry. Please try again.");
@@ -97,13 +95,29 @@ function getApiBaseUrl() {
 }
 
 async function apiRequest(path, options = {}) {
+  const { credentials = "include", ...requestOptions } = options;
   const response = await fetch(`${getApiBaseUrl()}${path}`, {
-    ...options,
-    credentials: "include",
-    headers: { ...(options.headers || {}) }
+    ...requestOptions,
+    credentials,
+    headers: { ...(requestOptions.headers || {}) }
   });
   const payload = await response.json().catch(() => ({}));
   return { response, payload };
+}
+
+function getSafeNextPage(candidate) {
+  const fallback = "account.html";
+  if (typeof candidate !== "string" || !candidate.trim()) return fallback;
+
+  try {
+    const destination = new URL(candidate, window.location.href);
+    const page = destination.pathname.split("/").pop();
+    const allowedPages = new Set(["account.html", "join-league.html", "create-league.html", "competition.html"]);
+    if (destination.origin !== window.location.origin || !allowedPages.has(page)) return fallback;
+    return `${page}${destination.search}${destination.hash}`;
+  } catch {
+    return fallback;
+  }
 }
 
 function setStatus(status, message, state) {
@@ -155,6 +169,17 @@ document.querySelectorAll("[data-auth-form]").forEach((form) => {
   password?.addEventListener("input", validateConfirmation);
   confirmation?.addEventListener("input", validateConfirmation);
 
+  const switchLink = form.querySelector(".member-switch a");
+  if (switchLink) {
+    const destination = kind === "signup" ? "login.html" : "signup.html";
+    const nextPage = getSafeNextPage(new URLSearchParams(window.location.search).get("next"));
+    switchLink.href = `${destination}?next=${encodeURIComponent(nextPage)}`;
+  }
+
+  if (kind === "login" && new URLSearchParams(window.location.search).get("signed-out") === "1") {
+    setStatus(status, "You have been signed out.", "success");
+  }
+
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     validateConfirmation();
@@ -200,8 +225,7 @@ document.querySelectorAll("[data-auth-form]").forEach((form) => {
 
       setStatus(status, kind === "signup" ? "Your account is ready. Taking you to your profile…" : "You're signed in. Taking you to your account…", "success");
       const requestedPage = new URLSearchParams(window.location.search).get("next");
-      const nextPage = requestedPage === "account.html" ? requestedPage : "account.html";
-      window.location.assign(nextPage);
+      window.location.assign(getSafeNextPage(requestedPage));
     } catch (error) {
       setStatus(status, error instanceof TypeError
         ? "We couldn't reach the account service. Your details are still here; please try again."
@@ -320,6 +344,56 @@ function createTextElement(tagName, className, text) {
   if (className) element.className = className;
   if (text !== undefined) element.textContent = text;
   return element;
+}
+
+const homeLeagueDirectory = document.querySelector("[data-home-league-directory]");
+if (homeLeagueDirectory) {
+  const homeLeagueStatus = document.querySelector("[data-home-league-status]");
+  const emptyState = document.querySelector("[data-home-league-empty]");
+
+  const loadHomeLeagueDirectory = async () => {
+    homeLeagueDirectory.replaceChildren();
+    if (emptyState) emptyState.hidden = true;
+    setStatus(homeLeagueStatus, "Loading public leagues…", "pending");
+    try {
+      const { response, payload } = await apiRequest("/api/leagues");
+      if (!response.ok) throw new Error(payload.error || "We couldn't load public leagues.");
+      const leagues = Array.isArray(payload.leagues) ? payload.leagues : [];
+      if (!leagues.length) {
+        setStatus(homeLeagueStatus, "No public leagues are listed yet.", "success");
+        if (emptyState) emptyState.hidden = false;
+        return;
+      }
+
+      leagues.forEach((league) => {
+        const card = createTextElement("article", "league-directory-card");
+        const kicker = createTextElement("div", "section-kicker", league.status === "active" ? "ACTIVE LEAGUE" : "OPEN LEAGUE");
+        const title = createTextElement("h3", "", league.name);
+        const location = createTextElement("p", "league-card-location", league.location || "Location not provided");
+        const description = createTextElement("p", "league-card-description", league.description || "The organiser has not added a description yet.");
+        const details = createTextElement("div", "league-card-details");
+        details.append(
+          createTextElement("span", "", league.joinPolicy === "open" ? "Open joining" : "Approval required"),
+          createTextElement("span", "", `${league.memberCount || 0} active members`)
+        );
+        const detailsLink = createTextElement("a", "league-details-link", "Seasons, divisions & teams");
+        detailsLink.href = `competition.html?id=${encodeURIComponent(league.id)}`;
+        const actionArea = createTextElement("div", "league-card-action");
+        const directoryLink = createTextElement("a", "button button-gold", "Open league directory");
+        directoryLink.href = "join-league.html#league-directory";
+        actionArea.append(directoryLink);
+        card.append(kicker, title, location, description, details, detailsLink, actionArea);
+        homeLeagueDirectory.append(card);
+      });
+      setStatus(homeLeagueStatus, `${leagues.length} public ${leagues.length === 1 ? "league" : "leagues"} available.`, "success");
+    } catch (error) {
+      setStatus(homeLeagueStatus, error instanceof TypeError
+        ? "We couldn't reach the league service. Public league listings are unavailable right now."
+        : error.message, "error");
+    }
+  };
+
+  loadHomeLeagueDirectory();
 }
 
 function appendLoginLink(container, text, returnPage) {
