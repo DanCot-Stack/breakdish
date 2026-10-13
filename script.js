@@ -127,22 +127,68 @@ function setStatus(status, message, state) {
 }
 
 async function updateAccountNavigation() {
-  if (!nav) return;
-  const existingAccountLink = nav.querySelector('a[href="account.html"]');
+  const accountActions = document.querySelector(".header-account-actions");
+  const navigation = document.querySelector("#primary-nav");
+  if (!accountActions || !navigation) return;
+  const pageHasLogoutAction = Boolean(document.querySelector("[data-logout]"));
+  const loginLink = accountActions.querySelector('a[href="login.html"]');
+  const signupLink = accountActions.querySelector('a[href="signup.html"]');
+
   try {
     const { response } = await apiRequest("/api/me");
     const signedIn = response.ok;
-    nav.querySelectorAll('a[href="login.html"], a[href="signup.html"]').forEach((link) => {
-      link.hidden = signedIn;
-    });
-    if (signedIn && !existingAccountLink) {
-      const accountLink = document.createElement("a");
+    if (loginLink) loginLink.hidden = signedIn;
+    if (signupLink) signupLink.hidden = signedIn;
+
+    let accountLink = accountActions.querySelector("[data-nav-account]");
+    let logoutButton = navigation.querySelector("[data-nav-logout]");
+    let logoutStatus = navigation.querySelector("[data-nav-auth-status]");
+    if (signedIn && !accountLink) {
+      accountLink = createTextElement("a", "header-login", "My Account");
       accountLink.href = "account.html";
-      accountLink.textContent = "My Account";
-      const contactLink = nav.querySelector(".nav-cta");
-      nav.insertBefore(accountLink, contactLink || null);
+      accountLink.dataset.navAccount = "";
+      if (window.location.pathname.endsWith("/account.html")) accountLink.setAttribute("aria-current", "page");
+      accountActions.insertBefore(accountLink, loginLink || accountActions.firstChild);
     }
-    if (existingAccountLink) existingAccountLink.hidden = !signedIn;
+    if (signedIn && !logoutButton && !pageHasLogoutAction) {
+      logoutButton = createTextElement("button", "nav-logout", "Log out");
+      logoutButton.type = "button";
+      logoutButton.dataset.navLogout = "";
+      navigation.append(logoutButton);
+
+      logoutStatus = createTextElement("span", "nav-auth-status");
+      logoutStatus.dataset.navAuthStatus = "";
+      logoutStatus.setAttribute("role", "status");
+      logoutStatus.setAttribute("aria-live", "polite");
+      logoutStatus.setAttribute("aria-atomic", "true");
+      logoutStatus.hidden = true;
+      navigation.append(logoutStatus);
+
+      logoutButton.addEventListener("click", async () => {
+        logoutButton.disabled = true;
+        logoutStatus.hidden = false;
+        setStatus(logoutStatus, "Signing out…", "pending");
+        try {
+          const { response } = await apiRequest("/api/auth/sign-out", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}"
+          });
+          if (!response.ok) throw new Error("We couldn't sign you out. Please try again.");
+          window.location.assign("login.html?signed-out=1");
+        } catch (error) {
+          logoutButton.disabled = false;
+          setStatus(logoutStatus, error instanceof TypeError
+            ? "We couldn't reach the account service. Please try again."
+            : error.message, "error");
+        }
+      });
+    }
+    if (accountLink) accountLink.hidden = !signedIn;
+    if (!signedIn) {
+      logoutButton?.remove();
+      logoutStatus?.remove();
+    }
   } catch {
     // Leave the standard sign-in links available when the API cannot be reached.
   }
