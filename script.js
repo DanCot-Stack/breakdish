@@ -1170,7 +1170,7 @@ if (competitionPage) {
     }).format(date);
   };
 
-  const createFixtureDraft = (season, activeMembers) => {
+  const createFixtureDraft = (season, activeMembers, doublesEntries) => {
     const row = createTextElement("fieldset", "fixture-entry-row");
     row.append(createTextElement("legend", "", `Fixture ${document.querySelectorAll(".fixture-entry-row").length + 1}`));
     const field = (label, name, type, options = {}) => {
@@ -1179,7 +1179,7 @@ if (competitionPage) {
       return control;
     };
     const matchType = field("Competition type", "type", "select", {
-      choices: [["team_league", "Team League"], ["singles_league", "Singles League"]]
+      choices: [["team_league", "Team League"], ["singles_league", "Singles League"], ["doubles_league", "Doubles League"]]
     });
     const teamFields = createTextElement("div", "fixture-side-fields");
     const teamChoices = season.teams.filter((team) => team.status === "active").map((team) => [team.id, team.name]);
@@ -1200,6 +1200,18 @@ if (competitionPage) {
     const playerTwo = addField(singlesFields, "Player on side 2", "playerTwo", "select", {
       required: true, choices: memberChoices.length ? [["", "Choose a player"], ...memberChoices] : [["", "No active members"]]
     });
+    const doublesFields = createTextElement("div", "fixture-side-fields");
+    const pairChoices = doublesEntries.map((entry) => [entry.id, entry.displayName]);
+    const pairOptions = pairChoices.length ? [["", "Choose an approved pair"], ...pairChoices] : [["", "No approved pairs with two active members"]];
+    const pairOne = addField(doublesFields, "Approved pair on side 1", "doublesEntryOne", "select", {
+      required: true, choices: pairOptions
+    });
+    const pairTwo = addField(doublesFields, "Approved pair on side 2", "doublesEntryTwo", "select", {
+      required: true, choices: pairOptions
+    });
+    if (!doublesEntries.length) {
+      doublesFields.append(createTextElement("p", "management-help", "No approved Doubles League pairs with exactly two active league members are available for this season."));
+    }
     const scheduledAt = field("Date and time", "scheduledAt", "datetime-local", { required: true });
     const venue = field("Venue (optional)", "venue", "text", { maxLength: 160, placeholder: "Venue name" });
     const remove = createTextElement("button", "button button-quiet button-compact fixture-remove", "Remove fixture row");
@@ -1207,14 +1219,17 @@ if (competitionPage) {
     remove.addEventListener("click", () => {
       if (row.parentElement.children.length > 1) row.remove();
     });
-    row.append(teamFields, singlesFields, remove);
+    row.append(teamFields, singlesFields, doublesFields, remove);
     const syncType = () => {
       const teamMode = matchType.value === "team_league";
+      const doublesMode = matchType.value === "doubles_league";
       teamFields.hidden = !teamMode;
-      singlesFields.hidden = teamMode;
+      singlesFields.hidden = teamMode || doublesMode;
+      doublesFields.hidden = !doublesMode;
       [homeTeam, awayTeam].forEach((control) => { control.disabled = !teamMode; });
       division.disabled = !teamMode;
       [playerOne, playerTwo].forEach((control) => { control.disabled = teamMode; });
+      [pairOne, pairTwo].forEach((control) => { control.disabled = !doublesMode; });
     };
     matchType.addEventListener("change", syncType);
     syncType();
@@ -1294,7 +1309,7 @@ if (competitionPage) {
     return controls;
   };
 
-  const renderSeasonFixtures = (season, isManager, matches, activeMembers) => {
+  const renderSeasonFixtures = (season, isManager, matches, activeMembers, doublesEntries, doublesEntriesError) => {
     const section = createTextElement("section", "competition-fixtures");
     section.append(createTextElement("div", "section-kicker", "SCHEDULE"), createTextElement("h4", "", "Upcoming fixtures"));
     const divisionChoices = [["", "All divisions"]];
@@ -1337,12 +1352,13 @@ if (competitionPage) {
 
     if (isManager && season.status !== "completed") {
       const form = makeForm("competition-form fixture-create-form", "Add one or more fixtures");
-      form.append(createTextElement("p", "management-help", "Build several fixtures in this session. Team fixtures use active teams; Singles fixtures use active registered league members."));
+      form.append(createTextElement("p", "management-help", "Build several fixtures in this session. Team fixtures use active teams, Singles fixtures use active league members, and Doubles fixtures use approved pairs."));
+      if (doublesEntriesError) form.append(statusElement(`Approved Doubles League pairs could not be loaded: ${doublesEntriesError}`));
       const rows = createTextElement("div", "fixture-entry-list");
-      rows.append(createFixtureDraft(season, activeMembers));
+      rows.append(createFixtureDraft(season, activeMembers, doublesEntries));
       const addRow = createTextElement("button", "button button-quiet button-compact", "Add another fixture");
       addRow.type = "button";
-      addRow.addEventListener("click", () => rows.append(createFixtureDraft(season, activeMembers)));
+      addRow.addEventListener("click", () => rows.append(createFixtureDraft(season, activeMembers, doublesEntries)));
       const feedback = statusElement();
       form.append(rows, addRow, makeButton("Create fixtures"), feedback);
       form.addEventListener("submit", async (event) => {
@@ -1364,9 +1380,15 @@ if (competitionPage) {
             if (type === "team_league") {
               if (value("homeTeamId") === value("awayTeamId")) throw new Error("A team cannot play itself. Choose two different teams.");
               details = { ...details, divisionId: value("divisionId") || null, homeTeamId: value("homeTeamId"), awayTeamId: value("awayTeamId") };
-            } else {
+            } else if (type === "singles_league") {
               if (value("playerOne") === value("playerTwo")) throw new Error("Choose two different registered players for a Singles fixture.");
               details.participants = [{ userId: value("playerOne"), side: 1 }, { userId: value("playerTwo"), side: 2 }];
+            } else if (type === "doubles_league") {
+              const sideOneEntryId = value("doublesEntryOne");
+              const sideTwoEntryId = value("doublesEntryTwo");
+              if (!sideOneEntryId || !sideTwoEntryId) throw new Error("Choose an approved pair for both Doubles League sides.");
+              if (sideOneEntryId === sideTwoEntryId) throw new Error("A Doubles League entry cannot play against itself.");
+              details.doublesEntryIds = [sideOneEntryId, sideTwoEntryId];
             }
             await request("/api/matches", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(details) });
             row.dataset.created = "true";
@@ -1381,7 +1403,7 @@ if (competitionPage) {
           submit.disabled = false;
         }
       });
-      section.append(createTextElement("p", "management-help", "Doubles fixture sides are not offered yet: the current database does not link a registered doubles entry to each match side."), form);
+      section.append(form);
     }
     return section;
   };
@@ -1410,6 +1432,21 @@ if (competitionPage) {
       } catch {
         activeMembers = [];
       }
+    }
+    const doublesEntriesBySeason = new Map();
+    const doublesEntriesErrors = new Map();
+    if (isManager) {
+      await Promise.all(competition.seasons.map(async (season) => {
+        try {
+          const result = await request(`/api/leagues/${encodeURIComponent(competition.league.id)}/seasons/${encodeURIComponent(season.id)}/doubles-entries`);
+          doublesEntriesBySeason.set(season.id, result.entries || []);
+        } catch (error) {
+          doublesEntriesBySeason.set(season.id, []);
+          doublesEntriesErrors.set(season.id, error instanceof TypeError
+            ? "The match service could not be reached."
+            : error.message);
+        }
+      }));
     }
     if (!competition.seasons.length) {
       setStatus(status, isManager ? "No seasons yet. Create a draft season to begin organising divisions and teams." : "No public seasons have been published yet.", "success");
@@ -1487,7 +1524,10 @@ if (competitionPage) {
       for (const team of season.teams) unassignedGrid.append(await renderTeamCard(team, season, isManager));
       unassignedBlock.append(unassignedGrid);
       seasonCard.append(unassignedBlock);
-      const fixtureBlock = renderSeasonFixtures(season, isManager, matchRows, activeMembers);
+      const fixtureBlock = renderSeasonFixtures(
+        season, isManager, matchRows, activeMembers,
+        doublesEntriesBySeason.get(season.id) || [], doublesEntriesErrors.get(season.id) || ""
+      );
       if (matchLoadError) fixtureBlock.prepend(statusElement(matchLoadError));
       seasonCard.append(fixtureBlock);
       seasonsContainer.append(seasonCard);

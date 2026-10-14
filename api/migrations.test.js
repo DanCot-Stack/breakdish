@@ -7,6 +7,7 @@ import * as signingMigration from "./migrations/004_auditable_team_signings.js";
 import * as signingHistoryMigration from "./migrations/005_protect_registration_history.js";
 import * as signingStartMigration from "./migrations/006_require_official_start_for_signings.js";
 import * as matchClassificationMigration from "./migrations/007_match_categories_and_practice_stats.js";
+import * as doublesLeagueSidesMigration from "./migrations/008_doubles_league_match_sides.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -185,4 +186,31 @@ test("migration 007 defines auditable match formats, lifecycle, frame model, com
   const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
   assert.match(downSql, /Cannot roll back migration 007 while match, event, template or entry history exists/);
   assert.match(downSql, /ALTER TABLE team_registrations DROP CONSTRAINT team_registrations_match_identity_unique/);
+});
+
+test("migration 008 links Doubles League match sides to approved entries and protects player snapshots", () => {
+  const upCalls = [];
+  doublesLeagueSidesMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+  const sql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(sql, /CREATE TABLE match_doubles_league_sides/);
+  assert.match(sql, /UNIQUE \(match_id, entry_id\)/);
+  assert.match(sql, /entry_record\.entry_type <> 'doubles_league'/);
+  assert.match(sql, /entry_record\.status <> 'approved'/);
+  assert.match(sql, /entry_record\.league_id IS DISTINCT FROM match_record\.league_id/);
+  assert.match(sql, /entry_record\.season_id IS DISTINCT FROM match_record\.season_id/);
+  assert.match(sql, /roster_count <> 2/);
+  assert.match(sql, /match_doubles_exactly_two_sides/);
+  assert.match(sql, /match_doubles_exactly_two_participants_per_side/);
+  assert.match(sql, /match_doubles_participants_immutable/);
+  assert.match(sql, /competition_entry_doubles_identity_immutable/);
+  assert.match(sql, /existing Doubles League matches before assigning entry sides/);
+
+  const downCalls = [];
+  doublesLeagueSidesMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back migration 008 while Doubles League fixture history exists/);
 });

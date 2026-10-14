@@ -170,13 +170,17 @@ async function matchWithDetails(client, matchId) {
      LEFT JOIN teams at ON at.id = sb.away_team_id
      LEFT JOIN tournament_events te ON te.id = sb.tournament_event_id
      LEFT JOIN LATERAL (
-       SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+       SELECT string_agg(coalesce(pp.display_name, u.name),
+         CASE WHEN sb.match_type = 'doubles_league' THEN ' / ' ELSE ' & ' END
+         ORDER BY coalesce(pp.display_name, u.name)) AS display_names
        FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
        LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
        WHERE mp.match_id = sb.match_id AND mp.side = 1
      ) hp ON true
      LEFT JOIN LATERAL (
-       SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+       SELECT string_agg(coalesce(pp.display_name, u.name),
+         CASE WHEN sb.match_type = 'doubles_league' THEN ' / ' ELSE ' & ' END
+         ORDER BY coalesce(pp.display_name, u.name)) AS display_names
        FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
        LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
        WHERE mp.match_id = sb.match_id AND mp.side = 2
@@ -301,13 +305,17 @@ export function createMatchStore(database) {
            LEFT JOIN teams at ON at.id = sb.away_team_id
            LEFT JOIN tournament_events te ON te.id = sb.tournament_event_id
            LEFT JOIN LATERAL (
-             SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+             SELECT string_agg(coalesce(pp.display_name, u.name),
+               CASE WHEN sb.match_type = 'doubles_league' THEN ' / ' ELSE ' & ' END
+               ORDER BY coalesce(pp.display_name, u.name)) AS display_names
              FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
              LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
              WHERE mp.match_id = sb.match_id AND mp.side = 1
            ) hp ON true
            LEFT JOIN LATERAL (
-             SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+             SELECT string_agg(coalesce(pp.display_name, u.name),
+               CASE WHEN sb.match_type = 'doubles_league' THEN ' / ' ELSE ' & ' END
+               ORDER BY coalesce(pp.display_name, u.name)) AS display_names
              FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
              LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
              WHERE mp.match_id = sb.match_id AND mp.side = 2
@@ -380,6 +388,38 @@ export function createMatchStore(database) {
           version: Number(result.rows[0].version), name: result.rows[0].name,
           frames: frameRows.rows.map((frame) => ({ number: Number(frame.frame_number), type: frame.frame_type }))
         };
+      });
+    },
+
+    async listApprovedDoublesEntries(leagueId, seasonId, actorId) {
+      return withTransaction(database, actorId, async (client) => {
+        const leagueKey = cleanUuid(leagueId, "league ID");
+        const seasonKey = cleanUuid(seasonId, "season ID");
+        await requireLeagueManager(client, leagueKey, actorId);
+        const season = await client.query("SELECT id FROM seasons WHERE id = $1 AND league_id = $2", [seasonKey, leagueKey]);
+        if (!season.rows[0]) throw new LeagueStoreError(404, "This season could not be found in the selected league.");
+        const result = await client.query(
+          `SELECT ce.id,
+             string_agg(pair.display_name, ' / ' ORDER BY pair.display_name, pair.user_id) AS display_name,
+             jsonb_agg(jsonb_build_object('userId', pair.user_id, 'displayName', pair.display_name)
+               ORDER BY pair.display_name, pair.user_id) AS players
+           FROM competition_entries ce
+           CROSS JOIN LATERAL (
+             SELECT ep.user_id, coalesce(pp.display_name, u.name) AS display_name
+             FROM competition_entry_participants ep
+             JOIN league_memberships lm ON lm.league_id = ce.league_id AND lm.user_id = ep.user_id AND lm.status = 'active'
+             JOIN "user" u ON u.id = ep.user_id
+             LEFT JOIN player_profiles pp ON pp.user_id = ep.user_id
+             WHERE ep.entry_id = ce.id
+           ) pair
+           WHERE ce.entry_type = 'doubles_league' AND ce.status = 'approved'
+             AND ce.league_id = $1 AND ce.season_id = $2
+             AND (SELECT count(*) FROM competition_entry_participants ep WHERE ep.entry_id = ce.id) = 2
+           GROUP BY ce.id
+           HAVING count(*) = 2
+           ORDER BY display_name, ce.id`, [leagueKey, seasonKey]
+        );
+        return result.rows.map((row) => ({ id: row.id, displayName: row.display_name, players: row.players }));
       });
     },
 
@@ -539,6 +579,7 @@ export function createMatchStore(database) {
         let tournamentEventId = details.tournamentEventId ? cleanUuid(details.tournamentEventId, "tournament event ID") : null;
         let template = null;
         let frameList;
+        let doublesEntries = null;
 
         if (["team_league", "singles_league", "doubles_league"].includes(type)) {
           if (!leagueId || !seasonId) invalid("Select the league and season for this league match.");
@@ -562,6 +603,50 @@ export function createMatchStore(database) {
               || new Set(sides).size !== 2 || players.some((id) => typeof id !== "string" || !id.trim())
               || new Set(players).size !== 2) {
               invalid("A Singles League fixture needs one different registered player on each side.");
+            }
+          } else if (type === "doubles_league") {
+            const rawEntryIds = details.doublesEntryIds;
+            if (!Array.isArray(rawEntryIds) || rawEntryIds.length !== 2) {
+              invalid("Choose one approved Doubles League pair for each side.");
+            }
+            const entryIds = rawEntryIds.map((entryId, index) => cleanUuid(entryId, `Doubles League side ${index + 1} entry ID`));
+            if (new Set(entryIds).size !== 2) invalid("A Doubles League entry cannot play against itself.");
+            if (Array.isArray(details.participants)) {
+              invalid("Doubles League sides must be selected from approved pair entries.");
+            }
+            const entries = await client.query(
+              `SELECT id, entry_type, status, league_id, season_id FROM competition_entries
+               WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`, [entryIds]
+            );
+            if (entries.rowCount !== 2) throw new LeagueStoreError(404, "One or both approved Doubles League pairs could not be found.");
+            const entryById = new Map(entries.rows.map((entry) => [entry.id, entry]));
+            doublesEntries = [];
+            const playerIds = [];
+            for (const entryId of entryIds) {
+              const entry = entryById.get(entryId);
+              if (entry.entry_type !== "doubles_league" || entry.status !== "approved"
+                || entry.league_id !== leagueId || entry.season_id !== seasonId) {
+                throw new LeagueStoreError(409, "Choose two different approved Doubles League pairs from this league season.");
+              }
+              const total = await client.query(
+                "SELECT count(*)::integer AS count FROM competition_entry_participants WHERE entry_id = $1", [entryId]
+              );
+              const players = await client.query(
+                `SELECT ep.user_id, coalesce(pp.display_name, u.name) AS display_name
+                 FROM competition_entry_participants ep
+                 JOIN league_memberships lm ON lm.league_id = $2 AND lm.user_id = ep.user_id AND lm.status = 'active'
+                 JOIN "user" u ON u.id = ep.user_id
+                 LEFT JOIN player_profiles pp ON pp.user_id = ep.user_id
+                 WHERE ep.entry_id = $1 ORDER BY ep.user_id FOR SHARE OF lm`, [entryId, leagueId]
+              );
+              if (Number(total.rows[0]?.count) !== 2 || players.rowCount !== 2) {
+                throw new LeagueStoreError(409, "Each selected pair must contain exactly two active members of this league.");
+              }
+              playerIds.push(...players.rows.map((player) => player.user_id));
+              doublesEntries.push({ id: entryId, players: players.rows });
+            }
+            if (new Set(playerIds).size !== 4) {
+              invalid("A player cannot be registered on both sides of the same Doubles League fixture.");
             }
           }
           if (divisionId) {
@@ -605,6 +690,22 @@ export function createMatchStore(database) {
           [type, leagueId, seasonId, divisionId, homeTeamId, awayTeamId, tournamentEventId, scheduledAt, venue, actorId]
         );
         const matchId = insert.rows[0].id;
+        if (type === "doubles_league") {
+          for (let index = 0; index < doublesEntries.length; index++) {
+            await client.query(
+              `INSERT INTO match_doubles_league_sides(match_id, side, entry_id, assigned_by)
+               VALUES($1,$2,$3,$4)`, [matchId, index + 1, doublesEntries[index].id, actorId]
+            );
+          }
+          for (let index = 0; index < doublesEntries.length; index++) {
+            for (const player of doublesEntries[index].players) {
+              await client.query(
+                `INSERT INTO match_participants(match_id, user_id, side, added_by)
+                 VALUES($1,$2,$3,$4)`, [matchId, player.user_id, index + 1, actorId]
+              );
+            }
+          }
+        }
         const snapshot = await client.query(
           `INSERT INTO match_format_snapshots(match_id, template_id, template_version, name, created_by)
            VALUES($1,$2,$3,$4,$5) RETURNING id`,
@@ -692,6 +793,15 @@ export function createMatchStore(database) {
           return result.rows.map((row) => ({ userId: row.user_id, displayName: row.display_name, registrationId: row.team_registration_id }));
         }
         if (["singles_league", "doubles_league"].includes(match.match_type)) {
+          if (match.match_type === "doubles_league") {
+            const result = await client.query(
+              `SELECT mp.user_id, coalesce(pp.display_name, u.name) AS display_name
+               FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
+               LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
+               WHERE mp.match_id = $1 AND mp.side = $2 ORDER BY display_name, mp.user_id`, [match.id, sideNumber]
+            );
+            return result.rows.map((row) => ({ userId: row.user_id, displayName: row.display_name, registrationId: null }));
+          }
           const result = await client.query(
             `SELECT u.id AS user_id, coalesce(pp.display_name, u.name) AS display_name
              FROM league_memberships lm JOIN "user" u ON u.id = lm.user_id
@@ -735,6 +845,11 @@ export function createMatchStore(database) {
         if (players.length > slotCount || (isBye && slotCount === 2 && details.partialBye)) {
           invalid("A doubles Bye uses both player slots; partial doubles Byes are not supported.");
         }
+        if (match.match_type === "doubles_league" && !isBye && players.length !== slotCount) {
+          invalid(frame.rows[0].frame_type === "doubles"
+            ? "A Doubles League frame needs both registered players from the selected pair."
+            : "A Singles frame in a Doubles League fixture needs one player from the selected pair.");
+        }
         if (new Set(players).size !== players.length) invalid("A player cannot occupy two slots in the same frame.");
         await client.query("SELECT set_config('breakdish.audit_action', $1, true)", [amendment ? "admin_amendment" : "player_selection_changed"]);
         await client.query("DELETE FROM match_frame_players WHERE match_id = $1 AND frame_number = $2 AND side = $3", [match.id, frameNumber, side]);
@@ -761,7 +876,13 @@ export function createMatchStore(database) {
                  VALUES($1,$2,$3,$4,$5) ON CONFLICT(match_id,user_id) DO NOTHING`,
                 [match.id, userId, side, registration.rows[0].id, actorId]
               );
-            } else if (!["singles_league", "doubles_league"].includes(match.match_type)) {
+            } else if (match.match_type === "doubles_league") {
+              const participant = await client.query(
+                "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2 AND side = $3",
+                [match.id, userId, side]
+              );
+              if (!participant.rows[0]) throw new LeagueStoreError(409, "Choose a player from the approved pair recorded for this side.");
+            } else if (match.match_type !== "singles_league") {
               const participant = await client.query("SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2 AND side = $3", [match.id, userId, side]);
               if (!participant.rows[0]) throw new LeagueStoreError(403, "Choose a player already recorded on this match side.");
             } else {

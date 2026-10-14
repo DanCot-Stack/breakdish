@@ -699,6 +699,22 @@ function createApp({
     }
   });
 
+  app.get("/api/leagues/:leagueId/seasons/:seasonId/doubles-entries", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId) || !isUuid(req.params.seasonId)) {
+        return res.status(400).json({ error: "Enter valid league and season IDs." });
+      }
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to view approved Doubles League pairs." });
+      const entries = await (await matchStore()).listApprovedDoublesEntries(
+        req.params.leagueId, req.params.seasonId, session.user.id
+      );
+      return res.json({ entries });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.put("/api/leagues/:leagueId/match-format", matchMutationLimiter, async (req, res, next) => {
     try {
       if (!isUuid(req.params.leagueId)) return res.status(400).json({ error: "Enter a valid league ID." });

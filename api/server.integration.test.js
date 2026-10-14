@@ -395,6 +395,37 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       assert.equal(created.status, 200, await created.clone().text());
       return cookieFrom(created);
     };
+    const createDoublesEntry = async (leagueId, seasonId, userIds, status = "approved") => {
+      const client = await database.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT set_config('breakdish.actor_user_id',$1,true)", [firstUserId]);
+        const inserted = await client.query(
+          `INSERT INTO competition_entries(entry_type,league_id,season_id,created_by)
+           VALUES('doubles_league',$1,$2,$3) RETURNING id`, [leagueId, seasonId, firstUserId]
+        );
+        const entryId = inserted.rows[0].id;
+        for (const userId of userIds) {
+          await client.query(
+            `INSERT INTO competition_entry_participants(entry_id,user_id,added_by) VALUES($1,$2,$3)`,
+            [entryId, userId, firstUserId]
+          );
+        }
+        if (status === "approved") {
+          await client.query("UPDATE competition_entries SET status='payment_confirmed' WHERE id=$1", [entryId]);
+          await client.query("UPDATE competition_entries SET status='approved' WHERE id=$1", [entryId]);
+        } else if (status !== "pending") {
+          await client.query("UPDATE competition_entries SET status=$2 WHERE id=$1", [entryId, status]);
+        }
+        await client.query("COMMIT");
+        return entryId;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
 
     const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -963,17 +994,148 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(fullDoublesBye.outcome, "bye");
     assert.equal(fullDoublesBye.winnerSide, 2, "A full Doubles Bye awards the frame to the valid opposing pair.");
 
-    response = await matchPostJson("/api/matches", firstUserCookie, {
+    response = await fetchFromSite(`/api/leagues/${approval.league.id}/seasons/${matchSeason.id}/doubles-entries`);
+    assert.equal(response.status, 401, "Anonymous users cannot enumerate registered Doubles League pairs.");
+    response = await fetchFromSite(`/api/leagues/${approval.league.id}/seasons/${matchSeason.id}/doubles-entries`, { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 403, "Ordinary members cannot enumerate private organiser entry choices.");
+
+    const sideOneEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [firstUserId, secondProfile.userId]);
+    const sideTwoEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [thirdProfile.userId, fourthProfile.userId]);
+    const pendingDoublesEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [firstUserId, fifthProfile.userId], "pending");
+    const rejectedDoublesEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [secondProfile.userId, fifthProfile.userId], "rejected");
+    const withdrawnDoublesEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [thirdProfile.userId, fifthProfile.userId], "withdrawn");
+    const onePlayerEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [firstUserId]);
+    const threePlayerEntryId = await createDoublesEntry(approval.league.id, matchSeason.id, [firstUserId, secondProfile.userId, fifthProfile.userId]);
+    const wrongSeasonEntryId = await createDoublesEntry(approval.league.id, otherSeason.id, [firstUserId, secondProfile.userId]);
+    const openSeasonResponse = await postJson(`/api/leagues/${open.league.id}/seasons`, firstUserCookie, { name: `Other league ${crypto.randomUUID()}` });
+    assert.equal(openSeasonResponse.status, 201, await openSeasonResponse.clone().text());
+    const openSeason = (await openSeasonResponse.json()).season;
+    const wrongLeagueEntryId = await createDoublesEntry(open.league.id, openSeason.id, [firstUserId, secondProfile.userId]);
+
+    response = await fetchFromSite(`/api/leagues/${approval.league.id}/seasons/${matchSeason.id}/doubles-entries`, { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200, await response.clone().text());
+    const selectablePairs = (await response.json()).entries;
+    assert.equal(selectablePairs.length, 2, "Only approved entries with exactly two active league players are selectable.");
+    assert.deepEqual(selectablePairs.map((entry) => entry.id).sort(), [sideOneEntryId, sideTwoEntryId].sort());
+    assert.ok(selectablePairs.every((entry) => entry.players.length === 2 && entry.displayName.includes(" / ")),
+      "The organiser sees both player names while choosing each pair.");
+    response = await matchPostJson("/api/matches", thirdUserCookie, {
       type: "doubles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
-      scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString(),
-      participants: [
-        { userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 1 },
-        { userId: thirdProfile.userId, side: 2 }, { userId: fourthProfile.userId, side: 2 }
-      ]
+      doublesEntryIds: [sideOneEntryId, sideTwoEntryId], scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString()
     });
+    assert.equal(response.status, 403, "Only an active league owner or administrator can create a Doubles League fixture.");
+
+    const doublesFormat = [{ type: "doubles" }, { type: "singles" }];
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Doubles League test format", frames: doublesFormat
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const createDoublesFixture = (entryIds, cookie = firstUserCookie) => matchPostJson("/api/matches", cookie, {
+      type: "doubles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      doublesEntryIds: entryIds, scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString(), venue: "Doubles venue"
+    });
+    for (const invalidIds of [
+      [sideOneEntryId, sideOneEntryId], [pendingDoublesEntryId, sideTwoEntryId],
+      [rejectedDoublesEntryId, sideTwoEntryId], [withdrawnDoublesEntryId, sideTwoEntryId],
+      [onePlayerEntryId, sideTwoEntryId], [threePlayerEntryId, sideTwoEntryId],
+      [wrongSeasonEntryId, sideTwoEntryId], [wrongLeagueEntryId, sideTwoEntryId]
+    ]) {
+      response = await createDoublesFixture(invalidIds);
+      assert.ok([400, 409].includes(response.status), `Invalid Doubles League pair selection was accepted: ${await response.clone().text()}`);
+    }
+    response = await createDoublesFixture([sideOneEntryId, sideTwoEntryId]);
     assert.equal(response.status, 201, await response.clone().text());
-    const doublesLeagueMatch = (await response.json()).match;
-    assert.equal(doublesLeagueMatch.type, "doubles_league");
+    const scheduledDoublesDetail = await response.json();
+    const scheduledDoublesMatch = scheduledDoublesDetail.match;
+    assert.equal(scheduledDoublesMatch.type, "doubles_league");
+    assert.deepEqual(scheduledDoublesDetail.frames.map((frame) => frame.type), doublesFormat.map((frame) => frame.type),
+      "Doubles League fixtures use the league's configured match format.");
+    assert.equal(scheduledDoublesMatch.homeSideName, "Alex Player / Second Player Updated");
+    assert.equal(scheduledDoublesMatch.awaySideName, "Fourth Player / Third Player");
+    const storedDoublesSides = await database.query(
+      `SELECT s.side, s.entry_id, count(mp.user_id)::integer AS players
+       FROM match_doubles_league_sides s JOIN match_participants mp ON mp.match_id=s.match_id AND mp.side=s.side
+       WHERE s.match_id=$1 GROUP BY s.side,s.entry_id ORDER BY s.side`, [scheduledDoublesMatch.id]
+    );
+    assert.deepEqual(storedDoublesSides.rows.map((row) => ({ side: row.side, entry_id: row.entry_id, players: row.players })), [
+      { side: 1, entry_id: sideOneEntryId, players: 2 }, { side: 2, entry_id: sideTwoEntryId, players: 2 }
+    ]);
+    const publicDoublesResponse = await fetchFromSite(`/api/matches?leagueId=${approval.league.id}`);
+    assert.equal(publicDoublesResponse.status, 200);
+    const listedDoublesMatch = (await publicDoublesResponse.json()).matches.find((match) => match.id === scheduledDoublesMatch.id);
+    assert.equal(listedDoublesMatch?.homeSideName, "Alex Player / Second Player Updated",
+      "Anonymous Match Centre listing includes the saved public doubles-pair names.");
+    assert.equal(listedDoublesMatch?.awaySideName, "Fourth Player / Third Player");
+
+    await database.query("DELETE FROM competition_entry_participants WHERE entry_id=$1 AND user_id=$2", [sideOneEntryId, firstUserId]);
+    await database.query(
+      "INSERT INTO competition_entry_participants(entry_id,user_id,added_by) VALUES($1,$2,$3)",
+      [sideOneEntryId, fifthProfile.userId, firstUserId]
+    );
+    const historicalSide = await fetchFromSite(`/api/matches/${scheduledDoublesMatch.id}`, { headers: { cookie: firstUserCookie } });
+    assert.equal(historicalSide.status, 200);
+    assert.equal((await historicalSide.json()).match.homeSideName, "Alex Player / Second Player Updated",
+      "Changing the current entry roster does not rewrite the match participant snapshot.");
+    const historicalEligible = await fetchFromSite(`/api/matches/${scheduledDoublesMatch.id}/eligible-players?side=1`, { headers: { cookie: firstUserCookie } });
+    assert.deepEqual((await historicalEligible.json()).players.map((player) => player.userId).sort(), [firstUserId, secondProfile.userId].sort());
+    await assert.rejects(
+      database.query("DELETE FROM match_participants WHERE match_id=$1 AND user_id=$2", [scheduledDoublesMatch.id, firstUserId]),
+      (error) => error.constraint === "match_doubles_participants_immutable",
+      "Doubles participant snapshots cannot be deleted after an entry changes."
+    );
+    await assert.rejects(
+      database.query("UPDATE match_doubles_league_sides SET entry_id=$2 WHERE match_id=$1 AND side=1", [scheduledDoublesMatch.id, sideTwoEntryId]),
+      (error) => error.constraint === "match_doubles_league_sides_immutable",
+      "A recorded Doubles League side cannot be silently replaced."
+    );
+    await assert.rejects(
+      database.query("UPDATE competition_entries SET season_id=$2 WHERE id=$1", [sideOneEntryId, otherSeason.id]),
+      (error) => error.constraint === "competition_entry_doubles_identity_immutable",
+      "An entry linked to match history cannot later change its league-season identity."
+    );
+
+    response = await matchPatchJson(`/api/matches/${scheduledDoublesMatch.id}/schedule`, firstUserCookie, {
+      scheduledAt: new Date(Date.now() + 60 * 86400000).toISOString(), venue: "Rescheduled doubles venue"
+    });
+    assert.equal(response.status, 200, "Managers can edit an unstarted Doubles League schedule.");
+    response = await matchPostJson(`/api/matches/${scheduledDoublesMatch.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 200, "Managers can cancel an unstarted Doubles League fixture.");
+    assert.equal((await response.json()).match.status, "cancelled");
+
+    response = await createDoublesFixture([sideOneEntryId, sideTwoEntryId]);
+    assert.equal(response.status, 201, await response.clone().text());
+    const playingDoublesMatch = (await response.json()).match;
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 200);
+    response = await matchPatchJson(`/api/matches/${playingDoublesMatch.id}/schedule`, firstUserCookie, {
+      scheduledAt: new Date(Date.now() + 90 * 86400000).toISOString(), venue: "Too late"
+    });
+    assert.equal(response.status, 409, "Started Doubles League fixture scheduling is locked.");
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 409, "Started Doubles League fixtures cannot be cancelled as unstarted.");
+    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [secondProfile.userId] });
+    assert.equal(response.status, 400, "Doubles League doubles frames require both pair players.");
+    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId, secondProfile.userId] });
+    assert.equal(response.status, 409, "Players removed from the current entry cannot replace a recorded match-side player.");
+    await setFrameSide(playingDoublesMatch.id, 1, 1, { players: [secondProfile.userId, fifthProfile.userId] });
+    await setFrameSide(playingDoublesMatch.id, 1, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
+    await recordFrame(playingDoublesMatch.id, 1, { outcome: "played", winnerSide: 1 });
+    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/2/players`, firstUserCookie, { side: 1, players: [secondProfile.userId, fifthProfile.userId] });
+    assert.equal(response.status, 400, "A Singles frame in a Doubles League fixture accepts only one player per side.");
+    await setFrameSide(playingDoublesMatch.id, 2, 1, { players: [fifthProfile.userId] });
+    await setFrameSide(playingDoublesMatch.id, 2, 2, { players: [thirdProfile.userId] });
+    await recordFrame(playingDoublesMatch.id, 2, { outcome: "played", winnerSide: 2 });
+    await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, secondUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, thirdUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await matchPatchJson(`/api/matches/${playingDoublesMatch.id}/schedule`, firstUserCookie, {
+      scheduledAt: new Date(Date.now() + 90 * 86400000).toISOString(), venue: "Completed change"
+    });
+    assert.equal(response.status, 409, "Completed Doubles League fixture scheduling remains protected.");
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 409, "Completed Doubles League fixtures cannot be cancelled.");
+
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
       name: "Single-frame dispute test", frames: [{ type: "singles" }]
     });
