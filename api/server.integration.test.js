@@ -964,8 +964,27 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.deepEqual(practiceCategoryStats.rows[0], { is_official: false, matches_played: 1 });
     const publicMatches = await fetchFromSite("/api/matches");
     assert.equal(publicMatches.status, 200);
-    assert.equal((await publicMatches.json()).matches.some((item) => [practiceMatch.id, moneyMatch.id].includes(item.id)), false,
+    const publicMatchIds = (await publicMatches.json()).matches.map((item) => item.id);
+    assert.equal([practiceMatch.id, moneyMatch.id].some((id) => publicMatchIds.includes(id)), false,
       "The public match listing excludes private practice and Money Matches.");
+
+    const creatorMatchResponse = await fetchFromSite("/api/matches", { headers: { cookie: firstUserCookie } });
+    assert.equal(creatorMatchResponse.status, 200, await creatorMatchResponse.clone().text());
+    const creatorMatchIds = (await creatorMatchResponse.json()).matches.map((item) => item.id);
+    assert.ok(creatorMatchIds.includes(practiceMatch.id), "A signed-in creator can list their private Practice Match.");
+    assert.ok(creatorMatchIds.includes(moneyMatch.id), "A signed-in creator can list their private Money Match.");
+
+    const participantMatchResponse = await fetchFromSite("/api/matches", { headers: { cookie: secondUserCookie } });
+    assert.equal(participantMatchResponse.status, 200, await participantMatchResponse.clone().text());
+    const participantMatchIds = (await participantMatchResponse.json()).matches.map((item) => item.id);
+    assert.ok(participantMatchIds.includes(practiceMatch.id), "A recorded Practice Match participant can list it.");
+    assert.ok(participantMatchIds.includes(moneyMatch.id), "A recorded Money Match participant can list it.");
+
+    const unrelatedMatchResponse = await fetchFromSite("/api/matches", { headers: { cookie: thirdUserCookie } });
+    assert.equal(unrelatedMatchResponse.status, 200, await unrelatedMatchResponse.clone().text());
+    const unrelatedMatchIds = (await unrelatedMatchResponse.json()).matches.map((item) => item.id);
+    assert.equal([practiceMatch.id, moneyMatch.id].some((id) => unrelatedMatchIds.includes(id)), false,
+      "A signed-in nonparticipant cannot list another user's private matches.");
 
     const entryClient = await database.connect();
     try {

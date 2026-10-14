@@ -241,7 +241,7 @@ export function createMatchStore(database) {
         }
         if (viewerId) {
           values.push(viewerId);
-          clauses.push(`(sb.match_type NOT IN ('practice', 'money_match') OR sb.created_by = $${values.length} OR EXISTS (
+          clauses.push(`(sb.match_type NOT IN ('practice', 'money_match') OR m.created_by = $${values.length} OR EXISTS (
             SELECT 1 FROM match_participants mp WHERE mp.match_id = sb.match_id AND mp.user_id = $${values.length}
           ))`);
         } else {
@@ -259,6 +259,7 @@ export function createMatchStore(database) {
           `SELECT sb.*, l.name AS league_name, ht.name AS home_team_name,
              at.name AS away_team_name, te.name AS tournament_name
            FROM match_scoreboard sb
+           JOIN matches m ON m.id = sb.match_id
            LEFT JOIN leagues l ON l.id = sb.league_id
            LEFT JOIN teams ht ON ht.id = sb.home_team_id
            LEFT JOIN teams at ON at.id = sb.away_team_id
