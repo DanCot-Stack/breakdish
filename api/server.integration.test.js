@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL?.trim();
 
-test("Better Auth registration, login, persistent sessions, own-profile access and logout use PostgreSQL", {
+test("Better Auth, league management and the Match Engine use PostgreSQL", {
   skip: testDatabaseUrl ? false : "Set TEST_DATABASE_URL to a disposable local PostgreSQL database ending in _test."
 }, async () => {
   if (!testDatabaseUrl) return;
@@ -697,6 +697,296 @@ test("Better Auth registration, login, persistent sessions, own-profile access a
     competition = (await response.json()).competition;
     assert.equal(competition.seasons.some((item) => item.id === otherSeason.id), false,
       "Draft seasons remain private to league managers.");
+
+    // Match Engine Phase 1 uses only the disposable local PostgreSQL test database.
+    const matchPostJson = (path, sessionCookie, body) => fetchFromSite(path, {
+      method: "POST", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.141" },
+      body: JSON.stringify(body)
+    });
+    const matchPutJson = (path, sessionCookie, body) => fetchFromSite(path, {
+      method: "PUT", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.142" },
+      body: JSON.stringify(body)
+    });
+    const matchSeasonResponse = await signingPostJson(`/api/leagues/${approval.league.id}/seasons`, firstUserCookie, {
+      name: `Match Engine ${crypto.randomUUID()}`, startsOn: yesterday, endsOn: "2027-10-13"
+    });
+    assert.equal(matchSeasonResponse.status, 201, await matchSeasonResponse.clone().text());
+    const matchSeason = (await matchSeasonResponse.json()).season;
+    const homeMatchTeam = await createSigningTeam(matchSeason.id, "Match Home");
+    const awayMatchTeam = await createSigningTeam(matchSeason.id, "Match Away");
+    for (const [team, playerId] of [
+      [homeMatchTeam, firstUserId], [homeMatchTeam, secondProfile.userId],
+      [awayMatchTeam, thirdProfile.userId], [awayMatchTeam, fourthProfile.userId]
+    ]) {
+      response = await signingPostJson(`/api/teams/${team.id}/members`, firstUserCookie, { userId: playerId });
+      assert.equal(response.status, 201, await response.clone().text());
+    }
+
+    const formatV1Frames = ["singles", "singles", "doubles", "singles", "doubles"].map((type) => ({ type }));
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Match engine integration format v1", frames: formatV1Frames
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const createTeamMatch = async (cookie = firstUserCookie) => {
+      const created = await matchPostJson("/api/matches", cookie, {
+        type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+        homeTeamId: homeMatchTeam.id, awayTeamId: awayMatchTeam.id,
+        scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString(), venue: "Local test venue"
+      });
+      assert.equal(created.status, 201, await created.clone().text());
+      return (await created.json()).match;
+    };
+    response = await matchPostJson("/api/matches", "", { type: "practice" });
+    assert.equal(response.status, 401, "Anonymous users cannot create matches.");
+    response = await matchPostJson("/api/matches", thirdUserCookie, { type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id });
+    assert.equal(response.status, 403, "League members cannot create fixtures without manager permission.");
+
+    const matchUnderTest = await createTeamMatch();
+    const untouchedFutureMatch = await createTeamMatch();
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal(response.status, 200, await response.clone().text());
+    let matchDetail = await response.json();
+    assert.equal(matchDetail.match.type, "team_league");
+    assert.equal(matchDetail.frames.length, 5);
+    assert.deepEqual(matchDetail.frames.map((frame) => frame.type), formatV1Frames.map((frame) => frame.type));
+    const storedSnapshot = await database.query(
+      `SELECT s.template_version, count(sf.frame_number)::integer AS frame_count
+       FROM match_format_snapshots s JOIN match_format_snapshot_frames sf ON sf.snapshot_id=s.id
+       WHERE s.match_id=$1 GROUP BY s.template_version`, [matchUnderTest.id]
+    );
+    assert.deepEqual(storedSnapshot.rows[0], { template_version: 1, frame_count: 5 },
+      "A fixture stores the exact league format revision and ordered frame snapshot.");
+
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Single-frame revision", frames: [{ type: "singles" }]
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal((await response.json()).frames.length, 5, "Changing the default does not silently change an existing fixture snapshot.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/apply-league-format`, firstUserCookie, {});
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal((await response.json()).frames.length, 1, "An explicitly selected future match receives the current format only.");
+    response = await fetchFromSite(`/api/matches/${untouchedFutureMatch.id}`);
+    assert.equal((await response.json()).frames.length, 5, "Updating one selected match leaves another future fixture unchanged.");
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Restored mixed format", frames: formatV1Frames, applyToFuture: true
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal((await response.json()).format.updatedMatches, 2,
+      "League administrators can apply a new revision to all future unplayed fixtures.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal((await response.json()).frames.length, 5);
+
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`);
+    assert.equal(response.status, 401, "Eligible-player reads require a session.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`, { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200);
+    const eligibleHomePlayers = (await response.json()).players;
+    assert.deepEqual(eligibleHomePlayers.map((player) => player.userId).sort(), [firstUserId, secondProfile.userId].sort(),
+      "Team scoreboard choices come only from active registrations to the correct team.");
+
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, thirdUserCookie, {});
+    assert.equal(response.status, 200, "Any authenticated player can start an active scoreboard.");
+    const setFrameSide = async (matchId, frame, side, selection) => {
+      const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/players`, firstUserCookie, { side, ...selection });
+      assert.equal(result.status, 200, await result.clone().text());
+      return result.json();
+    };
+    const recordFrame = async (matchId, frame, details) => {
+      const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/result`, firstUserCookie, details);
+      assert.equal(result.status, 200, await result.clone().text());
+      return result.json();
+    };
+    await setFrameSide(matchUnderTest.id, 1, 1, { players: [firstUserId] });
+    await setFrameSide(matchUnderTest.id, 1, 2, { players: [thirdProfile.userId] });
+    await recordFrame(matchUnderTest.id, 1, { outcome: "played", winnerSide: 1, dishEvent: "dish", dishPlayerId: firstUserId });
+    await setFrameSide(matchUnderTest.id, 2, 1, { bye: true, players: [] });
+    await setFrameSide(matchUnderTest.id, 2, 2, { players: [fourthProfile.userId] });
+    await recordFrame(matchUnderTest.id, 2, { outcome: "bye" });
+    await setFrameSide(matchUnderTest.id, 3, 1, { players: [firstUserId, secondProfile.userId] });
+    await setFrameSide(matchUnderTest.id, 3, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
+    await recordFrame(matchUnderTest.id, 3, { outcome: "played", winnerSide: 2, dishEvent: "counter_dish", dishPlayerId: thirdProfile.userId });
+    await setFrameSide(matchUnderTest.id, 4, 1, { players: [secondProfile.userId] });
+    await setFrameSide(matchUnderTest.id, 4, 2, { players: [thirdProfile.userId] });
+    await recordFrame(matchUnderTest.id, 4, { outcome: "played", winnerSide: 1 });
+    await setFrameSide(matchUnderTest.id, 5, 1, { players: [firstUserId, secondProfile.userId] });
+    await setFrameSide(matchUnderTest.id, 5, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
+    matchDetail = await recordFrame(matchUnderTest.id, 5, { outcome: "played", winnerSide: 2 });
+    assert.equal(matchDetail.match.status, "awaiting_confirmation", "Completing all snapshot frames moves the match to confirmation, not directly to final.");
+    assert.equal(matchDetail.match.homeScore, 2);
+    assert.equal(matchDetail.match.awayScore, 3);
+    assert.equal(matchDetail.match.framesRemaining, 0);
+    assert.ok(matchDetail.frames[0].players.some((player) => player.userId === firstUserId));
+    assert.ok(matchDetail.frames[2].players.some((player) => player.userId === firstUserId), "A player may play repeatedly across frames.");
+    const frameEvents = await database.query("SELECT frame_number,event_type FROM match_frame_events WHERE match_id=$1 ORDER BY frame_number", [matchUnderTest.id]);
+    assert.deepEqual(frameEvents.rows, [{ frame_number: 1, event_type: "dish" }, { frame_number: 3, event_type: "counter_dish" }]);
+    const byeDecoration = await database.query("SELECT count(*)::integer AS count FROM match_frame_events WHERE match_id=$1 AND frame_number=2", [matchUnderTest.id]);
+    assert.equal(byeDecoration.rows[0].count, 0, "Bye wins cannot carry Dish or Counter Dish records.");
+
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/confirm`, firstUserCookie, { side: 1 });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/confirm`, secondUserCookie, { side: 2 });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, thirdUserCookie, {});
+    assert.equal(response.status, 200, "Both distinct sides' confirmations allow finalization.");
+    matchDetail = await response.json();
+    assert.equal(matchDetail.match.status, "completed");
+    const finalizedAudit = await fetchFromSite(`/api/matches/${matchUnderTest.id}/audit`, { headers: { cookie: firstUserCookie } });
+    assert.equal(finalizedAudit.status, 200);
+    const auditActions = (await finalizedAudit.json()).events.map((event) => event.action_type);
+    for (const action of ["match_started", "player_selection_changed", "frame_result_entered", "bye_entered", "confirmation_confirmed", "match_finalized"]) {
+      assert.ok(auditActions.includes(action), `Missing immutable audit action ${action}.`);
+    }
+    const officialTeamStats = await database.query("SELECT matches_played, matches_won, matches_lost FROM official_competitive_player_statistics WHERE user_id=$1", [firstUserId]);
+    assert.equal(Number(officialTeamStats.rows[0].matches_played), 1);
+    assert.equal(Number(officialTeamStats.rows[0].matches_lost), 1, "The official match winner is derived from the frame winners.");
+
+    response = await matchPostJson("/api/tournaments", firstUserCookie, { name: `Local Flyer ${crypto.randomUUID()}`, venue: "Test room" });
+    assert.equal(response.status, 201, await response.clone().text());
+    const tournamentEvent = (await response.json()).event;
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "tournament_flyer", tournamentEventId: tournamentEvent.id,
+      frames: [{ type: "doubles" }],
+      participants: [
+        { userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 1 },
+        { userId: thirdProfile.userId, side: 2 }, { userId: fourthProfile.userId, side: 2 }
+      ]
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const flyerMatch = (await response.json()).match;
+    assert.equal(flyerMatch.type, "tournament_flyer");
+    response = await matchPostJson(`/api/matches/${flyerMatch.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 200);
+    response = await matchPutJson(`/api/matches/${flyerMatch.id}/frames/1/players`, firstUserCookie, { side: 1, bye: true, players: [firstUserId] });
+    assert.equal(response.status, 400, "The API rejects a partial Doubles Bye before it writes a selection.");
+    await matchPutJson(`/api/matches/${flyerMatch.id}/frames/1/players`, firstUserCookie, { side: 1, bye: true, players: [] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPutJson(`/api/matches/${flyerMatch.id}/frames/1/players`, firstUserCookie, { side: 2, players: [thirdProfile.userId, fourthProfile.userId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPutJson(`/api/matches/${flyerMatch.id}/frames/1/result`, firstUserCookie, { outcome: "bye" });
+    assert.equal(response.status, 200, await response.clone().text());
+    const fullDoublesBye = (await response.json()).frames[0];
+    assert.equal(fullDoublesBye.outcome, "bye");
+    assert.equal(fullDoublesBye.winnerSide, 2, "A full Doubles Bye awards the frame to the valid opposing pair.");
+
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "doubles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      participants: [
+        { userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 1 },
+        { userId: thirdProfile.userId, side: 2 }, { userId: fourthProfile.userId, side: 2 }
+      ]
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const doublesLeagueMatch = (await response.json()).match;
+    assert.equal(doublesLeagueMatch.type, "doubles_league");
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Single-frame dispute test", frames: [{ type: "singles" }]
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "singles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }]
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const singlesMatch = (await response.json()).match;
+    assert.equal(singlesMatch.type, "singles_league");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 200);
+    await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 2, players: [secondProfile.userId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1 });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes`, secondUserCookie, { reason: "Local integration dispute test" });
+    assert.equal(response.status, 201, await response.clone().text());
+    const disputedMatch = await response.json();
+    assert.equal(disputedMatch.match.status, "disputed");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 409, "Open disputes block finalization.");
+    const disputeId = disputedMatch.disputes[0].id;
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes/${disputeId}/resolve`, thirdUserCookie, { resolution: "Unauthorised" });
+    assert.equal(response.status, 403, "A regular member cannot resolve a league dispute.");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes/${disputeId}/resolve`, secondUserCookie, { resolution: "Score checked by the league administrator." });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal((await response.json()).match.status, "awaiting_confirmation");
+    await matchPostJson(`/api/matches/${singlesMatch.id}/confirm`, firstUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${singlesMatch.id}/confirm`, secondUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 200, await response.clone().text());
+    const disputeAudit = await fetchFromSite(`/api/matches/${singlesMatch.id}/audit`, { headers: { cookie: firstUserCookie } });
+    const disputeActions = (await disputeAudit.json()).events.map((event) => event.action_type);
+    assert.ok(disputeActions.includes("dispute_raised"));
+    assert.ok(disputeActions.includes("dispute_resolved"));
+
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "money_match", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
+      frames: [{ type: "singles" }],
+      moneyTerms: { wagerAmount: 5, adminUserId: thirdProfile.userId }
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const moneyMatch = (await response.json()).match;
+    assert.equal(moneyMatch.type, "money_match");
+    response = await matchPostJson(`/api/matches/${moneyMatch.id}/money-acknowledgements`, secondUserCookie, { type: "player_a_terms" });
+    assert.equal(response.status, 409, "Only the assigned player or Match Admin can record each Money Match acknowledgement.");
+    for (const [type, sessionCookie] of [
+      ["player_a_terms", firstUserCookie], ["player_b_terms", secondUserCookie], ["admin_role", thirdUserCookie],
+      ["admin_stake_confirmed", thirdUserCookie], ["player_a_winner_takes_wager", firstUserCookie],
+      ["player_b_winner_takes_wager", secondUserCookie]
+    ]) {
+      response = await matchPostJson(`/api/matches/${moneyMatch.id}/money-acknowledgements`, sessionCookie, { type });
+      assert.equal(response.status, 200, await response.clone().text());
+    }
+    response = await matchPostJson(`/api/matches/${moneyMatch.id}/start`, thirdUserCookie, {});
+    assert.equal(response.status, 200, "Money Match start requires both players and the appointed admin's manual acknowledgements.");
+
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "practice", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
+      frames: [{ type: "singles" }], formatName: "Friendly singles practice"
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const practiceMatch = (await response.json()).match;
+    assert.equal(practiceMatch.type, "practice");
+    response = await fetchFromSite(`/api/matches/${practiceMatch.id}`);
+    assert.equal(response.status, 401, "Practice match details are private to a signed-in participant.");
+    response = await matchPostJson(`/api/matches/${practiceMatch.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 200);
+    await matchPutJson(`/api/matches/${practiceMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPutJson(`/api/matches/${practiceMatch.id}/frames/1/players`, firstUserCookie, { side: 2, players: [secondProfile.userId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPutJson(`/api/matches/${practiceMatch.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1, dishEvent: "dish", dishPlayerId: firstUserId }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${practiceMatch.id}/confirm`, firstUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${practiceMatch.id}/confirm`, secondUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPostJson(`/api/matches/${practiceMatch.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 200, await response.clone().text());
+    const practiceStats = await database.query("SELECT matches_played,matches_won,dishes,practice_win_percentage FROM practice_player_statistics WHERE user_id=$1", [firstUserId]);
+    assert.equal(Number(practiceStats.rows[0].matches_played), 1);
+    assert.equal(Number(practiceStats.rows[0].matches_won), 1);
+    assert.equal(Number(practiceStats.rows[0].dishes), 1);
+    assert.equal(Number(practiceStats.rows[0].practice_win_percentage), 100);
+    const practiceCategoryStats = await database.query("SELECT is_official,matches_played FROM match_player_statistics WHERE user_id=$1 AND match_type='practice'", [firstUserId]);
+    assert.deepEqual(practiceCategoryStats.rows[0], { is_official: false, matches_played: 1 });
+    const publicMatches = await fetchFromSite("/api/matches");
+    assert.equal(publicMatches.status, 200);
+    assert.equal((await publicMatches.json()).matches.some((item) => [practiceMatch.id, moneyMatch.id].includes(item.id)), false,
+      "The public match listing excludes private practice and Money Matches.");
+
+    const entryClient = await database.connect();
+    try {
+      await entryClient.query("BEGIN");
+      await entryClient.query("SELECT set_config('breakdish.actor_user_id',$1,true)", [firstUserId]);
+      const entryInsert = await entryClient.query(
+        `INSERT INTO competition_entries(entry_type,league_id,season_id,created_by)
+         VALUES('singles_league',$1,$2,$3) RETURNING id`, [approval.league.id, matchSeason.id, firstUserId]
+      );
+      const entryId = entryInsert.rows[0].id;
+      await entryClient.query("UPDATE competition_entries SET status='payment_confirmed' WHERE id=$1", [entryId]);
+      await entryClient.query("UPDATE competition_entries SET status='approved' WHERE id=$1", [entryId]);
+      const entryHistory = await entryClient.query("SELECT old_status,new_status FROM competition_entry_events WHERE entry_id=$1 ORDER BY occurred_at,id", [entryId]);
+      assert.deepEqual(entryHistory.rows.map((event) => event.new_status).sort(), ["approved", "payment_confirmed", "pending"].sort());
+      await entryClient.query("COMMIT");
+    } catch (error) {
+      await entryClient.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      entryClient.release();
+    }
 
     response = await patchJson(`/api/seasons/${season.id}`, firstUserCookie, { status: "completed" });
     assert.equal(response.status, 200);

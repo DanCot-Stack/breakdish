@@ -7,11 +7,13 @@ Responsive BREAK DISH static website with an Express API. The contact form sends
 - `index.html`, `styles.css`, `script.js` — branded responsive website and contact form.
 - `login.html`, `signup.html`, `account.html` — Better Auth registration and login forms, plus a session-checked player profile page.
 - `join-league.html`, `create-league.html`, `competition.html` — public league directory, league creation and membership tools, plus season, division, team and roster management.
+- `match.html`, `match.js` — public Match Centre and frame-by-frame scoreboard for existing matches.
 - `privacy.html`, `terms.html` — website legal-information pages.
 - `api/server.js` — Express 5 contact API, Better Auth routes, authenticated profile, league and competition endpoints, security headers and origin checks.
+- `api/match-store.js` — transactional match, frame, confirmation, dispute and audit operations.
 - `api/auth-factory.js`, `api/auth.js` — Better Auth configuration and PostgreSQL pool.
 - `api/profile-store.js`, `api/league-store.js`, `api/competition-store.js` — parameterised PostgreSQL access for player profiles, league membership and transactional season/team workflows.
-- `api/migrations/` — application schema for player profiles, league ownership and membership, seasons, divisions, teams, rosters and registration history.
+- `api/migrations/` — application schema for player profiles, leagues, seasons, teams, auditable registrations, match categories and separated practice/competitive statistics.
 - `api/*.test.js` — unit tests and an opt-in local PostgreSQL integration test.
 
 ## Current functionality
@@ -19,15 +21,15 @@ Responsive BREAK DISH static website with an Express API. The contact form sends
 - Existing contact form: sends email through Resend; it does not save messages to a database or files.
 - Authentication: Better Auth email/password registration, login, logout and persistent sessions. `GET /api/me`, `GET /api/me/profile` and `PUT /api/me/profile` validate the session on the server. Email verification and password recovery require configured email delivery.
 - Player profiles: the signed-in user can edit display name, location and biography. The API always takes profile ownership from the authenticated session; public profile pages and player identifiers are not implemented.
-- PostgreSQL schema: Better Auth-managed identity/session tables plus `player_profiles`, `leagues` and `league_memberships`.
+- PostgreSQL schema: Better Auth identity/session tables plus profiles, leagues, seasons, team registrations, match formats, frames, confirmations, disputes and audit history. Match category determines whether statistics are official; practice rows remain separate from competitive aggregates.
 - Leagues: signed-in players can create a public league, and a database trigger assigns the creator as its active owner. The directory shows public open/active leagues and their details. A league can allow immediate joining or require organiser approval. Owners and administrators can review requests; only owners can assign or remove administrator access. Server-side checks enforce league-scoped owner, administrator and member permissions.
 - Ownership safety: database triggers prevent an active league from losing its last active owner or becoming active without one. Join and request operations use transactions, serialize per league and rely on the unique league/user constraint to avoid duplicates.
 - Seasons, divisions and teams: league owners and administrators can create draft seasons with optional dates, add divisions during draft, and create active/inactive teams with an optional home venue. Season status moves forward from draft to active to completed; completed seasons are read-only and remain available as history. Teams are scoped by database constraints to a season and its league, and divisions are scoped to one season.
 - Team registrations: a player can be actively registered to one team per league season and may transfer. Owners/administrators can transfer players atomically; active team captains can sign unattached eligible members and remove non-captains on their team. A receiving team can accept at most three post-start signing events per season. Preseason signings are free; returns and transfers each use a new slot. Durable registration and event history is retained after removal or transfer.
 
-Signing rules apply only to team-event rosters. Singles and money-match entry are outside this registration workflow; those competition types are not implemented yet.
+Signing rules apply only to team-event rosters. Singles matches, doubles matches, tournaments/flyers, Money Matches and practice matches use explicit match categories without inheriting team-roster signing limits. Money Match terms and manual acknowledgements record agreement only; BREAK DISH does not collect or transfer money.
 
-The static account page checks the session for user experience; profile and competition data remain protected by the API regardless of frontend behavior. Fixtures, results, standings, scoring and tournament features are not implemented. There is no public player profile directory, ownership transfer, league suspension or season deletion interface.
+The Match Centre lists actual public matches and renders frame scores from recorded results. Signed-in users can start scheduled matches, select eligible team players, record frame results and Dish/Counter Dish events, confirm results, or raise disputes. The API supports dispute resolution and historical audit records; there is not yet a dedicated organiser interface for creating matches, resolving disputes, or managing tournament draws. There are no automated weekly-fixture tools, standings, rankings/Top 10 pages, tournament brackets/progression, or live push updates. Practice matches are private to participants and feed separate practice statistics. Competition-entry statuses are manual records only, with no payment processing. The static account page checks the session for user experience; profile and competition data remain protected by the API regardless of frontend behavior. There is no public player profile directory, ownership transfer, league suspension or season deletion interface.
 
 ## Prerequisites and local environment
 
@@ -53,7 +55,7 @@ psql -U postgres -c "CREATE DATABASE breakdish_dev OWNER breakdish;"
 psql -U postgres -c "CREATE DATABASE breakdish_test OWNER breakdish;"
 ```
 
-Then set `DATABASE_URL=postgres://breakdish:your-local-password@127.0.0.1:5432/breakdish_dev` in `api/.env`. These commands are for new local databases only; don’t point them at a managed or production database. The project migration creates the `player_profiles` table along with the planned league schema, but league features are not connected to the website yet.
+Then set `DATABASE_URL=postgres://breakdish:your-local-password@127.0.0.1:5432/breakdish_dev` in `api/.env`. These commands are for new local databases only; don’t point them at a managed or production database. The migrations create profile, league, registration and Match Engine tables; they do not insert sample competition data.
 
 Local values to configure:
 
@@ -72,9 +74,9 @@ pnpm auth:migrate
 pnpm db:up
 ```
 
-Better Auth's supported PostgreSQL migration command creates its own identity, account, session, verification and persistent rate-limit tables. The `node-pg-migrate` application migrations create profile, league and membership tables, followed by the league joining workflow, seasons/divisions/teams/rosters and auditable registrations. Migration 004 imports the existing roster snapshot as legacy history. Older versions did not retain prior transfers, signing authors or reasons, so those details are clearly marked unavailable rather than fabricated. If migration preflight finds overlapping active registrations, a team already beyond the signing allowance, or an unfinished season with registrations but no start date, it stops for review. Migration 006 requires a season start date before new registrations; start dates freeze after the first registration. Application rollback is limited to the latest migration and may be blocked to preserve data. Better Auth tables contain login credentials and sessions, so there is no automatic auth rollback command; take a backup before any manual schema removal.
+Better Auth's supported PostgreSQL migration command creates its own identity, account, session, verification and persistent rate-limit tables. The `node-pg-migrate` application migrations create profile, league and membership tables, followed by the league joining workflow, seasons/divisions/teams/rosters, auditable registrations, and match categories with separate practice and competitive statistics. Migration 004 imports the existing roster snapshot as legacy history. Older versions did not retain prior transfers, signing authors or reasons, so those details are clearly marked unavailable rather than fabricated. If migration preflight finds overlapping active registrations, a team already beyond the signing allowance, or an unfinished season with no start date, it stops for review. Migration 006 requires a season start date before new registrations; start dates freeze after the first registration. Migration 007 requires every match to have a fixed category, derives its official/practice classification from that category, and exposes separate statistics views so practice results cannot enter competitive aggregates. Application rollback is limited to the latest migration and may be blocked to preserve data. Better Auth tables contain login credentials and sessions, so there is no automatic auth rollback command; take a backup before any manual schema removal.
 
-For local frontend calls, the website automatically uses `http://localhost:3001` when opened from `localhost` or `127.0.0.1`. For a different local hostname, set the empty `breakdish-api-url` meta value in the HTML pages that include `script.js` to the API origin. That value is public configuration, never a secret.
+For local frontend calls, the website automatically uses `http://localhost:3001` when opened from `localhost` or `127.0.0.1`. For a different local hostname, set that page's `breakdish-api-url` meta value to the local API origin. The value is public configuration, never a secret.
 
 Start the API:
 
@@ -149,9 +151,9 @@ Render supplies `PORT`; do not set it to a fixed production port. Render's inter
 
 1. Provision a persistent production database and the API service only after approving their plans and costs. Do not use local PostgreSQL in production.
 2. Set the API environment above. Check the exact database target and arrange a backup before applying schema changes.
-3. Apply Better Auth's schema with `pnpm auth:migrate`, then application migrations 001–006 with `pnpm db:up`, from the API root and only against the verified production database, after explicit approval to migrate production. Do not put these commands in the build or start command; review migration output and take an approved backup first.
+3. Apply Better Auth's schema with `pnpm auth:migrate`, then application migrations 001–007 with `pnpm db:up`, from the API root and only against the verified production database, after explicit approval to migrate production. Do not put these commands in the build or start command; review migration output and take an approved backup first.
 4. Deploy the API and verify `/healthz`, database-backed authentication, contact delivery, and browser cookie/session behavior.
-5. Put the same API origin in the `breakdish-api-url` meta setting in all nine pages: `index.html`, `login.html`, `signup.html`, `account.html`, `join-league.html`, `create-league.html`, `competition.html`, `privacy.html`, and `terms.html`. Leave it blank in the local source until the real API URL is known; `script.js` selects `http://localhost:3001` on localhost and reports an unconfigured production URL instead of silently calling the static site.
+5. Verify the `breakdish-api-url` meta setting in all ten pages: `index.html`, `login.html`, `signup.html`, `account.html`, `join-league.html`, `create-league.html`, `competition.html`, `privacy.html`, `terms.html`, and `match.html`. Set it to the configured production API origin; `script.js` selects `http://localhost:3001` on localhost and reports an unconfigured production URL instead of silently calling the static site.
 6. Deploy the frontend to the existing Static Site only after the API URL and required services are ready.
 
 Better Auth uses credentialed CORS and secure production cookies. Keep `ALLOWED_ORIGINS` exact; do not use `*` or disable origin checks. Separate Render hostnames can encounter browser third-party-cookie restrictions. Verify signup, login, refresh and logout in supported browsers before launch; if cookies are blocked, use a shared custom-domain parent or same-origin proxy. The API health route currently confirms the HTTP service responds; it is not a database readiness check.

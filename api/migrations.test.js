@@ -6,6 +6,7 @@ import * as competitionMigration from "./migrations/003_seasons_divisions_teams.
 import * as signingMigration from "./migrations/004_auditable_team_signings.js";
 import * as signingHistoryMigration from "./migrations/005_protect_registration_history.js";
 import * as signingStartMigration from "./migrations/006_require_official_start_for_signings.js";
+import * as matchClassificationMigration from "./migrations/007_match_categories_and_practice_stats.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -133,4 +134,55 @@ test("team registrations require a frozen official season start date", () => {
   assert.match(sql, /unfinished season has team registration history but no official start date/);
   assert.match(sql, /season_start_required_for_signing/);
   assert.match(sql, /BEFORE INSERT ON team_registrations/);
+});
+
+test("migration 007 defines auditable match formats, lifecycle, frame model, competition entries and separated statistics", () => {
+  const upCalls = [];
+  matchClassificationMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+  const sql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+
+  for (const category of ["team_league", "singles_league", "doubles_league", "tournament_flyer", "money_match", "practice"]) {
+    assert.ok(sql.includes(`'${category}'`), `missing match category ${category}`);
+  }
+  for (const table of [
+    "tournament_events", "matches", "league_match_format_templates", "league_match_format_template_frames",
+    "league_match_format_defaults", "match_format_snapshots", "match_format_snapshot_frames", "match_frames",
+    "match_participants", "match_frame_players", "match_frame_events", "match_confirmations",
+    "match_disputes", "match_dispute_resolutions", "competition_entries", "competition_entry_participants",
+    "competition_entry_events", "money_match_terms", "money_match_acknowledgements", "match_audit_events"
+  ]) assert.match(sql, new RegExp(`CREATE TABLE ${table}\\s*\\(`), `missing ${table}`);
+
+  assert.match(sql, /is_official boolean GENERATED ALWAYS AS \(match_type <> 'practice'\) STORED/);
+  assert.match(sql, /matches_identity_immutable/);
+  assert.match(sql, /matches_status_transition/);
+  assert.match(sql, /matches_format_snapshot_required/);
+  assert.match(sql, /breakdish_auto_await_confirmation/);
+  assert.match(sql, /matches_both_sides_confirmed/);
+  assert.match(sql, /matches_no_open_dispute/);
+  assert.match(sql, /max\(r\.created_at\) INTO latest_resolution/);
+  assert.match(sql, /match_dispute_resolution_permission/);
+  assert.match(sql, /match_snapshot_unplayed_only/);
+  assert.match(sql, /match_participant_team_eligibility/);
+  assert.match(sql, /match_frame_singles_slots/);
+  assert.match(sql, /match_frame_doubles_slots/);
+  assert.match(sql, /match_frame_full_doubles_bye/);
+  assert.match(sql, /match_frame_no_partial_bye/);
+  assert.match(sql, /match_frame_no_decoration_on_bye/);
+  assert.match(sql, /match_audit_events_append_only/);
+  assert.match(sql, /CREATE VIEW match_scoreboard AS/);
+  assert.match(sql, /CREATE VIEW match_player_statistics AS/);
+  assert.match(sql, /CREATE VIEW practice_player_statistics AS[\s\S]*WHERE match_type = 'practice'/);
+  assert.match(sql, /practice_win_percentage/);
+  assert.match(sql, /CREATE VIEW official_competitive_player_statistics AS[\s\S]*WHERE is_official/);
+  assert.match(sql, /counter_dishes/);
+
+  const downCalls = [];
+  matchClassificationMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back migration 007 while match, event, template or entry history exists/);
+  assert.match(downSql, /ALTER TABLE team_registrations DROP CONSTRAINT team_registrations_match_identity_unique/);
 });

@@ -2854,3 +2854,359 @@ td:first-child {
     align-items: flex-start;
   }
 }
+
+/* Match Centre and frame-by-frame scoreboard */
+.match-centre-content {
+  padding: clamp(46px, 6vw, 82px) var(--page-gutter);
+  background: #141115;
+}
+
+.match-centre-content > .section-heading {
+  margin-bottom: 24px;
+}
+
+.match-list,
+.score-frame-list {
+  display: grid;
+  gap: 16px;
+  margin-top: 22px;
+}
+
+.match-list {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+}
+
+.match-list-card,
+.match-scoreboard-header,
+.score-frame-card,
+.match-confirmation-panel,
+.match-audit-panel {
+  min-width: 0;
+  padding: clamp(17px, 2.7vw, 28px);
+  border: 1px solid rgba(213, 177, 107, .2);
+  background: linear-gradient(145deg, rgba(32, 25, 31, .96), rgba(17, 15, 18, .98));
+}
+
+.match-list-card-header,
+.score-frame-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+
+.match-category-tag,
+.match-state-tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid rgba(213, 177, 107, .35);
+  color: var(--gold-light);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.match-state-tag {
+  border-color: rgba(242, 234, 219, .2);
+  color: var(--cream);
+  text-transform: capitalize;
+}
+
+.match-state-tag.is-in_progress,
+.match-state-banner.is-in_progress {
+  border-color: rgba(157, 185, 206, .52);
+  color: var(--blue);
+}
+
+.match-state-tag.is-completed,
+.match-state-banner.is-completed {
+  border-color: rgba(120, 180, 135, .52);
+  color: #a8d3b2;
+}
+
+.match-state-tag.is-disputed,
+.match-state-banner.is-disputed {
+  border-color: rgba(223, 123, 123, .6);
+  color: #ffc0c0;
+}
+
+.match-list-card h3,
+.match-scoreboard-identity h2 {
+  margin: 15px 0 7px;
+  color: var(--cream);
+  font-family: "Barlow Condensed", Impact, sans-serif;
+  font-size: clamp(26px, 3vw, 36px);
+  line-height: 1.1;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}
+
+.match-list-meta,
+.match-list-score {
+  margin: 0 0 12px;
+  color: #d0c4c8;
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.match-list-score {
+  color: var(--gold-light);
+  font-family: "Barlow Condensed", Impact, sans-serif;
+  font-size: 31px;
+  font-weight: 700;
+}
+
+.match-list-card .button {
+  min-height: 46px;
+  margin-top: 8px;
+}
+
+.match-detail {
+  display: grid;
+  gap: 16px;
+  margin-top: 22px;
+}
+
+.match-scoreboard-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(240px, .8fr);
+  gap: 24px;
+  align-items: center;
+}
+
+.match-scoreboard-identity h2 {
+  margin-top: 13px;
+  font-size: clamp(32px, 5vw, 56px);
+}
+
+.match-score-summary {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  padding: 16px;
+  border-left: 1px solid var(--line);
+  text-align: center;
+}
+
+.match-score-team {
+  color: #e0d5d7;
+  font-size: 15px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.match-score-number {
+  color: var(--gold-light);
+  font-family: "Barlow Condensed", Impact, sans-serif;
+  font-size: clamp(42px, 7vw, 72px);
+  line-height: 1;
+}
+
+.match-score-summary small {
+  color: #c7bbc0;
+  font-size: 14px;
+}
+
+.match-state-banner,
+.match-access-note,
+.match-inline-status,
+.match-final-note {
+  margin: 0;
+  padding: 12px 15px;
+  border: 1px solid rgba(213, 177, 107, .25);
+  color: var(--cream);
+  background: rgba(101, 29, 53, .23);
+  font-size: 15px;
+}
+
+.match-state-banner.is-awaiting_confirmation {
+  color: var(--gold-light);
+}
+
+.match-state-banner.is-disputed,
+.match-inline-status.is-error {
+  color: #ffc0c0;
+  border-color: rgba(223, 123, 123, .5);
+}
+
+.score-frame-card {
+  padding: clamp(15px, 2.4vw, 23px);
+}
+
+.score-frame-number {
+  margin-right: auto;
+  color: var(--gold-light);
+  font-family: "Barlow Condensed", Impact, sans-serif;
+  font-size: 23px;
+  font-weight: 700;
+}
+
+.score-frame-result {
+  margin: 15px 0 0;
+  font-weight: 700;
+}
+
+.score-frame-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+  margin-top: 16px;
+}
+
+.score-frame-side {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 13px;
+  border: 1px solid rgba(242, 234, 219, .14);
+}
+
+.score-frame-side legend {
+  padding: 0 6px;
+  color: var(--gold-light);
+  font-weight: 700;
+}
+
+.match-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #e4dadd;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.match-field input,
+.match-field select,
+.match-field textarea {
+  width: 100%;
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 1px solid rgba(242, 234, 219, .25);
+  border-radius: 0;
+  background: #171318;
+  color: var(--cream);
+  font: inherit;
+  font-size: 16px;
+}
+
+.match-field textarea {
+  resize: vertical;
+}
+
+.match-field :disabled {
+  opacity: .78;
+}
+
+.score-frame-card > .button,
+.score-frame-result-form .button,
+.match-confirmation-panel > .button,
+.match-dispute-form .button {
+  min-height: 48px;
+  margin-top: 13px;
+}
+
+.score-frame-result-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.score-frame-result-form .button {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.match-confirmation-panel {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+}
+
+.match-confirmation-panel h3 {
+  margin: 0;
+  color: var(--gold-light);
+  font-family: "Barlow Condensed", Impact, sans-serif;
+  font-size: 29px;
+  text-transform: uppercase;
+}
+
+.match-confirmation-panel > p {
+  margin: 0;
+  font-size: 15px;
+}
+
+.match-dispute-form {
+  display: grid;
+  gap: 8px;
+  width: min(100%, 640px);
+  margin-top: 8px;
+}
+
+.match-audit-panel summary {
+  color: var(--gold-light);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.match-audit-list {
+  display: grid;
+  gap: 7px;
+  padding-left: 22px;
+  color: #d5cbd0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.match-page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+  margin-top: 28px;
+}
+
+@media (max-width: 760px) {
+  .match-scoreboard-header {
+    grid-template-columns: 1fr;
+  }
+
+  .match-score-summary {
+    border-top: 1px solid var(--line);
+    border-left: 0;
+    padding-top: 20px;
+  }
+
+  .score-frame-result-form {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  .match-centre-content {
+    padding-top: 44px;
+    padding-bottom: 54px;
+  }
+
+  .score-frame-sides {
+    grid-template-columns: 1fr;
+  }
+
+  .score-frame-side {
+    padding: 11px;
+  }
+
+  .match-list-card,
+  .match-scoreboard-header,
+  .score-frame-card,
+  .match-confirmation-panel,
+  .match-audit-panel {
+    padding: 15px;
+  }
+}

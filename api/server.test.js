@@ -14,6 +14,61 @@ test("login page sends the checked state of Remember me as a boolean", async () 
     "The frontend must not persist passwords or session credentials in browser storage.");
 });
 
+test("match API keeps public reads available and requires an authenticated user for scoreboard mutations", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  const { createApp } = await import("./server.js");
+  const calls = [];
+  const match = { id: "123e4567-e89b-42d3-a456-426614174000", type: "team_league", status: "scheduled" };
+  const store = {
+    async listMatches(filters, viewerId) { calls.push(["list", filters, viewerId]); return [match]; },
+    async createMatch(actorId, details) { calls.push(["create", actorId, details]); return { match }; },
+    async getMatch(id, viewerId) { calls.push(["get", id, viewerId]); return { match, frames: [], confirmations: [], disputes: [] }; },
+    async startMatch(id, actorId) { calls.push(["start", id, actorId]); return { match }; }
+  };
+  const auth = { api: { async getSession({ headers }) {
+    return headers.get("x-test-session") === "player-1" ? { user: { id: "player-1" } } : null;
+  } } };
+  const app = createApp({ getAuthInstance: async () => auth, getMatchStore: async () => store });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const request = (path, options = {}) => fetch(`${base}${path}`, {
+    ...options,
+    headers: { origin: "http://localhost:5500", ...(options.headers || {}) }
+  });
+  try {
+    let response = await request("/api/matches?type=team_league");
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).matches, [match]);
+    assert.deepEqual(calls[0], ["list", { type: "team_league" }, null]);
+
+    response = await request("/api/matches", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "practice" })
+    });
+    assert.equal(response.status, 401);
+    assert.equal(calls.some(([method]) => method === "create"), false);
+
+    response = await request("/api/matches", {
+      method: "POST", headers: { "content-type": "application/json", "x-test-session": "player-1" }, body: JSON.stringify({ type: "practice" })
+    });
+    assert.equal(response.status, 201);
+    assert.equal(calls.at(-1)[1], "player-1");
+
+    response = await request("/api/matches/not-a-uuid");
+    assert.equal(response.status, 400);
+    response = await request(`/api/matches/${match.id}/start`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(response.status, 401);
+    response = await request(`/api/matches/${match.id}/start`, {
+      method: "POST", headers: { "content-type": "application/json", "x-test-session": "player-1" }, body: "{}"
+    });
+    assert.equal(response.status, 200);
+    assert.equal(calls.at(-1)[2], "player-1");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 const sentEmails = [];
 const providerResponses = [];
 const emailSender = {

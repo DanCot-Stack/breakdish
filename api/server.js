@@ -6,6 +6,7 @@ import helmet from "helmet";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { createLeagueStore, LeagueStoreError } from "./league-store.js";
 import { createCompetitionStore } from "./competition-store.js";
+import { createMatchStore } from "./match-store.js";
 import { createEmailSender } from "./mailer.js";
 import { createProfileStore } from "./profile-store.js";
 import { validateSubmission } from "./validation.js";
@@ -25,6 +26,7 @@ let authModulePromise;
 let profileStorePromise;
 let leagueStorePromise;
 let competitionStorePromise;
+let matchStorePromise;
 
 async function getConfiguredAuth() {
   authModulePromise ??= import("./auth.js");
@@ -46,6 +48,11 @@ async function getConfiguredCompetitionStore() {
   return competitionStorePromise;
 }
 
+async function getConfiguredMatchStore() {
+  matchStorePromise ??= import("./auth.js").then(({ database }) => createMatchStore(database));
+  return matchStorePromise;
+}
+
 function createConfiguredEmailSender() {
   const hasContactSettings = ["RESEND_API_KEY", "CONTACT_TO_EMAIL", "CONTACT_FROM_EMAIL"]
     .some((key) => typeof process.env[key] === "string" && process.env[key].trim());
@@ -57,7 +64,8 @@ function createApp({
   getAuthInstance = getConfiguredAuth,
   getProfileStore = getConfiguredProfileStore,
   getLeagueStore = getConfiguredLeagueStore,
-  getCompetitionStore = getConfiguredCompetitionStore
+  getCompetitionStore = getConfiguredCompetitionStore,
+  getMatchStore = getConfiguredMatchStore
 } = {}) {
   const app = express();
 
@@ -140,6 +148,13 @@ function createApp({
     standardHeaders: "draft-8",
     legacyHeaders: false,
     handler: (_req, res) => res.status(429).json({ error: "Too many season or team changes. Please wait before trying again." })
+  });
+  const matchMutationLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 120,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    handler: (_req, res) => res.status(429).json({ error: "Too many scoreboard changes. Please wait before trying again." })
   });
 
   app.get("/healthz", (_req, res) => res.json({ ok: true }));
@@ -611,6 +626,247 @@ function createApp({
     }
   });
 
+  const matchStore = () => getMatchStore();
+  const matchSession = async (req) => {
+    const auth = await getAuthInstance();
+    return auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+  };
+  const parseFrameNumber = (value) => {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= 1 && number <= 99 ? number : null;
+  };
+
+  app.get("/api/matches", async (req, res, next) => {
+    try {
+      const session = await matchSession(req);
+      const filters = {};
+      for (const key of ["leagueId", "seasonId", "tournamentEventId", "type", "status"]) {
+        if (typeof req.query[key] === "string" && req.query[key]) filters[key] = req.query[key];
+      }
+      const matches = await (await matchStore()).listMatches(filters, session?.user.id || null);
+      return res.json({ matches });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/matches", matchMutationLimiter, async (req, res, next) => {
+    try {
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to create a match." });
+      const match = await (await matchStore()).createMatch(session.user.id, asRecord(req.body));
+      return res.status(201).json(match);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/api/tournaments", async (_req, res, next) => {
+    try {
+      const events = await (await matchStore()).listTournamentEvents();
+      return res.json({ events });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/tournaments", matchMutationLimiter, async (req, res, next) => {
+    try {
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to organise a tournament or flyer." });
+      const details = asRecord(req.body);
+      if (details.description != null && (typeof details.description !== "string" || details.description.trim().length > 2000)) {
+        return res.status(400).json({ error: "Description must be 2,000 characters or fewer." });
+      }
+      if (details.venue != null && (typeof details.venue !== "string" || details.venue.trim().length > 160)) {
+        return res.status(400).json({ error: "Venue must be 160 characters or fewer." });
+      }
+      const event = await (await matchStore()).createTournamentEvent(session.user.id, details);
+      return res.status(201).json({ event });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/api/leagues/:leagueId/match-format", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId)) return res.status(400).json({ error: "Enter a valid league ID." });
+      const format = await (await matchStore()).getLeagueFormat(req.params.leagueId);
+      if (!format) return res.status(404).json({ error: "This league has not configured a match format yet." });
+      return res.json({ format });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.put("/api/leagues/:leagueId/match-format", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId)) return res.status(400).json({ error: "Enter a valid league ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to set the match format." });
+      const body = asRecord(req.body);
+      if (!Array.isArray(body.frames) || body.frames.length < 1 || body.frames.length > 99) {
+        return res.status(400).json({ error: "Add between 1 and 99 ordered Singles or Doubles frames." });
+      }
+      const format = await (await matchStore()).setLeagueFormat(req.params.leagueId, session.user.id, body);
+      return res.json({ format });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/matches/:matchId/apply-league-format", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to update this fixture format." });
+      const match = await (await matchStore()).applyLeagueFormatToMatch(req.params.matchId, session.user.id);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.get("/api/matches/:matchId", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      const result = await (await matchStore()).getMatch(req.params.matchId, session?.user.id || null);
+      if (!result) return res.status(404).json({ error: "This match could not be found." });
+      return res.json(result);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/matches/:matchId/start", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to start this scoreboard." });
+      const match = await (await matchStore()).startMatch(req.params.matchId, session.user.id);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.get("/api/matches/:matchId/eligible-players", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to view eligible players." });
+      const players = await (await matchStore()).eligiblePlayers(req.params.matchId, req.query.side, session.user.id);
+      return res.json({ players });
+    } catch (error) { return next(error); }
+  });
+
+  app.put("/api/matches/:matchId/frames/:frameNumber/players", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const frameNumber = parseFrameNumber(req.params.frameNumber);
+      if (!frameNumber) return res.status(400).json({ error: "Enter a valid frame number." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to update this scoreboard." });
+      const players = req.body?.players;
+      if (players !== undefined && (!Array.isArray(players) || players.length > 2 || players.some((id) => !isValidAccountId(id)))) {
+        return res.status(400).json({ error: "Choose up to two valid registered players." });
+      }
+      const match = await (await matchStore()).setFramePlayers(req.params.matchId, frameNumber, session.user.id, asRecord(req.body));
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.put("/api/matches/:matchId/frames/:frameNumber/result", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const frameNumber = parseFrameNumber(req.params.frameNumber);
+      if (!frameNumber) return res.status(400).json({ error: "Enter a valid frame number." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to record a frame result." });
+      const match = await (await matchStore()).completeFrame(req.params.matchId, frameNumber, session.user.id, asRecord(req.body));
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.put("/api/matches/:matchId/frames/:frameNumber/event", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const frameNumber = parseFrameNumber(req.params.frameNumber);
+      if (!frameNumber) return res.status(400).json({ error: "Enter a valid frame number." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to update frame events." });
+      const match = await (await matchStore()).setFrameEvent(req.params.matchId, frameNumber, session.user.id, asRecord(req.body));
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/confirm", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to confirm this result." });
+      const match = await (await matchStore()).confirmSide(req.params.matchId, session.user.id, req.body?.side ?? null);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/confirm/retract", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to retract your confirmation." });
+      const match = await (await matchStore()).retractConfirmation(req.params.matchId, session.user.id, req.body?.side);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/disputes", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to dispute this result." });
+      const match = await (await matchStore()).raiseDispute(req.params.matchId, session.user.id, asRecord(req.body));
+      return res.status(201).json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/disputes/:disputeId/resolve", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId) || !isUuid(req.params.disputeId)) return res.status(400).json({ error: "Enter valid match and dispute IDs." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a competition administrator to resolve a dispute." });
+      const match = await (await matchStore()).resolveDispute(req.params.matchId, req.params.disputeId, session.user.id, req.body?.resolution);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/finalize", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to finalize this result." });
+      const match = await (await matchStore()).finalizeMatch(req.params.matchId, session.user.id);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/money-acknowledgements", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to acknowledge Money Match terms." });
+      const match = await (await matchStore()).acknowledgeMoneyMatch(req.params.matchId, session.user.id, req.body?.type);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.get("/api/matches/:matchId/audit", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to view this audit history." });
+      const events = await (await matchStore()).getAudit(req.params.matchId, session.user.id);
+      return res.json({ events });
+    } catch (error) { return next(error); }
+  });
+
   app.post("/api/contact", contactLimiter, async (req, res, next) => {
     try {
       const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -654,8 +910,8 @@ let app = createApp();
 
 async function start(options = {}) {
   emailSender = Object.hasOwn(options, "emailSender") ? options.emailSender : createConfiguredEmailSender();
-  const { getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore } = options;
-  app = createApp({ getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore });
+  const { getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore, getMatchStore } = options;
+  app = createApp({ getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore, getMatchStore });
   server = app.listen(port, "0.0.0.0", () => {
     console.log(`BREAK DISH API listening on port ${server.address().port}`);
   });
@@ -681,6 +937,7 @@ async function shutDown() {
   profileStorePromise = undefined;
   leagueStorePromise = undefined;
   competitionStorePromise = undefined;
+  matchStorePromise = undefined;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

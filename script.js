@@ -105,6 +105,8 @@ async function apiRequest(path, options = {}) {
   return { response, payload };
 }
 
+window.BreakDishApi = Object.freeze({ request: apiRequest });
+
 function getSafeNextPage(candidate) {
   const fallback = "account.html";
   if (typeof candidate !== "string" || !candidate.trim()) return fallback;
