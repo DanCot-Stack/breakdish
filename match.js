@@ -56,10 +56,17 @@ if (page) {
   }
 
   function matchLabel(match) {
-    if (match.homeTeam || match.awayTeam) return `${match.homeTeam || "Home"} v ${match.awayTeam || "Away"}`;
+    if (match.homeTeam || match.awayTeam || match.homeSideName || match.awaySideName) {
+      return `${sideName(match, 1)} v ${sideName(match, 2)}`;
+    }
     if (match.tournamentName) return match.tournamentName;
     if (match.leagueName) return match.leagueName;
     return labels[match.type] || "BREAK DISH match";
+  }
+
+  function sideName(match, side) {
+    if (side === 1) return match.homeTeam || match.homeSideName || "Home";
+    return match.awayTeam || match.awaySideName || "Away";
   }
 
   function renderMatchList(matches) {
@@ -76,7 +83,7 @@ if (page) {
         textElement("span", `match-state-tag is-${match.status}`, match.status.replaceAll("_", " "))
       );
       const name = textElement("h3", "", matchLabel(match));
-      const meta = textElement("p", "match-list-meta", `${formatDate(match.scheduledAt)}${match.venue ? ` · ${match.venue}` : ""}`);
+      const meta = textElement("p", "match-list-meta", `${formatDate(match.scheduledAt)}${match.divisionName ? ` · ${match.divisionName}` : ""}${match.venue ? ` · ${match.venue}` : ""}`);
       const score = textElement("p", "match-list-score", `${match.homeScore} — ${match.awayScore}`);
       const link = textElement("a", "button button-gold", "Open scoreboard");
       link.href = `match.html?id=${encodeURIComponent(match.id)}`;
@@ -107,9 +114,9 @@ if (page) {
     const score = textElement("div", "match-score-summary");
     score.setAttribute("aria-label", `Score ${match.homeScore} to ${match.awayScore}`);
     score.append(
-      textElement("span", "match-score-team", match.homeTeam || "Home"),
+      textElement("span", "match-score-team", sideName(match, 1)),
       textElement("strong", "match-score-number", `${match.homeScore} – ${match.awayScore}`),
-      textElement("span", "match-score-team", match.awayTeam || "Away"),
+      textElement("span", "match-score-team", sideName(match, 2)),
       textElement("small", "", `${match.framesCompleted} played · ${match.framesRemaining} remaining`)
     );
     header.append(identity, score);
@@ -153,7 +160,7 @@ if (page) {
     );
     card.append(heading);
     if (frame.status === "completed") {
-      const winning = frame.winnerSide === 1 ? (match.homeTeam || "Home") : (match.awayTeam || "Away");
+      const winning = sideName(match, frame.winnerSide);
       card.append(textElement("p", "score-frame-result", `${winning} won${frame.outcome === "bye" ? " by Bye" : frame.outcome === "forfeit" ? " by forfeit" : ""}.`));
     }
     const grid = textElement("div", "score-frame-sides");
@@ -163,10 +170,10 @@ if (page) {
     const selects = new Map();
     let playerLoadError = "";
     for (const side of [1, 2]) {
-      const sideName = side === 1 ? (match.homeTeam || "Home") : (match.awayTeam || "Away");
+      const label = sideName(match, side);
       const fieldset = document.createElement("fieldset");
       fieldset.className = "score-frame-side";
-      fieldset.append(textElement("legend", "", sideName));
+      fieldset.append(textElement("legend", "", label));
       let eligible = [];
       if (signedIn) {
         try { eligible = await loadEligiblePlayers(match.id, side); }
@@ -183,7 +190,7 @@ if (page) {
       for (let slot = 1; slot <= slots; slot++) {
         const selected = current.find((player) => Number(player.slot) === slot);
         const value = selected?.isBye ? "__bye__" : selected?.userId || "";
-        const field = makeSelect(slots === 1 ? `${sideName} player` : `${sideName} player ${slot}`, options, value);
+        const field = makeSelect(slots === 1 ? `${label} player` : `${label} player ${slot}`, options, value);
         field.select.disabled = !editable;
         if (slots === 2 && slot === 2 && current.some((player) => player.isBye)) {
           field.select.value = "__bye__";
@@ -222,7 +229,7 @@ if (page) {
     if (canEditResult) {
       const resultForm = textElement("div", "score-frame-result-form");
       const winnerField = makeSelect("Frame winner", [
-        { value: "1", label: match.homeTeam || "Home" }, { value: "2", label: match.awayTeam || "Away" }
+        { value: "1", label: sideName(match, 1) }, { value: "2", label: sideName(match, 2) }
       ], frame.winnerSide ? String(frame.winnerSide) : "");
       const eventField = makeSelect("Frame event", [
         { value: "none", label: "No Dish" }, { value: "dish", label: "Dish" }, { value: "counter_dish", label: "Counter Dish" }
@@ -308,10 +315,10 @@ if (page) {
     confirmationSection.append(textElement("h3", "", "Result confirmation"));
     const latest = latestConfirmations(result.confirmations);
     const confirmed = [1, 2].filter((side) => latest.get(side)?.action === "confirmed");
-    confirmationSection.append(textElement("p", "", `${match.homeTeam || "Home"}: ${latest.get(1)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"} · ${match.awayTeam || "Away"}: ${latest.get(2)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"}`));
+    confirmationSection.append(textElement("p", "", `${sideName(match, 1)}: ${latest.get(1)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"} · ${sideName(match, 2)}: ${latest.get(2)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"}`));
     if (signedIn && ["awaiting_confirmation", "disputed"].includes(match.status)) {
       if (match.type === "team_league") {
-        const sideField = makeSelect("Team side to confirm", [{ value: "1", label: match.homeTeam || "Home" }, { value: "2", label: match.awayTeam || "Away" }], "1");
+        const sideField = makeSelect("Team side to confirm", [{ value: "1", label: sideName(match, 1) }, { value: "2", label: sideName(match, 2) }], "1");
         const confirm = textElement("button", "button button-gold", "Confirm result for selected side");
         confirm.type = "button";
         confirm.addEventListener("click", () => mutate(async () => {

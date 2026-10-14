@@ -707,6 +707,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       method: "PUT", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.142" },
       body: JSON.stringify(body)
     });
+    const matchPatchJson = (path, sessionCookie, body) => fetchFromSite(path, {
+      method: "PATCH", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.143" },
+      body: JSON.stringify(body)
+    });
     const matchSeasonResponse = await signingPostJson(`/api/leagues/${approval.league.id}/seasons`, firstUserCookie, {
       name: `Match Engine ${crypto.randomUUID()}`, startsOn: yesterday, endsOn: "2027-10-13"
     });
@@ -743,6 +747,12 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     const matchUnderTest = await createTeamMatch();
     const untouchedFutureMatch = await createTeamMatch();
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      homeTeamId: homeMatchTeam.id, awayTeamId: homeMatchTeam.id,
+      scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString()
+    });
+    assert.equal(response.status, 400, "A team cannot be scheduled to play itself.");
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
     assert.equal(response.status, 200, await response.clone().text());
     let matchDetail = await response.json();
@@ -778,6 +788,64 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
     assert.equal((await response.json()).frames.length, 5);
 
+    const changedSchedule = new Date(Date.now() + 45 * 86400000).toISOString();
+    response = await matchPatchJson(`/api/matches/${untouchedFutureMatch.id}/schedule`, thirdUserCookie, {
+      scheduledAt: changedSchedule, venue: "Unauthorised venue"
+    });
+    assert.equal(response.status, 403, "An ordinary league member cannot edit a fixture schedule.");
+    response = await matchPatchJson(`/api/matches/${untouchedFutureMatch.id}/schedule`, firstUserCookie, {
+      scheduledAt: changedSchedule, venue: "Updated local venue"
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    let changedMatch = await response.json();
+    assert.equal(changedMatch.match.venue, "Updated local venue");
+    assert.equal(new Date(changedMatch.match.scheduledAt).toISOString(), changedSchedule);
+
+    const fixtureFrames = [{ type: "doubles" }, { type: "singles" }];
+    response = await matchPutJson(`/api/matches/${untouchedFutureMatch.id}/format`, thirdUserCookie, {
+      name: "Unauthorised fixture format", frames: fixtureFrames
+    });
+    assert.equal(response.status, 403, "An ordinary member cannot change a fixture format.");
+    response = await matchPutJson(`/api/matches/${untouchedFutureMatch.id}/format`, firstUserCookie, {
+      name: "One-off fixture format", frames: fixtureFrames, makeDefault: false
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    changedMatch = await response.json();
+    assert.deepEqual(changedMatch.frames.map((frame) => frame.type), ["doubles", "singles"]);
+    response = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
+    assert.deepEqual((await response.json()).format.frames.map((frame) => frame.type), formatV1Frames.map((frame) => frame.type),
+      "A match-only edit leaves the league default unchanged.");
+    response = await matchPutJson(`/api/matches/${untouchedFutureMatch.id}/format`, firstUserCookie, {
+      name: "Default from fixture edit", frames: fixtureFrames, makeDefault: true
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
+    assert.deepEqual((await response.json()).format.frames.map((frame) => frame.type), fixtureFrames.map((frame) => frame.type),
+      "The optional make-default action updates the format for newly created fixtures.");
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Restore current league default", frames: formatV1Frames
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const newDefaultMatch = await createTeamMatch();
+    assert.equal(newDefaultMatch.framesTotal, formatV1Frames.length, "New fixtures snapshot the current league default.");
+
+    response = await fetchFromSite(`/api/matches?leagueId=${approval.league.id}`);
+    assert.equal(response.status, 200, await response.clone().text());
+    let listedMatches = (await response.json()).matches;
+    const listedFixture = listedMatches.find((item) => item.id === newDefaultMatch.id);
+    assert.ok(listedFixture, "The public Match Centre feed immediately lists a created fixture.");
+    assert.deepEqual([listedFixture.homeScore, listedFixture.awayScore], [0, 0]);
+    assert.equal(listedFixture.status, "scheduled");
+    assert.equal(listedFixture.venue, "Local test venue");
+
+    response = await matchPostJson(`/api/matches/${newDefaultMatch.id}/cancel`, thirdUserCookie, {});
+    assert.equal(response.status, 403, "An ordinary member cannot cancel a fixture.");
+    response = await matchPostJson(`/api/matches/${newDefaultMatch.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal((await response.json()).match.status, "cancelled");
+    response = await matchPostJson(`/api/matches/${newDefaultMatch.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 409, "A cancelled fixture cannot be cancelled a second time.");
+
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`);
     assert.equal(response.status, 401, "Eligible-player reads require a session.");
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`, { headers: { cookie: firstUserCookie } });
@@ -788,6 +856,23 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, thirdUserCookie, {});
     assert.equal(response.status, 200, "Any authenticated player can start an active scoreboard.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/format`, firstUserCookie, {
+      name: "Too late", frames: [{ type: "singles" }]
+    });
+    assert.equal(response.status, 409, "Started match snapshots are locked.");
+    response = await matchPatchJson(`/api/matches/${matchUnderTest.id}/schedule`, firstUserCookie, {
+      scheduledAt: new Date(Date.now() + 50 * 86400000).toISOString(), venue: "Too late"
+    });
+    assert.equal(response.status, 409, "Started fixture scheduling is locked.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 409, "Started fixtures cannot be cancelled as unstarted fixtures.");
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Future fixtures only", frames: [{ type: "singles" }], applyToFuture: true
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal((await response.json()).frames.length, 5,
+      "Applying the new league default to future fixtures leaves a started match snapshot unchanged.");
     const setFrameSide = async (matchId, frame, side, selection) => {
       const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/players`, firstUserCookie, { side, ...selection });
       assert.equal(result.status, 200, await result.clone().text());
@@ -838,6 +923,16 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     for (const action of ["match_started", "player_selection_changed", "frame_result_entered", "bye_entered", "confirmation_confirmed", "match_finalized"]) {
       assert.ok(auditActions.includes(action), `Missing immutable audit action ${action}.`);
     }
+    response = await matchPatchJson(`/api/matches/${matchUnderTest.id}/schedule`, firstUserCookie, {
+      scheduledAt: new Date(Date.now() + 60 * 86400000).toISOString(), venue: "Completed change rejected"
+    });
+    assert.equal(response.status, 409, "Completed match schedules remain immutable.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 409, "Completed matches cannot be cancelled.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/format`, firstUserCookie, {
+      name: "Completed change rejected", frames: [{ type: "singles" }]
+    });
+    assert.equal(response.status, 409, "Completed match format snapshots remain immutable.");
     const officialTeamStats = await database.query("SELECT matches_played, matches_won, matches_lost FROM official_competitive_player_statistics WHERE user_id=$1", [firstUserId]);
     assert.equal(Number(officialTeamStats.rows[0].matches_played), 1);
     assert.equal(Number(officialTeamStats.rows[0].matches_lost), 1, "The official match winner is derived from the frame winners.");
@@ -870,6 +965,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "doubles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString(),
       participants: [
         { userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 1 },
         { userId: thirdProfile.userId, side: 2 }, { userId: fourthProfile.userId, side: 2 }
@@ -884,11 +980,25 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200, await response.clone().text());
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "singles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString(),
+      participants: [{ userId: firstUserId, side: 1 }]
+    });
+    assert.equal(response.status, 400, "Singles fixtures require one player per side.");
+    response = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "singles_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString(),
       participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }]
     });
     assert.equal(response.status, 201, await response.clone().text());
     const singlesMatch = (await response.json()).match;
     assert.equal(singlesMatch.type, "singles_league");
+    const singlesListResponse = await fetchFromSite(`/api/matches?leagueId=${approval.league.id}`);
+    assert.equal(singlesListResponse.status, 200);
+    const listedSingles = (await singlesListResponse.json()).matches.find((item) => item.id === singlesMatch.id);
+    assert.ok(listedSingles);
+    assert.equal(listedSingles.homeSideName, profile.displayName);
+    assert.equal(listedSingles.awaySideName, "Second Player Updated",
+      "Match Centre lists the two registered player names for a Singles fixture.");
     response = await matchPostJson(`/api/matches/${singlesMatch.id}/start`, firstUserCookie, {});
     assert.equal(response.status, 200);
     await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));

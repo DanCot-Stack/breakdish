@@ -807,6 +807,114 @@ if (competitionPage) {
     return payload;
   };
 
+  const matchTypeLabels = { team_league: "Team League", singles_league: "Singles League", doubles_league: "Doubles League" };
+  const sideLabel = (match, side) => side === 1
+    ? match.homeTeam || match.homeSideName || "Home"
+    : match.awayTeam || match.awaySideName || "Away";
+
+  const createFrameEditor = (initialFrames = []) => {
+    const list = createTextElement("div", "format-frame-list");
+    const addFrame = (type = "singles") => {
+      const row = createTextElement("div", "format-frame-row");
+      const number = createTextElement("strong", "format-frame-number", `Frame ${list.children.length + 1}`);
+      const field = createTextElement("label", "competition-field format-frame-type");
+      field.append(createTextElement("span", "", "Frame type"));
+      const select = document.createElement("select");
+      select.dataset.frameType = "true";
+      for (const [value, label] of [["singles", "Singles"], ["doubles", "Doubles"]]) {
+        const option = createTextElement("option", "", label);
+        option.value = value;
+        select.append(option);
+      }
+      select.value = type;
+      field.append(select);
+      const controls = createTextElement("div", "format-frame-controls");
+      const moveUp = createTextElement("button", "button button-quiet button-compact", "Move up");
+      moveUp.type = "button";
+      moveUp.addEventListener("click", () => {
+        const previous = row.previousElementSibling;
+        if (previous) list.insertBefore(row, previous);
+        updateNumbers();
+      });
+      const moveDown = createTextElement("button", "button button-quiet button-compact", "Move down");
+      moveDown.type = "button";
+      moveDown.addEventListener("click", () => {
+        const next = row.nextElementSibling;
+        if (next) list.insertBefore(next, row);
+        updateNumbers();
+      });
+      const remove = createTextElement("button", "button button-quiet button-compact", "Remove");
+      remove.type = "button";
+      remove.addEventListener("click", () => {
+        if (list.children.length <= 1) return;
+        row.remove();
+        updateNumbers();
+      });
+      controls.append(moveUp, moveDown, remove);
+      row.append(number, field, controls);
+      list.append(row);
+      updateNumbers();
+    };
+    const updateNumbers = () => {
+      Array.from(list.children).forEach((row, index) => {
+        row.querySelector(".format-frame-number").textContent = `Frame ${index + 1}`;
+        row.querySelectorAll("button").forEach((button, buttonIndex) => {
+          button.disabled = (buttonIndex === 0 && index === 0)
+            || (buttonIndex === 1 && index === list.children.length - 1)
+            || (buttonIndex === 2 && list.children.length === 1);
+        });
+      });
+    };
+    (initialFrames.length ? initialFrames : [{ type: "singles" }]).forEach((frame) => addFrame(frame.type));
+    return { list, addFrame, getFrames: () => Array.from(list.querySelectorAll("[data-frame-type]")).map((select) => ({ type: select.value })) };
+  };
+
+  const renderLeagueFormat = async (competition, isManager) => {
+    const panel = createTextElement("section", "competition-match-management");
+    panel.append(createTextElement("div", "section-kicker", "MATCH FORMAT"), createTextElement("h3", "", "League default format"));
+    let current = null;
+    try {
+      const { response, payload } = await apiRequest(`/api/leagues/${encodeURIComponent(competition.league.id)}/match-format`);
+      if (response.ok) current = payload.format;
+      else if (response.status !== 404) throw new Error(payload.error || "The league format could not be loaded.");
+    } catch (error) {
+      panel.append(statusElement(error instanceof TypeError ? "The match format service is unavailable." : error.message));
+      return panel;
+    }
+    if (current) {
+      const summary = current.frames.map((frame) => `${frame.number}. ${frame.type === "singles" ? "Singles" : "Doubles"}`).join(" · ");
+      panel.append(createTextElement("p", "management-help", `${current.name} · version ${current.version} · ${summary}`));
+    } else {
+      panel.append(createTextElement("p", "management-help", "No match format has been configured. Set the ordered frame list before creating league fixtures."));
+    }
+    if (!isManager) return panel;
+
+    const form = makeForm("competition-form league-format-form", current ? "Create a new format version" : "Configure the first format");
+    addField(form, "Format name", "name", "text", { value: current?.name || "League match format", maxLength: 120, required: true });
+    const editor = createFrameEditor(current?.frames || []);
+    form.append(editor.list);
+    const add = createTextElement("button", "button button-quiet button-compact", "Add a frame");
+    add.type = "button";
+    add.addEventListener("click", () => editor.addFrame());
+    form.append(add);
+    addField(form, "When saving this default", "applyMode", "select", {
+      choices: [["default", "Use for new fixtures only"], ["future", "Also update all eligible future, unplayed fixtures"]]
+    });
+    form.append(createTextElement("p", "management-help", "Started and completed matches keep their existing snapshots. Future fixture updates apply only to scheduled matches without player selections."));
+    form.append(makeButton(current ? "Save new format version" : "Save league format"), statusElement());
+    wireForm(form, async (data) => {
+      const frames = editor.getFrames();
+      if (!frames.length || frames.length > 99) throw new Error("Add between 1 and 99 frames.");
+      const result = await request(`/api/leagues/${encodeURIComponent(competition.league.id)}/match-format`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: data.get("name"), frames, applyToFuture: data.get("applyMode") === "future" })
+      });
+      return result;
+    }, "League format saved. Existing started or completed match snapshots are unchanged.");
+    panel.append(form);
+    return panel;
+  };
+
   const addSeasonActions = (season, isManager) => {
     const panel = createTextElement("div", "season-management");
     const dateOptions = [
@@ -1047,12 +1155,262 @@ if (competitionPage) {
     }
   }
 
+  const toLocalDateTime = (value) => {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.valueOf())) return "";
+    return new Date(date.valueOf() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  };
+
+  const formatFixtureDate = (value) => {
+    if (!value) return "Date to be confirmed";
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf()) ? "Date to be confirmed" : new Intl.DateTimeFormat("en-GB", {
+      dateStyle: "medium", timeStyle: "short", timeZone: "Europe/London"
+    }).format(date);
+  };
+
+  const createFixtureDraft = (season, activeMembers) => {
+    const row = createTextElement("fieldset", "fixture-entry-row");
+    row.append(createTextElement("legend", "", `Fixture ${document.querySelectorAll(".fixture-entry-row").length + 1}`));
+    const field = (label, name, type, options = {}) => {
+      const control = addField(row, label, name, type, options);
+      control.dataset.fixtureField = name;
+      return control;
+    };
+    const matchType = field("Competition type", "type", "select", {
+      choices: [["team_league", "Team League"], ["singles_league", "Singles League"]]
+    });
+    const teamFields = createTextElement("div", "fixture-side-fields");
+    const teamChoices = season.teams.filter((team) => team.status === "active").map((team) => [team.id, team.name]);
+    const homeTeam = addField(teamFields, "Home team", "homeTeamId", "select", {
+      required: true, choices: teamChoices.length ? [["", "Choose a team"], ...teamChoices] : [["", "No active teams"]]
+    });
+    const awayTeam = addField(teamFields, "Away team", "awayTeamId", "select", {
+      required: true, choices: teamChoices.length ? [["", "Choose a team"], ...teamChoices] : [["", "No active teams"]]
+    });
+    const divisionChoices = [["", "No division"]];
+    season.divisions.forEach((division) => divisionChoices.push([division.id, division.name]));
+    const division = addField(teamFields, "Division (optional)", "divisionId", "select", { choices: divisionChoices });
+    const singlesFields = createTextElement("div", "fixture-side-fields");
+    const memberChoices = activeMembers.map((member) => [member.userId, member.displayName]);
+    const playerOne = addField(singlesFields, "Player on side 1", "playerOne", "select", {
+      required: true, choices: memberChoices.length ? [["", "Choose a player"], ...memberChoices] : [["", "No active members"]]
+    });
+    const playerTwo = addField(singlesFields, "Player on side 2", "playerTwo", "select", {
+      required: true, choices: memberChoices.length ? [["", "Choose a player"], ...memberChoices] : [["", "No active members"]]
+    });
+    const scheduledAt = field("Date and time", "scheduledAt", "datetime-local", { required: true });
+    const venue = field("Venue (optional)", "venue", "text", { maxLength: 160, placeholder: "Venue name" });
+    const remove = createTextElement("button", "button button-quiet button-compact fixture-remove", "Remove fixture row");
+    remove.type = "button";
+    remove.addEventListener("click", () => {
+      if (row.parentElement.children.length > 1) row.remove();
+    });
+    row.append(teamFields, singlesFields, remove);
+    const syncType = () => {
+      const teamMode = matchType.value === "team_league";
+      teamFields.hidden = !teamMode;
+      singlesFields.hidden = teamMode;
+      [homeTeam, awayTeam].forEach((control) => { control.disabled = !teamMode; });
+      division.disabled = !teamMode;
+      [playerOne, playerTwo].forEach((control) => { control.disabled = teamMode; });
+    };
+    matchType.addEventListener("change", syncType);
+    syncType();
+    return row;
+  };
+
+  const renderFixtureControls = (match) => {
+    const controls = createTextElement("div", "fixture-manager-actions");
+    const scheduleDetails = createTextElement("details", "fixture-edit-details");
+    scheduleDetails.append(createTextElement("summary", "", "Edit date, time or venue"));
+    const scheduleForm = makeForm("competition-form fixture-edit-form", "Update scheduled details");
+    addField(scheduleForm, "Date and time", "scheduledAt", "datetime-local", { value: toLocalDateTime(match.scheduledAt), required: true });
+    addField(scheduleForm, "Venue", "venue", "text", { value: match.venue || "", maxLength: 160 });
+    scheduleForm.append(makeButton("Save fixture details", "button button-quiet"), statusElement());
+    wireForm(scheduleForm, async (data) => request(`/api/matches/${encodeURIComponent(match.id)}/schedule`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scheduledAt: new Date(data.get("scheduledAt")).toISOString(), venue: data.get("venue") || null })
+    }), "Fixture details updated.");
+    scheduleDetails.append(scheduleForm);
+
+    const formatDetails = createTextElement("details", "fixture-edit-details");
+    formatDetails.append(createTextElement("summary", "", "Edit this fixture’s frame format"));
+    const formatContent = createTextElement("div", "fixture-format-content");
+    formatDetails.append(formatContent);
+    formatDetails.addEventListener("toggle", async () => {
+      if (!formatDetails.open || formatDetails.dataset.loaded === "true") return;
+      setStatus(status, "Loading fixture format…", "pending");
+      try {
+        const details = await request(`/api/matches/${encodeURIComponent(match.id)}`);
+        const frames = (details.frames || []).map((frame) => ({ type: frame.type }));
+        const form = makeForm("competition-form fixture-format-form", "Save a new fixture format version");
+        addField(form, "Format name", "name", "text", { value: `Fixture format for ${formatFixtureDate(match.scheduledAt)}`, maxLength: 120, required: true });
+        const editor = createFrameEditor(frames);
+        form.append(editor.list);
+        const add = createTextElement("button", "button button-quiet button-compact", "Add a frame");
+        add.type = "button";
+        add.addEventListener("click", () => editor.addFrame());
+        form.append(add);
+        const defaultLabel = createTextElement("label", "competition-inline-check");
+        const makeDefault = document.createElement("input");
+        makeDefault.type = "checkbox";
+        makeDefault.name = "makeDefault";
+        defaultLabel.append(makeDefault, createTextElement("span", "", "Also use this format as the league default for new fixtures"));
+        form.append(defaultLabel, createTextElement("p", "management-help", "Leave unchecked to change this scheduled fixture only. Started and completed matches cannot be rewritten."));
+        form.append(makeButton("Save fixture format"), statusElement());
+        wireForm(form, async (data) => {
+          const nextFrames = editor.getFrames();
+          if (!nextFrames.length || nextFrames.length > 99) throw new Error("Add between 1 and 99 frames.");
+          return request(`/api/matches/${encodeURIComponent(match.id)}/format`, {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: data.get("name"), frames: nextFrames, makeDefault: data.has("makeDefault") })
+          });
+        }, "Fixture format saved. Other existing match snapshots are unchanged.");
+        formatContent.replaceChildren(form);
+        formatDetails.dataset.loaded = "true";
+        setStatus(status, "Fixture format loaded.", "success");
+      } catch (error) {
+        formatContent.append(statusElement(error instanceof TypeError ? "Fixture format is unavailable right now." : error.message));
+        setStatus(status, "Fixture format could not be loaded.", "error");
+      }
+    });
+
+    const cancel = createTextElement("button", "button button-quiet button-compact", "Cancel fixture");
+    cancel.type = "button";
+    cancel.addEventListener("click", async () => {
+      if (!window.confirm("Cancel this unstarted fixture? It will remain in the match history as cancelled.")) return;
+      cancel.disabled = true;
+      try {
+        await request(`/api/matches/${encodeURIComponent(match.id)}/cancel`, { method: "POST" });
+        await loadCompetition();
+      } catch (error) {
+        setStatus(status, error instanceof TypeError ? "We couldn't reach the match service." : error.message, "error");
+        cancel.disabled = false;
+      }
+    });
+    controls.append(scheduleDetails, formatDetails, cancel);
+    return controls;
+  };
+
+  const renderSeasonFixtures = (season, isManager, matches, activeMembers) => {
+    const section = createTextElement("section", "competition-fixtures");
+    section.append(createTextElement("div", "section-kicker", "SCHEDULE"), createTextElement("h4", "", "Upcoming fixtures"));
+    const divisionChoices = [["", "All divisions"]];
+    season.divisions.forEach((division) => divisionChoices.push([division.id, division.name]));
+    const filterWrap = createTextElement("div", "fixture-list-filter");
+    const filter = document.createElement("select");
+    filter.setAttribute("aria-label", "Filter fixtures by division");
+    divisionChoices.forEach(([value, label]) => {
+      const option = createTextElement("option", "", label); option.value = value; filter.append(option);
+    });
+    filterWrap.append(createTextElement("label", "", "Division"), filter);
+    const list = createTextElement("div", "fixture-list");
+    const renderList = () => {
+      list.replaceChildren();
+      const upcoming = matches.filter((match) => match.seasonId === season.id && match.status === "scheduled"
+        && (!filter.value || match.divisionId === filter.value))
+        .sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+      if (!upcoming.length) {
+        list.append(createTextElement("p", "management-empty", filter.value ? "No upcoming fixtures are listed for this division." : "No upcoming fixtures have been published for this season."));
+        return;
+      }
+      upcoming.forEach((match) => {
+        const card = createTextElement("article", "fixture-card");
+        const heading = createTextElement("div", "fixture-card-heading");
+        heading.append(createTextElement("span", "match-category-tag", matchTypeLabels[match.type] || "League match"),
+          createTextElement("span", "match-state-tag is-scheduled", "scheduled"));
+        card.append(heading, createTextElement("h5", "", `${sideLabel(match, 1)} v ${sideLabel(match, 2)}`),
+          createTextElement("p", "match-list-meta", `${formatFixtureDate(match.scheduledAt)}${match.divisionName ? ` · ${match.divisionName}` : ""}${match.venue ? ` · ${match.venue}` : ""}`),
+          createTextElement("p", "fixture-score", `${match.homeScore} — ${match.awayScore}`));
+        const link = createTextElement("a", "text-link", "Open in Match Centre ↗");
+        link.href = `match.html?id=${encodeURIComponent(match.id)}`;
+        card.append(link);
+        if (isManager && season.status !== "completed") card.append(renderFixtureControls(match));
+        list.append(card);
+      });
+    };
+    filter.addEventListener("change", renderList);
+    section.append(filterWrap, list);
+    renderList();
+
+    if (isManager && season.status !== "completed") {
+      const form = makeForm("competition-form fixture-create-form", "Add one or more fixtures");
+      form.append(createTextElement("p", "management-help", "Build several fixtures in this session. Team fixtures use active teams; Singles fixtures use active registered league members."));
+      const rows = createTextElement("div", "fixture-entry-list");
+      rows.append(createFixtureDraft(season, activeMembers));
+      const addRow = createTextElement("button", "button button-quiet button-compact", "Add another fixture");
+      addRow.type = "button";
+      addRow.addEventListener("click", () => rows.append(createFixtureDraft(season, activeMembers)));
+      const feedback = statusElement();
+      form.append(rows, addRow, makeButton("Create fixtures"), feedback);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const pendingRows = Array.from(rows.children).filter((row) => row.dataset.created !== "true");
+        if (!pendingRows.length) return;
+        if (!form.reportValidity()) return;
+        const submit = form.querySelector("[type='submit']");
+        submit.disabled = true;
+        setStatus(feedback, "Saving fixtures…", "pending");
+        let saved = Array.from(rows.children).filter((row) => row.dataset.created === "true").length;
+        try {
+          for (const row of pendingRows) {
+            const value = (name) => row.querySelector(`[data-fixture-field='${name}']`).value;
+            const type = value("type");
+            const scheduledAt = new Date(value("scheduledAt"));
+            if (Number.isNaN(scheduledAt.valueOf())) throw new Error("Enter a valid date and time for each fixture.");
+            let details = { type, leagueId, seasonId: season.id, scheduledAt: scheduledAt.toISOString(), venue: value("venue") || null };
+            if (type === "team_league") {
+              if (value("homeTeamId") === value("awayTeamId")) throw new Error("A team cannot play itself. Choose two different teams.");
+              details = { ...details, divisionId: value("divisionId") || null, homeTeamId: value("homeTeamId"), awayTeamId: value("awayTeamId") };
+            } else {
+              if (value("playerOne") === value("playerTwo")) throw new Error("Choose two different registered players for a Singles fixture.");
+              details.participants = [{ userId: value("playerOne"), side: 1 }, { userId: value("playerTwo"), side: 2 }];
+            }
+            await request("/api/matches", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(details) });
+            row.dataset.created = "true";
+            row.disabled = true;
+            row.append(createTextElement("p", "form-status", "Fixture created."));
+            saved++;
+          }
+          await loadCompetition();
+          setStatus(status, `${saved} ${saved === 1 ? "fixture" : "fixtures"} created.`, "success");
+        } catch (error) {
+          setStatus(feedback, `${saved} saved. ${error instanceof TypeError ? "The match service could not be reached." : error.message} Unsaved rows remain available to retry.`, "error");
+          submit.disabled = false;
+        }
+      });
+      section.append(createTextElement("p", "management-help", "Doubles fixture sides are not offered yet: the current database does not link a registered doubles entry to each match side."), form);
+    }
+    return section;
+  };
+
   const renderCompetition = async (competition) => {
     title.replaceChildren(document.createTextNode(competition.league.name));
     title.classList.add("competition-title");
     description.textContent = [competition.league.location, competition.league.description].filter(Boolean).join(" · ") || "Season and team information published by this league's organisers.";
     seasonsContainer.replaceChildren();
     const isManager = ["owner", "administrator"].includes(competition.viewerRole);
+    seasonsContainer.append(await renderLeagueFormat(competition, isManager));
+    let matchRows = [];
+    let matchLoadError = "";
+    try {
+      const { response, payload } = await apiRequest(`/api/matches?leagueId=${encodeURIComponent(competition.league.id)}`);
+      if (!response.ok) throw new Error(payload.error || "Upcoming fixtures could not be loaded.");
+      matchRows = payload.matches || [];
+    } catch (error) {
+      matchLoadError = error instanceof TypeError ? "Upcoming fixtures are temporarily unavailable." : error.message;
+    }
+    let activeMembers = [];
+    if (isManager) {
+      try {
+        const result = await request(`/api/leagues/${encodeURIComponent(competition.league.id)}/members`);
+        activeMembers = (result.members || []).filter((member) => member.status === "active");
+      } catch {
+        activeMembers = [];
+      }
+    }
     if (!competition.seasons.length) {
       setStatus(status, isManager ? "No seasons yet. Create a draft season to begin organising divisions and teams." : "No public seasons have been published yet.", "success");
       if (isManager) {
@@ -1129,6 +1487,9 @@ if (competitionPage) {
       for (const team of season.teams) unassignedGrid.append(await renderTeamCard(team, season, isManager));
       unassignedBlock.append(unassignedGrid);
       seasonCard.append(unassignedBlock);
+      const fixtureBlock = renderSeasonFixtures(season, isManager, matchRows, activeMembers);
+      if (matchLoadError) fixtureBlock.prepend(statusElement(matchLoadError));
+      seasonCard.append(fixtureBlock);
       seasonsContainer.append(seasonCard);
     }
   };

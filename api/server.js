@@ -725,6 +725,40 @@ function createApp({
     } catch (error) { return next(error); }
   });
 
+  app.put("/api/matches/:matchId/format", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to edit this fixture format." });
+      const body = asRecord(req.body);
+      if (!Array.isArray(body.frames) || body.frames.length < 1 || body.frames.length > 99) {
+        return res.status(400).json({ error: "Add between 1 and 99 ordered Singles or Doubles frames." });
+      }
+      const match = await (await matchStore()).setMatchFormat(req.params.matchId, session.user.id, body);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.patch("/api/matches/:matchId/schedule", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to edit this fixture." });
+      const match = await (await matchStore()).updateScheduledMatch(req.params.matchId, session.user.id, asRecord(req.body));
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/matches/:matchId/cancel", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to cancel this fixture." });
+      const match = await (await matchStore()).cancelScheduledMatch(req.params.matchId, session.user.id);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
   app.get("/api/matches/:matchId", async (req, res, next) => {
     try {
       if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });

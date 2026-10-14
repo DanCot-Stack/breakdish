@@ -86,6 +86,23 @@ async function requireLeagueManager(client, leagueId, actorId) {
   }
 }
 
+async function lockManagedLeagueMatch(client, matchId, actorId) {
+  const id = cleanUuid(matchId, "match ID");
+  const initial = await requireMatch(client, id);
+  if (!initial.league_id) throw new LeagueStoreError(404, "This league fixture could not be found.");
+  await requireLeagueManager(client, initial.league_id, actorId);
+  const league = await client.query("SELECT id FROM leagues WHERE id = $1 FOR UPDATE", [initial.league_id]);
+  if (!league.rows[0]) throw new LeagueStoreError(404, "This league could not be found.");
+  return requireMatch(client, id, true);
+}
+
+async function assertFixtureSeasonEditable(client, match) {
+  const result = await client.query("SELECT status FROM seasons WHERE id = $1", [match.season_id]);
+  if (result.rows[0]?.status === "completed") {
+    throw new LeagueStoreError(409, "Completed seasons keep their fixture history unchanged.");
+  }
+}
+
 async function requireCompletedMatchAmendment(client, match, actorId) {
   if (!new Set(["completed", "disputed"]).has(match.status)) return false;
   if (match.league_id) {
@@ -121,7 +138,10 @@ function toMatch(row) {
     awayTeamId: row.away_team_id,
     homeTeam: row.home_team_name ?? null,
     awayTeam: row.away_team_name ?? null,
+    homeSideName: row.home_side_name ?? null,
+    awaySideName: row.away_side_name ?? null,
     leagueName: row.league_name ?? null,
+    divisionName: row.division_name ?? null,
     tournamentEventId: row.tournament_event_id,
     tournamentName: row.tournament_name ?? null,
     scheduledAt: row.scheduled_at,
@@ -140,13 +160,27 @@ function toMatch(row) {
 
 async function matchWithDetails(client, matchId) {
   const matchResult = await client.query(
-    `SELECT sb.*, l.name AS league_name, ht.name AS home_team_name,
-       at.name AS away_team_name, te.name AS tournament_name
+    `SELECT sb.*, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
+       at.name AS away_team_name, te.name AS tournament_name,
+       hp.display_names AS home_side_name, ap.display_names AS away_side_name
      FROM match_scoreboard sb
      LEFT JOIN leagues l ON l.id = sb.league_id
+     LEFT JOIN divisions d ON d.id = sb.division_id
      LEFT JOIN teams ht ON ht.id = sb.home_team_id
      LEFT JOIN teams at ON at.id = sb.away_team_id
      LEFT JOIN tournament_events te ON te.id = sb.tournament_event_id
+     LEFT JOIN LATERAL (
+       SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+       FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
+       LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
+       WHERE mp.match_id = sb.match_id AND mp.side = 1
+     ) hp ON true
+     LEFT JOIN LATERAL (
+       SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+       FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
+       LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
+       WHERE mp.match_id = sb.match_id AND mp.side = 2
+     ) ap ON true
      WHERE sb.match_id = $1`,
     [matchId]
   );
@@ -256,14 +290,28 @@ export function createMatchStore(database) {
           values.push(filters.status); clauses.push(`sb.status = $${values.length}`);
         }
         const result = await client.query(
-          `SELECT sb.*, l.name AS league_name, ht.name AS home_team_name,
-             at.name AS away_team_name, te.name AS tournament_name
+          `SELECT sb.*, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
+             at.name AS away_team_name, te.name AS tournament_name,
+             hp.display_names AS home_side_name, ap.display_names AS away_side_name
            FROM match_scoreboard sb
            JOIN matches m ON m.id = sb.match_id
            LEFT JOIN leagues l ON l.id = sb.league_id
+           LEFT JOIN divisions d ON d.id = sb.division_id
            LEFT JOIN teams ht ON ht.id = sb.home_team_id
            LEFT JOIN teams at ON at.id = sb.away_team_id
            LEFT JOIN tournament_events te ON te.id = sb.tournament_event_id
+           LEFT JOIN LATERAL (
+             SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+             FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
+             LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
+             WHERE mp.match_id = sb.match_id AND mp.side = 1
+           ) hp ON true
+           LEFT JOIN LATERAL (
+             SELECT string_agg(coalesce(pp.display_name, u.name), ' & ' ORDER BY coalesce(pp.display_name, u.name)) AS display_names
+             FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
+             LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
+             WHERE mp.match_id = sb.match_id AND mp.side = 2
+           ) ap ON true
            ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
            ORDER BY sb.scheduled_at NULLS LAST, sb.created_at DESC LIMIT 100`,
           values
@@ -366,7 +414,9 @@ export function createMatchStore(database) {
           const fixtures = await client.query(
             `SELECT m.id, s.id AS snapshot_id FROM matches m
              JOIN match_format_snapshots s ON s.match_id = m.id
+             JOIN seasons sea ON sea.id = m.season_id
              WHERE m.league_id = $1 AND m.status = 'scheduled' AND m.started_at IS NULL
+               AND sea.status <> 'completed'
                AND m.scheduled_at > now()
                AND NOT EXISTS (SELECT 1 FROM match_frame_players fp WHERE fp.match_id = m.id)
              FOR UPDATE OF m, s`, [leagueId]
@@ -382,11 +432,11 @@ export function createMatchStore(database) {
 
     async applyLeagueFormatToMatch(matchId, actorId) {
       return withTransaction(database, actorId, async (client) => {
-        const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
+        const match = await lockManagedLeagueMatch(client, matchId, actorId);
         if (!match.league_id || match.status !== "scheduled" || !match.scheduled_at || new Date(match.scheduled_at) <= new Date()) {
           throw new LeagueStoreError(409, "Only a future, unstarted league fixture can receive the current default format.");
         }
-        await requireLeagueManager(client, match.league_id, actorId);
+        await assertFixtureSeasonEditable(client, match);
         const current = await client.query(
           `SELECT t.id, t.version, t.name FROM league_match_format_defaults d
            JOIN league_match_format_templates t ON t.id = d.template_id WHERE d.league_id = $1`, [match.league_id]
@@ -399,13 +449,86 @@ export function createMatchStore(database) {
       });
     },
 
+    async setMatchFormat(matchId, actorId, details) {
+      const name = typeof details.name === "string" && details.name.trim()
+        ? details.name.trim().slice(0, 120) : "Agreed match format";
+      const frames = validateFrames(details.frames);
+      return withTransaction(database, actorId, async (client) => {
+        const match = await lockManagedLeagueMatch(client, matchId, actorId);
+        if (!match.league_id || match.status !== "scheduled" || match.started_at) {
+          throw new LeagueStoreError(409, "Only an unstarted scheduled league fixture can have its format changed.");
+        }
+        await assertFixtureSeasonEditable(client, match);
+        const selections = await client.query("SELECT 1 FROM match_frame_players WHERE match_id = $1 LIMIT 1", [match.id]);
+        if (selections.rows.length) throw new LeagueStoreError(409, "This fixture already has player selections and its format is locked.");
+        const latest = await client.query("SELECT coalesce(max(version), 0)::integer AS version FROM league_match_format_templates WHERE league_id = $1", [match.league_id]);
+        const version = Number(latest.rows[0].version) + 1;
+        const inserted = await client.query(
+          `INSERT INTO league_match_format_templates(league_id, version, name, created_by)
+           VALUES($1, $2, $3, $4) RETURNING id`, [match.league_id, version, name, actorId]
+        );
+        const templateId = inserted.rows[0].id;
+        for (const frame of frames) {
+          await client.query(
+            "INSERT INTO league_match_format_template_frames(template_id, frame_number, frame_type) VALUES($1, $2, $3)",
+            [templateId, frame.frameNumber, frame.type]
+          );
+        }
+        if (details.makeDefault === true) {
+          await client.query(
+            `INSERT INTO league_match_format_defaults(league_id, template_id, changed_by)
+             VALUES($1, $2, $3)
+             ON CONFLICT(league_id) DO UPDATE SET template_id = EXCLUDED.template_id,
+               changed_by = EXCLUDED.changed_by, changed_at = now()`, [match.league_id, templateId, actorId]
+          );
+        }
+        const snapshot = await client.query("SELECT id FROM match_format_snapshots WHERE match_id = $1", [match.id]);
+        if (!snapshot.rows[0]) throw new LeagueStoreError(409, "This fixture has no match-format snapshot.");
+        await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, templateId, version, name, actorId);
+        return matchWithDetails(client, match.id);
+      });
+    },
+
+    async updateScheduledMatch(matchId, actorId, details) {
+      const scheduledAt = details.scheduledAt == null || details.scheduledAt === "" ? null : new Date(details.scheduledAt);
+      if (!scheduledAt || Number.isNaN(scheduledAt.getTime())) invalid("Enter a valid fixture date and time.");
+      if (details.venue != null && (typeof details.venue !== "string" || details.venue.trim().length > 160)) {
+        invalid("Venue must be 160 characters or fewer.");
+      }
+      const venue = typeof details.venue === "string" ? details.venue.trim() || null : null;
+      return withTransaction(database, actorId, async (client) => {
+        const match = await lockManagedLeagueMatch(client, matchId, actorId);
+        if (!match.league_id || match.status !== "scheduled" || match.started_at) {
+          throw new LeagueStoreError(409, "Only an unstarted scheduled league fixture can be edited.");
+        }
+        await assertFixtureSeasonEditable(client, match);
+        await client.query("UPDATE matches SET scheduled_at = $2, venue = $3, updated_at = now() WHERE id = $1", [match.id, scheduledAt, venue]);
+        return matchWithDetails(client, match.id);
+      });
+    },
+
+    async cancelScheduledMatch(matchId, actorId) {
+      return withTransaction(database, actorId, async (client) => {
+        const match = await lockManagedLeagueMatch(client, matchId, actorId);
+        if (!match.league_id || match.status !== "scheduled" || match.started_at) {
+          throw new LeagueStoreError(409, "Only an unstarted scheduled league fixture can be cancelled.");
+        }
+        await assertFixtureSeasonEditable(client, match);
+        await client.query("UPDATE matches SET status = 'cancelled', updated_at = now() WHERE id = $1", [match.id]);
+        return matchWithDetails(client, match.id);
+      });
+    },
+
     async createMatch(actorId, details) {
       const type = details.type;
       if (!MATCH_TYPES.has(type)) invalid("Choose a supported match category.");
       const scheduledAt = details.scheduledAt === undefined || details.scheduledAt === null || details.scheduledAt === ""
         ? null : new Date(details.scheduledAt);
       if (scheduledAt && Number.isNaN(scheduledAt.getTime())) invalid("Enter a valid fixture date and time.");
-      const venue = details.venue == null ? null : String(details.venue).trim().slice(0, 160) || null;
+      if (details.venue != null && (typeof details.venue !== "string" || details.venue.trim().length > 160)) {
+        invalid("Venue must be 160 characters or fewer.");
+      }
+      const venue = typeof details.venue === "string" ? details.venue.trim() || null : null;
 
       return withTransaction(database, actorId, async (client) => {
         let leagueId = details.leagueId ? cleanUuid(details.leagueId, "league ID") : null;
@@ -423,12 +546,23 @@ export function createMatchStore(database) {
           const season = await client.query("SELECT status FROM seasons WHERE id = $1 AND league_id = $2 FOR UPDATE", [seasonId, leagueId]);
           if (!season.rows[0]) throw new LeagueStoreError(404, "This season could not be found in the selected league.");
           if (season.rows[0].status === "completed") throw new LeagueStoreError(409, "Completed seasons cannot receive new matches.");
+          if (!scheduledAt) invalid("Choose a scheduled date and time for a league fixture.");
           if (type === "team_league") {
             if (!homeTeamId || !awayTeamId || homeTeamId === awayTeamId) invalid("Choose different home and away teams.");
             const teams = await client.query("SELECT id FROM teams WHERE league_id = $1 AND season_id = $2 AND id = ANY($3::uuid[]) AND status = 'active' FOR UPDATE", [leagueId, seasonId, [homeTeamId, awayTeamId]]);
             if (teams.rowCount !== 2) throw new LeagueStoreError(404, "Both selected teams must be active in this league season.");
           } else if (homeTeamId || awayTeamId) {
             invalid("Singles and Doubles League matches do not use team sides.");
+          }
+          if (type === "singles_league") {
+            const participants = Array.isArray(details.participants) ? details.participants : [];
+            const sides = participants.map((participant) => Number(participant?.side));
+            const players = participants.map((participant) => participant?.userId);
+            if (participants.length !== 2 || sides.some((side) => ![1, 2].includes(side))
+              || new Set(sides).size !== 2 || players.some((id) => typeof id !== "string" || !id.trim())
+              || new Set(players).size !== 2) {
+              invalid("A Singles League fixture needs one different registered player on each side.");
+            }
           }
           if (divisionId) {
             const division = await client.query("SELECT id FROM divisions WHERE id = $1 AND season_id = $2", [divisionId, seasonId]);
