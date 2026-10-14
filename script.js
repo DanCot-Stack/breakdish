@@ -1236,6 +1236,274 @@ if (competitionPage) {
     return row;
   };
 
+  const renderRoundRobinGenerator = async (season) => {
+    const disclosure = createTextElement("details", "round-robin-generator");
+    disclosure.append(createTextElement("summary", "", "Generate Fixtures — Round Robin"));
+    const explanation = createTextElement("p", "management-help", "Choose eligible teams or registered entries, then preview the complete schedule. Nothing is saved until you confirm Save Fixtures.");
+    const panel = createTextElement("div", "round-robin-panel");
+    disclosure.append(explanation, panel);
+    let eligible;
+    try {
+      eligible = (await request(`/api/leagues/${encodeURIComponent(leagueId)}/seasons/${encodeURIComponent(season.id)}/round-robin/participants`)).participants;
+    } catch (error) {
+      panel.append(statusElement(error instanceof TypeError ? "Eligible participants could not be loaded." : error.message));
+      return disclosure;
+    }
+
+    const form = makeForm("competition-form round-robin-form", "Build a round-robin schedule");
+    const typeField = addField(form, "Competition type", "type", "select", {
+      choices: [["team_league", "Team League"], ["singles_league", "Singles League"], ["doubles_league", "Doubles League"]]
+    });
+    const divisionField = addField(form, "Division", "divisionId", "select", { choices: [] });
+    const meetingsField = addField(form, "Meet each opponent", "meetings", "select", {
+      choices: [["1", "Once"], ["2", "Twice — reverse home/side order"]]
+    });
+    addField(form, "First fixture date and time", "firstScheduledAt", "datetime-local", { required: true });
+    const intervalField = addField(form, "Days between rounds", "intervalDays", "number", { value: 7 });
+    intervalField.min = "1";
+    intervalField.max = "365";
+    intervalField.step = "1";
+    intervalField.required = true;
+    addField(form, "Default venue (optional)", "defaultVenue", "text", {
+      maxLength: 160, placeholder: "Used for Singles/Doubles and teams without a home venue"
+    });
+
+    const participantSet = createTextElement("fieldset", "round-robin-participant-set");
+    participantSet.append(createTextElement("legend", "", "Eligible participants"));
+    participantSet.append(createTextElement("p", "management-help", "Singles use approved player entries. Doubles use approved pairs with exactly two active league players. Team fixtures use active teams in the selected division."));
+    const participantActions = createTextElement("div", "round-robin-selection-actions");
+    const selectAll = createTextElement("button", "button button-quiet button-compact", "Select all shown");
+    selectAll.type = "button";
+    const selectNone = createTextElement("button", "button button-quiet button-compact", "Clear selection");
+    selectNone.type = "button";
+    participantActions.append(selectAll, selectNone);
+    const participantList = createTextElement("div", "round-robin-participant-list");
+    const selectionFeedback = statusElement();
+    participantSet.append(participantActions, participantList, selectionFeedback);
+    form.append(participantSet);
+    const formFeedback = statusElement();
+    form.append(makeButton("Generate Preview"), formFeedback);
+    const previewHost = createTextElement("div", "round-robin-preview-host");
+    panel.append(form, previewHost);
+    let latestPreview = null;
+    let latestRequest = null;
+
+    const divisionValue = () => divisionField.value === "__unassigned__" || !divisionField.value ? null : divisionField.value;
+    const refreshDivisionChoices = () => {
+      divisionField.replaceChildren();
+      const type = typeField.value;
+      if (type === "team_league") {
+        if (!season.divisions.length) {
+          const option = createTextElement("option", "", "No divisions in this season");
+          option.value = "";
+          divisionField.append(option);
+          divisionField.closest(".competition-field").hidden = true;
+        } else {
+          divisionField.closest(".competition-field").hidden = false;
+          const prompt = createTextElement("option", "", "Choose a division or unassigned teams");
+          prompt.value = "";
+          divisionField.append(prompt);
+          if (eligible.teams.some((team) => !team.divisionId)) {
+            const unassigned = createTextElement("option", "", "Teams without a division");
+            unassigned.value = "__unassigned__";
+            divisionField.append(unassigned);
+          }
+          season.divisions.forEach((division) => {
+            const option = createTextElement("option", "", division.name);
+            option.value = division.id;
+            divisionField.append(option);
+          });
+        }
+      } else {
+        divisionField.closest(".competition-field").hidden = false;
+        const noDivision = createTextElement("option", "", "No division");
+        noDivision.value = "";
+        divisionField.append(noDivision);
+        season.divisions.forEach((division) => {
+          const option = createTextElement("option", "", division.name);
+          option.value = division.id;
+          divisionField.append(option);
+        });
+      }
+    };
+
+    const renderParticipantChoices = () => {
+      participantList.replaceChildren();
+      const type = typeField.value;
+      let choices = eligible[type === "team_league" ? "teams" : type === "singles_league" ? "singles" : "doubles"] || [];
+      if (type === "team_league" && divisionField.closest(".competition-field").hidden) {
+        choices = choices.filter((team) => !team.divisionId);
+      } else if (type === "team_league" && divisionField.value === "__unassigned__") {
+        choices = choices.filter((team) => !team.divisionId);
+      } else if (type === "team_league" && divisionField.value) {
+        choices = choices.filter((team) => team.divisionId === divisionField.value);
+      } else if (type === "team_league") {
+        choices = [];
+      }
+      if (!choices.length) {
+        participantList.append(createTextElement("p", "management-empty", type === "team_league"
+          ? "Choose a division, or add active teams before generating fixtures."
+          : type === "singles_league" ? "No approved Singles League participants are available for this season."
+            : "No approved Doubles League pairs with two active players are available for this season."));
+      }
+      choices.forEach((participant) => {
+        const label = createTextElement("label", "round-robin-participant");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.name = "participantId";
+        checkbox.value = participant.id;
+        checkbox.checked = true;
+        const text = createTextElement("span", "", participant.label || participant.name || "Participant");
+        if (participant.homeVenue) text.append(createTextElement("small", "round-robin-participant-meta", `Home venue: ${participant.homeVenue}`));
+        label.append(checkbox, text);
+        participantList.append(label);
+      });
+      latestPreview = null;
+      previewHost.replaceChildren();
+    };
+
+    refreshDivisionChoices();
+    renderParticipantChoices();
+    typeField.addEventListener("change", () => { refreshDivisionChoices(); renderParticipantChoices(); });
+    divisionField.addEventListener("change", renderParticipantChoices);
+    const invalidatePreview = () => {
+      if (!latestPreview) return;
+      latestPreview = null;
+      latestRequest = null;
+      previewHost.replaceChildren();
+      setStatus(formFeedback, "Schedule settings changed. Generate a fresh preview before saving.", "pending");
+    };
+    selectAll.addEventListener("click", () => {
+      participantList.querySelectorAll("input[type='checkbox']").forEach((input) => { input.checked = true; });
+      invalidatePreview();
+    });
+    selectNone.addEventListener("click", () => {
+      participantList.querySelectorAll("input[type='checkbox']").forEach((input) => { input.checked = false; });
+      invalidatePreview();
+    });
+    form.addEventListener("input", invalidatePreview);
+
+    const renderPreview = (preview, requestBody) => {
+      previewHost.replaceChildren();
+      latestPreview = preview;
+      latestRequest = requestBody;
+      const summary = createTextElement("div", "round-robin-preview-summary");
+      summary.append(createTextElement("h5", "", `${preview.fixtureCount} fixtures across ${preview.roundCount} rounds`),
+        createTextElement("p", "management-help", `Format snapshot: ${preview.format.name} · ${preview.format.frames.length} frames · format version ${preview.format.version}. Fixture weeks keep the selected UK local start time.`));
+      previewHost.append(summary);
+      const editableRows = new Map();
+      preview.rounds.forEach((round) => {
+        const group = createTextElement("section", "round-robin-round");
+        group.append(createTextElement("h5", "", `Round ${round.roundNumber} · ${formatFixtureDate(round.scheduledAt)}`));
+        if (round.bye) group.append(createTextElement("p", "round-robin-bye", `${round.bye.label} has no fixture this round.`));
+        const rows = createTextElement("div", "round-robin-round-fixtures");
+        round.fixtures.forEach((fixture) => {
+          const row = createTextElement("article", "round-robin-fixture-row");
+          row.dataset.fixtureIndex = String(fixture.index);
+          const sides = createTextElement("h6", "", `${fixture.sideOne.label} v ${fixture.sideTwo.label}`);
+          const when = addField(row, "Date and time", `round-robin-date-${fixture.index}`, "datetime-local", {
+            value: toLocalDateTime(fixture.scheduledAt), required: true
+          });
+          const venue = addField(row, "Venue", `round-robin-venue-${fixture.index}`, "text", {
+            value: fixture.venue || "", maxLength: 160, placeholder: "Venue to be confirmed"
+          });
+          const originalDateValue = when.value;
+          const originalVenue = fixture.venue || null;
+          const rowActions = createTextElement("div", "round-robin-row-actions");
+          const remove = createTextElement("button", "button button-quiet button-compact", "Remove fixture");
+          remove.type = "button";
+          remove.addEventListener("click", () => {
+            const removed = row.dataset.removed === "true";
+            row.dataset.removed = removed ? "false" : "true";
+            when.disabled = !removed;
+            venue.disabled = !removed;
+            remove.textContent = removed ? "Remove fixture" : "Restore fixture";
+          });
+          rowActions.append(remove);
+          row.prepend(sides);
+          row.append(rowActions);
+          rows.append(row);
+          editableRows.set(fixture.index, { row, when, venue, originalDateValue, originalVenue });
+        });
+        group.append(rows);
+        previewHost.append(group);
+      });
+      const actions = createTextElement("div", "round-robin-preview-actions");
+      const save = createTextElement("button", "button button-gold", "Save Fixtures");
+      save.type = "button";
+      const discard = createTextElement("button", "button button-quiet", "Cancel / Discard Preview");
+      discard.type = "button";
+      const feedback = statusElement("Review the proposed schedule. Nothing has been saved yet.");
+      actions.append(save, discard, feedback);
+      previewHost.append(actions);
+      discard.addEventListener("click", () => { latestPreview = null; latestRequest = null; previewHost.replaceChildren(); setStatus(formFeedback, "Preview discarded. No fixtures were saved.", "success"); });
+      save.addEventListener("click", async () => {
+        const omittedFixtureIndexes = [];
+        const overrides = [];
+        for (const [index, row] of editableRows) {
+          if (row.row.dataset.removed === "true") { omittedFixtureIndexes.push(index); continue; }
+          if (!row.when.reportValidity()) return;
+          const date = new Date(row.when.value);
+          if (Number.isNaN(date.valueOf())) { setStatus(feedback, "Enter a valid date and time for each fixture.", "error"); return; }
+          const nextVenue = row.venue.value.trim() || null;
+          if (row.when.value !== row.originalDateValue || nextVenue !== row.originalVenue) {
+            overrides.push({ index, scheduledAt: date.toISOString(), venue: nextVenue });
+          }
+        }
+        save.disabled = true;
+        discard.disabled = true;
+        setStatus(feedback, "Saving all fixtures in one transaction…", "pending");
+        try {
+          const result = await request(`/api/leagues/${encodeURIComponent(leagueId)}/seasons/${encodeURIComponent(season.id)}/round-robin/save`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...latestRequest, formatVersion: preview.format.version, omittedFixtureIndexes, overrides })
+          });
+          latestPreview = null;
+          latestRequest = null;
+          await loadCompetition();
+          setStatus(status, `${result.savedCount} fixtures saved across ${result.roundCount} rounds${result.removedCount ? `; ${result.removedCount} removed from the preview` : ""}.`, "success");
+        } catch (error) {
+          setStatus(feedback, error instanceof TypeError ? "The fixture service could not be reached. Your preview is still here; try again." : error.message, "error");
+          save.disabled = false;
+          discard.disabled = false;
+        }
+      });
+    };
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!form.reportValidity()) return;
+      const participantIds = Array.from(participantList.querySelectorAll("input[type='checkbox']:checked"), (input) => input.value);
+      if (participantIds.length < 2) { setStatus(selectionFeedback, "Select at least two eligible participants.", "error"); return; }
+      const firstScheduledAt = new Date(form.elements.firstScheduledAt.value);
+      if (Number.isNaN(firstScheduledAt.valueOf())) { setStatus(formFeedback, "Choose a valid first fixture date and time.", "error"); return; }
+      const requestBody = {
+        type: typeField.value,
+        divisionId: divisionValue(),
+        meetings: Number(meetingsField.value),
+        participantIds,
+        firstScheduledAt: firstScheduledAt.toISOString(),
+        intervalDays: Number(intervalField.value),
+        defaultVenue: form.elements.defaultVenue.value.trim() || null
+      };
+      const submit = form.querySelector("[type='submit']");
+      submit.disabled = true;
+      setStatus(formFeedback, "Generating a read-only preview…", "pending");
+      try {
+        const result = await request(`/api/leagues/${encodeURIComponent(leagueId)}/seasons/${encodeURIComponent(season.id)}/round-robin/preview`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody)
+        });
+        renderPreview(result.preview, requestBody);
+        setStatus(formFeedback, "Preview ready. No fixtures have been saved.", "success");
+      } catch (error) {
+        setStatus(formFeedback, error instanceof TypeError ? "The fixture service could not be reached." : error.message, "error");
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    return disclosure;
+  };
+
   const renderFixtureControls = (match) => {
     const controls = createTextElement("div", "fixture-manager-actions");
     const scheduleDetails = createTextElement("details", "fixture-edit-details");
@@ -1309,7 +1577,7 @@ if (competitionPage) {
     return controls;
   };
 
-  const renderSeasonFixtures = (season, isManager, matches, activeMembers, doublesEntries, doublesEntriesError) => {
+  const renderSeasonFixtures = async (season, isManager, matches, activeMembers, doublesEntries, doublesEntriesError) => {
     const section = createTextElement("section", "competition-fixtures");
     section.append(createTextElement("div", "section-kicker", "SCHEDULE"), createTextElement("h4", "", "Upcoming fixtures"));
     const divisionChoices = [["", "All divisions"]];
@@ -1337,7 +1605,7 @@ if (competitionPage) {
         heading.append(createTextElement("span", "match-category-tag", matchTypeLabels[match.type] || "League match"),
           createTextElement("span", "match-state-tag is-scheduled", "scheduled"));
         card.append(heading, createTextElement("h5", "", `${sideLabel(match, 1)} v ${sideLabel(match, 2)}`),
-          createTextElement("p", "match-list-meta", `${formatFixtureDate(match.scheduledAt)}${match.divisionName ? ` · ${match.divisionName}` : ""}${match.venue ? ` · ${match.venue}` : ""}`),
+          createTextElement("p", "match-list-meta", `${formatFixtureDate(match.scheduledAt)}${match.roundNumber ? ` · Round ${match.roundNumber}` : ""}${match.divisionName ? ` · ${match.divisionName}` : ""}${match.venue ? ` · ${match.venue}` : ""}`),
           createTextElement("p", "fixture-score", `${match.homeScore} — ${match.awayScore}`));
         const link = createTextElement("a", "text-link", "Open in Match Centre ↗");
         link.href = `match.html?id=${encodeURIComponent(match.id)}`;
@@ -1404,6 +1672,7 @@ if (competitionPage) {
         }
       });
       section.append(form);
+      section.append(await renderRoundRobinGenerator(season));
     }
     return section;
   };
@@ -1524,7 +1793,7 @@ if (competitionPage) {
       for (const team of season.teams) unassignedGrid.append(await renderTeamCard(team, season, isManager));
       unassignedBlock.append(unassignedGrid);
       seasonCard.append(unassignedBlock);
-      const fixtureBlock = renderSeasonFixtures(
+      const fixtureBlock = await renderSeasonFixtures(
         season, isManager, matchRows, activeMembers,
         doublesEntriesBySeason.get(season.id) || [], doublesEntriesErrors.get(season.id) || ""
       );

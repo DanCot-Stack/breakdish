@@ -1,10 +1,13 @@
 import { LeagueStoreError } from "./league-store.js";
+import { generateRoundRobin, roundRobinFixtureCount, scheduledAtForRound } from "./round-robin.js";
 
 const MATCH_TYPES = new Set([
   "team_league", "singles_league", "doubles_league", "tournament_flyer", "money_match", "practice"
 ]);
 const MATCH_STATUSES = new Set(["scheduled", "in_progress", "awaiting_confirmation", "disputed", "completed", "cancelled"]);
 const FRAME_TYPES = new Set(["singles", "doubles"]);
+const ROUND_ROBIN_TYPES = new Set(["team_league", "singles_league", "doubles_league"]);
+const MAX_ROUND_ROBIN_FIXTURES = 500;
 
 function invalid(message) {
   throw new LeagueStoreError(400, message);
@@ -38,6 +41,9 @@ function mapDatabaseError(error) {
   if (error.constraint === "match_confirmation_distinct_users") {
     return new LeagueStoreError(409, "One person cannot confirm both sides of a match.");
   }
+  if (error.constraint === "matches_round_number_allowed") {
+    return new LeagueStoreError(400, "Round numbers can only be assigned to league fixtures.");
+  }
   if (error.constraint === "matches_status_transition" || error.constraint === "matches_format_snapshot_required") {
     return new LeagueStoreError(409, "This match cannot move to that state yet.");
   }
@@ -52,6 +58,21 @@ async function withTransaction(database, actorId, work) {
   try {
     await client.query("BEGIN");
     if (actorId) await client.query("SELECT set_config('breakdish.actor_user_id', $1, true)", [actorId]);
+    const result = await work(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    try { await client.query("ROLLBACK"); } catch { /* Keep the original error. */ }
+    throw mapDatabaseError(error);
+  } finally {
+    client.release();
+  }
+}
+
+async function withReadOnlyTransaction(database, work) {
+  const client = await database.connect();
+  try {
+    await client.query("BEGIN READ ONLY");
     const result = await work(client);
     await client.query("COMMIT");
     return result;
@@ -84,6 +105,331 @@ async function requireLeagueManager(client, leagueId, actorId) {
   if (!["owner", "administrator"].includes(result.rows[0]?.role)) {
     throw new LeagueStoreError(403, "Only an active league owner or administrator can manage this match or format.");
   }
+}
+
+async function requireLeagueManagerReadOnly(client, leagueId, actorId) {
+  const result = await client.query(
+    `SELECT role FROM league_memberships
+     WHERE league_id = $1 AND user_id = $2 AND status = 'active'`,
+    [leagueId, actorId]
+  );
+  if (!["owner", "administrator"].includes(result.rows[0]?.role)) {
+    throw new LeagueStoreError(403, "Only an active league owner or administrator can generate league fixtures.");
+  }
+}
+
+function roundRobinConfig(details) {
+  const type = details.type;
+  if (!ROUND_ROBIN_TYPES.has(type)) invalid("Choose Team, Singles or Doubles League fixtures.");
+  const participantIds = details.participantIds;
+  if (!Array.isArray(participantIds) || participantIds.length < 2 || participantIds.length > 64) {
+    invalid("Choose between 2 and 64 eligible participants.");
+  }
+  if (participantIds.some((id) => typeof id !== "string" || !id.trim())
+    || new Set(participantIds).size !== participantIds.length) {
+    invalid("Choose each eligible participant once.");
+  }
+  const cleanIds = participantIds.map((id, index) => type === "singles_league"
+    ? cleanAccountId(id, `participant ${index + 1} account ID`)
+    : cleanUuid(id, `participant ${index + 1} ID`));
+  const meetings = Number(details.meetings ?? 1);
+  if (![1, 2].includes(meetings)) invalid("Choose to play each opponent once or twice.");
+  const fixtureCount = roundRobinFixtureCount(cleanIds.length, meetings);
+  if (fixtureCount > MAX_ROUND_ROBIN_FIXTURES) {
+    invalid(`This schedule would create ${fixtureCount} fixtures. Select fewer participants (maximum ${MAX_ROUND_ROBIN_FIXTURES} fixtures).`);
+  }
+  const firstScheduledAt = typeof details.firstScheduledAt === "string" ? new Date(details.firstScheduledAt) : null;
+  if (!firstScheduledAt || Number.isNaN(firstScheduledAt.getTime())) invalid("Choose a valid first fixture date and time.");
+  const intervalDays = Number(details.intervalDays ?? 7);
+  if (!Number.isInteger(intervalDays) || intervalDays < 1 || intervalDays > 365) {
+    invalid("Round intervals must be from 1 to 365 days.");
+  }
+  const divisionId = details.divisionId ? cleanUuid(details.divisionId, "division ID") : null;
+  const defaultVenue = details.defaultVenue == null ? null : details.defaultVenue;
+  if (defaultVenue != null && (typeof defaultVenue !== "string" || defaultVenue.trim().length > 160)) {
+    invalid("Default venue must be 160 characters or fewer.");
+  }
+  const omittedFixtureIndexes = details.omittedFixtureIndexes ?? [];
+  const overrides = details.overrides ?? [];
+  if (!Array.isArray(omittedFixtureIndexes) || omittedFixtureIndexes.length > fixtureCount
+    || omittedFixtureIndexes.some((index) => !Number.isInteger(index) || index < 0 || index >= fixtureCount)
+    || new Set(omittedFixtureIndexes).size !== omittedFixtureIndexes.length) {
+    invalid("The preview contains an invalid removed fixture.");
+  }
+  if (!Array.isArray(overrides) || overrides.length > fixtureCount) invalid("The preview contains too many fixture edits.");
+  const overrideIndexes = new Set();
+  for (const override of overrides) {
+    if (!Number.isInteger(override?.index) || override.index < 0 || override.index >= fixtureCount
+      || overrideIndexes.has(override.index)) invalid("The preview contains an invalid or repeated fixture edit.");
+    overrideIndexes.add(override.index);
+    const date = new Date(override.scheduledAt);
+    if (typeof override.scheduledAt !== "string" || Number.isNaN(date.getTime())) invalid("Enter a valid date and time for every edited fixture.");
+    if (override.venue != null && (typeof override.venue !== "string" || override.venue.trim().length > 160)) {
+      invalid("Fixture venues must be 160 characters or fewer.");
+    }
+  }
+  if (omittedFixtureIndexes.some((index) => overrideIndexes.has(index))) {
+    invalid("A removed fixture cannot also have preview edits.");
+  }
+  return {
+    type, participantIds: cleanIds, meetings, fixtureCount, firstScheduledAt,
+    intervalDays, divisionId, defaultVenue: defaultVenue?.trim() || null,
+    omittedFixtureIndexes: new Set(omittedFixtureIndexes),
+    overrides: new Map(overrides.map((override) => [override.index, override])),
+    expectedFormatVersion: details.formatVersion == null ? null : Number(details.formatVersion)
+  };
+}
+
+async function roundRobinParticipants(client, leagueId, seasonId, actorId, type, participantIds = null, divisionId = null, lock = false) {
+  if (type === "team_league") {
+    const values = [leagueId, seasonId];
+    let where = "t.league_id = $1 AND t.season_id = $2 AND t.status = 'active'";
+    if (divisionId) {
+      values.push(divisionId);
+      where += ` AND t.division_id = $${values.length}`;
+    } else {
+      where += " AND t.division_id IS NULL";
+    }
+    if (participantIds) {
+      values.push(participantIds);
+      where += ` AND t.id = ANY($${values.length}::uuid[])`;
+    }
+    const result = await client.query(
+      `SELECT t.id, t.name AS label, t.home_venue AS "homeVenue", t.division_id AS "divisionId"
+       FROM teams t WHERE ${where} ORDER BY lower(t.name), t.id ${lock ? "FOR UPDATE OF t" : ""}`,
+      values
+    );
+    return result.rows;
+  }
+
+  if (lock) {
+    const lockValues = [leagueId, seasonId];
+    let selectedLockFilter = "";
+    if (participantIds) {
+      lockValues.push(participantIds);
+      selectedLockFilter = type === "singles_league"
+        ? " AND ep.user_id = ANY($3::text[])"
+        : " AND ce.id = ANY($3::uuid[])";
+    }
+    const entryTypePlaceholder = participantIds ? "$4" : "$3";
+    await client.query(
+      `SELECT ce.id FROM competition_entries ce
+       JOIN competition_entry_participants ep ON ep.entry_id = ce.id
+       WHERE ce.entry_type = ${entryTypePlaceholder} AND ce.status = 'approved' AND ce.league_id = $1 AND ce.season_id = $2
+         ${selectedLockFilter}
+         AND (SELECT count(*) FROM competition_entry_participants all_ep WHERE all_ep.entry_id = ce.id) = ${type === "singles_league" ? 1 : 2}
+       ORDER BY ce.id FOR UPDATE OF ce`,
+      [leagueId, seasonId, ...(participantIds ? [participantIds] : []), type]
+    );
+  }
+
+  if (type === "singles_league") {
+    const values = [leagueId, seasonId];
+    let selectedFilter = "";
+    if (participantIds) {
+      values.push(participantIds);
+      selectedFilter = " AND ep.user_id = ANY($3::text[])";
+    }
+    const result = await client.query(
+      `SELECT id, label FROM (
+         SELECT DISTINCT ep.user_id AS id, coalesce(pp.display_name, u.name) AS label
+         FROM competition_entries ce
+         JOIN competition_entry_participants ep ON ep.entry_id = ce.id
+         JOIN league_memberships lm ON lm.league_id = ce.league_id AND lm.user_id = ep.user_id AND lm.status = 'active'
+         JOIN "user" u ON u.id = ep.user_id
+         LEFT JOIN player_profiles pp ON pp.user_id = ep.user_id
+         WHERE ce.entry_type = 'singles_league' AND ce.status = 'approved' AND ce.league_id = $1 AND ce.season_id = $2
+           ${selectedFilter}
+           AND (SELECT count(*) FROM competition_entry_participants all_ep WHERE all_ep.entry_id = ce.id) = 1
+       ) eligible ORDER BY lower(label), id`,
+      values
+    );
+    return result.rows;
+  }
+
+  const values = [leagueId, seasonId];
+  let selectedFilter = "";
+  if (participantIds) {
+    values.push(participantIds);
+    selectedFilter = " AND ce.id = ANY($4::uuid[])";
+  }
+  const entryType = type;
+  const countRequired = 2;
+  const result = await client.query(
+    `SELECT ce.id,
+       string_agg(coalesce(pp.display_name, u.name), ' / ' ORDER BY coalesce(pp.display_name, u.name), ep.user_id) AS label,
+       array_agg(ep.user_id ORDER BY coalesce(pp.display_name, u.name), ep.user_id) AS "playerIds",
+       jsonb_agg(jsonb_build_object('userId', ep.user_id, 'displayName', coalesce(pp.display_name, u.name))
+         ORDER BY coalesce(pp.display_name, u.name), ep.user_id) AS players
+     FROM competition_entries ce
+     JOIN competition_entry_participants ep ON ep.entry_id = ce.id
+     JOIN league_memberships lm ON lm.league_id = ce.league_id AND lm.user_id = ep.user_id AND lm.status = 'active'
+     JOIN "user" u ON u.id = ep.user_id
+     LEFT JOIN player_profiles pp ON pp.user_id = ep.user_id
+     WHERE ce.entry_type = $3 AND ce.status = 'approved' AND ce.league_id = $1 AND ce.season_id = $2 ${selectedFilter}
+       AND (SELECT count(*) FROM competition_entry_participants all_ep WHERE all_ep.entry_id = ce.id) = ${countRequired}
+     GROUP BY ce.id
+     HAVING count(*) = ${countRequired}
+     ORDER BY lower(min(coalesce(pp.display_name, u.name))), ce.id`,
+    [leagueId, seasonId, entryType, ...(participantIds ? [participantIds] : [])]
+  );
+  return result.rows.map((row) => ({ id: row.id, label: row.label, players: row.players, playerIds: row.playerIds }));
+}
+
+async function getLeagueRoundRobinFormat(client, leagueId) {
+  const format = await client.query(
+    `SELECT t.id, t.version, t.name FROM league_match_format_defaults d
+     JOIN league_match_format_templates t ON t.id = d.template_id WHERE d.league_id = $1`, [leagueId]
+  );
+  if (!format.rows[0]) throw new LeagueStoreError(409, "Configure a league match format before generating fixtures.");
+  const frames = await client.query(
+    "SELECT frame_number, frame_type FROM league_match_format_template_frames WHERE template_id = $1 ORDER BY frame_number",
+    [format.rows[0].id]
+  );
+  if (!frames.rows.length) throw new LeagueStoreError(409, "The league match format does not contain any frames.");
+  return {
+    id: format.rows[0].id,
+    version: Number(format.rows[0].version),
+    name: format.rows[0].name,
+    frames: frames.rows.map((row) => ({ frameNumber: Number(row.frame_number), type: row.frame_type }))
+  };
+}
+
+function buildRoundRobinPlan(participants, config, format) {
+  const generatedRounds = generateRoundRobin(participants, config.meetings);
+  let fixtureIndex = 0;
+  const rounds = generatedRounds.map((round) => ({
+    roundNumber: round.roundNumber,
+    scheduledAt: scheduledAtForRound(config.firstScheduledAt, round.roundNumber, config.intervalDays),
+    bye: round.bye,
+    fixtures: round.fixtures.map(({ sideOne, sideTwo }) => ({
+      index: fixtureIndex++,
+      roundNumber: round.roundNumber,
+      sideOne,
+      sideTwo,
+      venue: config.type === "team_league" ? (sideOne.homeVenue || config.defaultVenue) : config.defaultVenue,
+      scheduledAt: scheduledAtForRound(config.firstScheduledAt, round.roundNumber, config.intervalDays)
+    }))
+  }));
+  const fixtures = rounds.flatMap((round) => round.fixtures);
+  for (const fixture of fixtures) {
+    if (config.type === "doubles_league") {
+      const firstPlayers = fixture.sideOne.playerIds || [];
+      const secondPlayers = new Set(fixture.sideTwo.playerIds || []);
+      if (firstPlayers.some((playerId) => secondPlayers.has(playerId))) {
+        invalid("The selected Doubles League pairs share a player, so they cannot all play one another.");
+      }
+    }
+  }
+  return {
+    rounds,
+    fixtures,
+    byes: rounds.filter((round) => round.bye).map((round) => ({ roundNumber: round.roundNumber, participant: round.bye })),
+    format: { version: format.version, name: format.name, frames: format.frames }
+  };
+}
+
+function fixturesWithPreviewChanges(plan, config) {
+  return plan.fixtures.filter((fixture) => !config.omittedFixtureIndexes.has(fixture.index)).map((fixture) => {
+    const override = config.overrides.get(fixture.index);
+    return {
+      ...fixture,
+      scheduledAt: override ? new Date(override.scheduledAt).toISOString() : fixture.scheduledAt,
+      venue: override ? (override.venue?.trim() || null) : fixture.venue
+    };
+  });
+}
+
+function pairingKey(type, sideOneId, sideTwoId) {
+  return `${type}:${[sideOneId, sideTwoId].sort().join(":")}`;
+}
+
+async function assertNoExistingRoundRobinCollisions(client, leagueId, seasonId, divisionId, type, fixtures) {
+  let existing;
+  if (type === "team_league") {
+    existing = await client.query(
+      `SELECT home_team_id AS side_one_id, away_team_id AS side_two_id, status
+       FROM matches WHERE league_id = $1 AND season_id = $2 AND match_type = $3
+         AND division_id IS NOT DISTINCT FROM $4::uuid`, [leagueId, seasonId, type, divisionId]
+    );
+  } else if (type === "singles_league") {
+    existing = await client.query(
+      `SELECT m.id, m.status, array_agg(mp.user_id ORDER BY mp.user_id) AS participant_ids
+       FROM matches m JOIN match_participants mp ON mp.match_id = m.id
+       WHERE m.league_id = $1 AND m.season_id = $2 AND m.match_type = $3
+         AND m.division_id IS NOT DISTINCT FROM $4::uuid
+       GROUP BY m.id, m.status HAVING count(mp.user_id) = 2`, [leagueId, seasonId, type, divisionId]
+    );
+    existing.rows = existing.rows.map((row) => ({
+      side_one_id: row.participant_ids[0], side_two_id: row.participant_ids[1], status: row.status
+    }));
+  } else {
+    existing = await client.query(
+      `SELECT m.id, m.status, array_agg(s.entry_id ORDER BY s.entry_id) AS entry_ids
+       FROM matches m JOIN match_doubles_league_sides s ON s.match_id = m.id
+       WHERE m.league_id = $1 AND m.season_id = $2 AND m.match_type = $3
+         AND m.division_id IS NOT DISTINCT FROM $4::uuid
+       GROUP BY m.id, m.status HAVING count(s.entry_id) = 2`, [leagueId, seasonId, type, divisionId]
+    );
+    existing.rows = existing.rows.map((row) => ({
+      side_one_id: row.entry_ids[0], side_two_id: row.entry_ids[1], status: row.status
+    }));
+  }
+  const existingKeys = new Set(existing.rows.map((row) => pairingKey(type, row.side_one_id, row.side_two_id)));
+  const collision = fixtures.some((fixture) => existingKeys.has(pairingKey(type, fixture.sideOne.id, fixture.sideTwo.id)));
+  if (collision) {
+    throw new LeagueStoreError(409, "This schedule overlaps an existing fixture for one or more pairings, including cancelled fixtures. No fixtures were saved; review the existing schedule first.");
+  }
+}
+
+async function insertRoundRobinMatch(client, actorId, leagueId, seasonId, type, divisionId, fixture, format) {
+  const homeTeamId = type === "team_league" ? fixture.sideOne.id : null;
+  const awayTeamId = type === "team_league" ? fixture.sideTwo.id : null;
+  const inserted = await client.query(
+    `INSERT INTO matches(match_type, league_id, season_id, division_id, home_team_id, away_team_id,
+       scheduled_at, venue, created_by, round_number)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+    [type, leagueId, seasonId, divisionId, homeTeamId, awayTeamId, fixture.scheduledAt, fixture.venue, actorId, fixture.roundNumber]
+  );
+  const matchId = inserted.rows[0].id;
+  if (type === "singles_league") {
+    for (const [side, participant] of [[1, fixture.sideOne], [2, fixture.sideTwo]]) {
+      await client.query(
+        "INSERT INTO match_participants(match_id,user_id,side,added_by) VALUES($1,$2,$3,$4)",
+        [matchId, participant.id, side, actorId]
+      );
+    }
+  } else if (type === "doubles_league") {
+    for (const [side, participant] of [[1, fixture.sideOne], [2, fixture.sideTwo]]) {
+      await client.query(
+        "INSERT INTO match_doubles_league_sides(match_id,side,entry_id,assigned_by) VALUES($1,$2,$3,$4)",
+        [matchId, side, participant.id, actorId]
+      );
+      for (const userId of participant.playerIds) {
+        await client.query(
+          "INSERT INTO match_participants(match_id,user_id,side,added_by) VALUES($1,$2,$3,$4)",
+          [matchId, userId, side, actorId]
+        );
+      }
+    }
+  }
+  const snapshot = await client.query(
+    `INSERT INTO match_format_snapshots(match_id,template_id,template_version,name,created_by)
+     VALUES($1,$2,$3,$4,$5) RETURNING id`,
+    [matchId, format.id, format.version, format.name, actorId]
+  );
+  for (const frame of format.frames) {
+    await client.query(
+      "INSERT INTO match_format_snapshot_frames(snapshot_id,frame_number,frame_type) VALUES($1,$2,$3)",
+      [snapshot.rows[0].id, frame.frameNumber, frame.type]
+    );
+  }
+  return {
+    id: matchId, type, status: "scheduled", leagueId, seasonId, divisionId,
+    homeTeamId, awayTeamId, homeSideName: fixture.sideOne.label, awaySideName: fixture.sideTwo.label,
+    roundNumber: fixture.roundNumber, scheduledAt: fixture.scheduledAt, venue: fixture.venue,
+    formatVersion: format.version, formatName: format.name, frameCount: format.frames.length
+  };
 }
 
 async function lockManagedLeagueMatch(client, matchId, actorId) {
@@ -144,6 +490,7 @@ function toMatch(row) {
     divisionName: row.division_name ?? null,
     tournamentEventId: row.tournament_event_id,
     tournamentName: row.tournament_name ?? null,
+    roundNumber: row.round_number == null ? null : Number(row.round_number),
     scheduledAt: row.scheduled_at,
     venue: row.venue,
     framesTotal: Number(row.frames_total || 0),
@@ -160,10 +507,11 @@ function toMatch(row) {
 
 async function matchWithDetails(client, matchId) {
   const matchResult = await client.query(
-    `SELECT sb.*, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
+    `SELECT sb.*, m.round_number AS round_number, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
        at.name AS away_team_name, te.name AS tournament_name,
        hp.display_names AS home_side_name, ap.display_names AS away_side_name
      FROM match_scoreboard sb
+     JOIN matches m ON m.id = sb.match_id
      LEFT JOIN leagues l ON l.id = sb.league_id
      LEFT JOIN divisions d ON d.id = sb.division_id
      LEFT JOIN teams ht ON ht.id = sb.home_team_id
@@ -294,7 +642,7 @@ export function createMatchStore(database) {
           values.push(filters.status); clauses.push(`sb.status = $${values.length}`);
         }
         const result = await client.query(
-          `SELECT sb.*, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
+          `SELECT sb.*, m.round_number AS round_number, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
              at.name AS away_team_name, te.name AS tournament_name,
              hp.display_names AS home_side_name, ap.display_names AS away_side_name
            FROM match_scoreboard sb
@@ -420,6 +768,127 @@ export function createMatchStore(database) {
            ORDER BY display_name, ce.id`, [leagueKey, seasonKey]
         );
         return result.rows.map((row) => ({ id: row.id, displayName: row.display_name, players: row.players }));
+      });
+    },
+
+    async listRoundRobinParticipants(leagueId, seasonId, actorId) {
+      const leagueKey = cleanUuid(leagueId, "league ID");
+      const seasonKey = cleanUuid(seasonId, "season ID");
+      return withReadOnlyTransaction(database, async (client) => {
+        await requireLeagueManagerReadOnly(client, leagueKey, actorId);
+        const season = await client.query("SELECT status FROM seasons WHERE id = $1 AND league_id = $2", [seasonKey, leagueKey]);
+        if (!season.rows[0]) throw new LeagueStoreError(404, "This season could not be found in the selected league.");
+        if (season.rows[0].status === "completed") throw new LeagueStoreError(409, "Completed seasons cannot receive new fixtures.");
+        const teams = await client.query(
+          `SELECT id, name AS label, home_venue AS "homeVenue", division_id AS "divisionId"
+           FROM teams WHERE league_id = $1 AND season_id = $2 AND status = 'active'
+           ORDER BY lower(name), id`, [leagueKey, seasonKey]
+        );
+        const singles = await roundRobinParticipants(client, leagueKey, seasonKey, actorId, "singles_league");
+        const doubles = await roundRobinParticipants(client, leagueKey, seasonKey, actorId, "doubles_league");
+        const divisionRows = await client.query(
+          "SELECT id, name FROM divisions WHERE season_id = $1 ORDER BY lower(name), id", [seasonKey]
+        );
+        return {
+          teams: teams.rows,
+          singles,
+          doubles,
+          divisions: divisionRows.rows.map((row) => ({ id: row.id, name: row.name }))
+        };
+      });
+    },
+
+    async previewRoundRobin(leagueId, seasonId, actorId, details) {
+      const leagueKey = cleanUuid(leagueId, "league ID");
+      const seasonKey = cleanUuid(seasonId, "season ID");
+      const config = roundRobinConfig(details);
+      return withReadOnlyTransaction(database, async (client) => {
+        await requireLeagueManagerReadOnly(client, leagueKey, actorId);
+        const season = await client.query("SELECT status FROM seasons WHERE id = $1 AND league_id = $2", [seasonKey, leagueKey]);
+        if (!season.rows[0]) throw new LeagueStoreError(404, "This season could not be found in the selected league.");
+        if (season.rows[0].status === "completed") throw new LeagueStoreError(409, "Completed seasons cannot receive new fixtures.");
+        if (config.divisionId) {
+          const division = await client.query("SELECT id FROM divisions WHERE id = $1 AND season_id = $2", [config.divisionId, seasonKey]);
+          if (!division.rows[0]) invalid("Choose a division from the selected season.");
+        }
+        const candidates = await roundRobinParticipants(
+          client, leagueKey, seasonKey, actorId, config.type, config.participantIds, config.divisionId
+        );
+        if (candidates.length !== config.participantIds.length) {
+          throw new LeagueStoreError(409, "One or more selected teams or approved entries are no longer eligible. Refresh the participants and try again.");
+        }
+        const byId = new Map(candidates.map((participant) => [participant.id, participant]));
+        const participants = config.participantIds.map((id) => byId.get(id));
+        const format = await getLeagueRoundRobinFormat(client, leagueKey);
+        const plan = buildRoundRobinPlan(participants, config, format);
+        return {
+          type: config.type,
+          divisionId: config.divisionId,
+          meetings: config.meetings,
+          intervalDays: config.intervalDays,
+          fixtureCount: plan.fixtures.length,
+          roundCount: plan.rounds.length,
+          rounds: plan.rounds.map((round) => ({ roundNumber: round.roundNumber, scheduledAt: round.scheduledAt,
+            bye: round.bye ? { id: round.bye.id, label: round.bye.label } : null,
+            fixtures: round.fixtures.map((fixture) => ({
+              index: fixture.index, roundNumber: fixture.roundNumber, scheduledAt: fixture.scheduledAt,
+              sideOne: { id: fixture.sideOne.id, label: fixture.sideOne.label },
+              sideTwo: { id: fixture.sideTwo.id, label: fixture.sideTwo.label }, venue: fixture.venue
+            }))
+          })),
+          format: plan.format
+        };
+      });
+    },
+
+    async saveRoundRobin(leagueId, seasonId, actorId, details) {
+      const leagueKey = cleanUuid(leagueId, "league ID");
+      const seasonKey = cleanUuid(seasonId, "season ID");
+      const config = roundRobinConfig(details);
+      if (!Number.isInteger(config.expectedFormatVersion) || config.expectedFormatVersion < 1) {
+        invalid("Generate a fresh preview before saving fixtures.");
+      }
+      return withTransaction(database, actorId, async (client) => {
+        await requireLeagueManager(client, leagueKey, actorId);
+        const season = await client.query(
+          "SELECT status FROM seasons WHERE id = $1 AND league_id = $2 FOR UPDATE", [seasonKey, leagueKey]
+        );
+        if (!season.rows[0]) throw new LeagueStoreError(404, "This season could not be found in the selected league.");
+        if (season.rows[0].status === "completed") throw new LeagueStoreError(409, "Completed seasons cannot receive new fixtures.");
+        if (config.divisionId) {
+          const division = await client.query("SELECT id FROM divisions WHERE id = $1 AND season_id = $2", [config.divisionId, seasonKey]);
+          if (!division.rows[0]) invalid("Choose a division from the selected season.");
+        }
+        const candidates = await roundRobinParticipants(
+          client, leagueKey, seasonKey, actorId, config.type, config.participantIds, config.divisionId, true
+        );
+        if (candidates.length !== config.participantIds.length) {
+          throw new LeagueStoreError(409, "One or more selected teams or approved entries are no longer eligible. Generate a fresh preview.");
+        }
+        const byId = new Map(candidates.map((participant) => [participant.id, participant]));
+        const participants = config.participantIds.map((id) => byId.get(id));
+        const format = await getLeagueRoundRobinFormat(client, leagueKey);
+        if (format.version !== config.expectedFormatVersion) {
+          throw new LeagueStoreError(409, "The league match format changed after this preview. Generate a fresh preview before saving.");
+        }
+        const plan = buildRoundRobinPlan(participants, config, format);
+        const fixtures = fixturesWithPreviewChanges(plan, config);
+        if (!fixtures.length) invalid("Keep at least one fixture in the preview before saving.");
+        await assertNoExistingRoundRobinCollisions(client, leagueKey, seasonKey, config.divisionId, config.type, fixtures);
+        const created = [];
+        for (const fixture of fixtures) {
+          created.push(await insertRoundRobinMatch(
+            client, actorId, leagueKey, seasonKey, config.type, config.divisionId, fixture, format
+          ));
+        }
+        return {
+          matches: created,
+          savedCount: created.length,
+          removedCount: plan.fixtures.length - created.length,
+          roundCount: plan.rounds.length,
+          byeCount: plan.byes.length,
+          formatVersion: format.version
+        };
       });
     },
 

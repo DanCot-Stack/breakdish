@@ -108,7 +108,10 @@ function createApp({
     }
   });
 
-  app.use(express.json({ limit: "12kb", strict: true }));
+  app.use((req, res, next) => {
+    const isRoundRobinSave = /^\/api\/leagues\/[^/]+\/seasons\/[^/]+\/round-robin\/save\/?$/.test(req.path);
+    return express.json({ limit: isRoundRobinSave ? "128kb" : "12kb", strict: true })(req, res, next);
+  });
 
   const contactLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -710,6 +713,54 @@ function createApp({
         req.params.leagueId, req.params.seasonId, session.user.id
       );
       return res.json({ entries });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/api/leagues/:leagueId/seasons/:seasonId/round-robin/participants", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId) || !isUuid(req.params.seasonId)) {
+        return res.status(400).json({ error: "Enter valid league and season IDs." });
+      }
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to generate fixtures." });
+      const participants = await (await matchStore()).listRoundRobinParticipants(
+        req.params.leagueId, req.params.seasonId, session.user.id
+      );
+      return res.json({ participants });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/leagues/:leagueId/seasons/:seasonId/round-robin/preview", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId) || !isUuid(req.params.seasonId)) {
+        return res.status(400).json({ error: "Enter valid league and season IDs." });
+      }
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to preview fixtures." });
+      const preview = await (await matchStore()).previewRoundRobin(
+        req.params.leagueId, req.params.seasonId, session.user.id, asRecord(req.body)
+      );
+      return res.json({ preview });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/leagues/:leagueId/seasons/:seasonId/round-robin/save", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId) || !isUuid(req.params.seasonId)) {
+        return res.status(400).json({ error: "Enter valid league and season IDs." });
+      }
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to save fixtures." });
+      const saved = await (await matchStore()).saveRoundRobin(
+        req.params.leagueId, req.params.seasonId, session.user.id, asRecord(req.body)
+      );
+      return res.status(201).json(saved);
     } catch (error) {
       return next(error);
     }

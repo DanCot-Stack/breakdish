@@ -8,6 +8,7 @@ import * as signingHistoryMigration from "./migrations/005_protect_registration_
 import * as signingStartMigration from "./migrations/006_require_official_start_for_signings.js";
 import * as matchClassificationMigration from "./migrations/007_match_categories_and_practice_stats.js";
 import * as doublesLeagueSidesMigration from "./migrations/008_doubles_league_match_sides.js";
+import * as fixtureRoundNumbersMigration from "./migrations/009_fixture_round_numbers.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -213,4 +214,27 @@ test("migration 008 links Doubles League match sides to approved entries and pro
   }));
   const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
   assert.match(downSql, /Cannot roll back migration 008 while Doubles League fixture history exists/);
+});
+
+test("migration 009 adds optional positive league fixture round numbers without backfilling", () => {
+  const upCalls = [];
+  fixtureRoundNumbersMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+  const upSql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(upSql, /ALTER TABLE matches ADD COLUMN round_number smallint/);
+  assert.match(upSql, /round_number IS NULL OR/);
+  assert.match(upSql, /round_number > 0/);
+  assert.match(upSql, /match_type IN \('team_league', 'singles_league', 'doubles_league'\)/);
+  assert.doesNotMatch(upSql, /UPDATE matches SET round_number/i, "Historical matches keep a null round number.");
+  assert.match(upSql, /matches_league_round_lookup/);
+  assert.match(upSql, /matches_round_number_immutable/);
+  assert.match(upSql, /A fixture round number is immutable once recorded/);
+
+  const downCalls = [];
+  fixtureRoundNumbersMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back migration 009 while fixture round history exists/);
 });

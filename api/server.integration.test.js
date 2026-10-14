@@ -762,6 +762,294 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       name: "Match engine integration format v1", frames: formatV1Frames
     });
     assert.equal(response.status, 200, await response.clone().text());
+
+    const roundRobinPostJson = (path, sessionCookie, body) => fetchFromSite(path, {
+      method: "POST", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.244" },
+      body: JSON.stringify(body)
+    });
+    const rrPath = `/api/leagues/${approval.league.id}/seasons`;
+    const rrSeasonResponse = await signingPostJson(rrPath, firstUserCookie, {
+      name: `Round Robin ${crypto.randomUUID()}`, startsOn: tomorrow, endsOn: "2027-10-13"
+    });
+    assert.equal(rrSeasonResponse.status, 201, await rrSeasonResponse.clone().text());
+    const rrSeason = (await rrSeasonResponse.json()).season;
+    const createRoundRobinDivision = async (name) => {
+      const created = await signingPostJson(`/api/seasons/${rrSeason.id}/divisions`, firstUserCookie, { name });
+      assert.equal(created.status, 201, await created.clone().text());
+      return (await created.json()).division;
+    };
+    const rrTeamDivision = await createRoundRobinDivision("Round Robin Teams");
+    const rrTeamReturnDivision = await createRoundRobinDivision("Round Robin Return Leg");
+    const rrSinglesDivision = await createRoundRobinDivision("Round Robin Singles");
+    const rrDoublesDivision = await createRoundRobinDivision("Round Robin Doubles");
+    const createRoundRobinTeam = async (divisionId, label, homeVenue) => {
+      const created = await signingPostJson(`/api/seasons/${rrSeason.id}/teams`, firstUserCookie, {
+        name: `${label} ${crypto.randomUUID()}`, divisionId, homeVenue
+      });
+      assert.equal(created.status, 201, await created.clone().text());
+      return (await created.json()).team;
+    };
+    const rrTeams = [];
+    for (let index = 1; index <= 5; index++) rrTeams.push(await createRoundRobinTeam(rrTeamDivision.id, `RR Team ${index}`, `Venue ${index}`));
+    const rrReturnTeams = [];
+    for (let index = 1; index <= 4; index++) rrReturnTeams.push(await createRoundRobinTeam(rrTeamReturnDivision.id, `RR Return Team ${index}`, `Return Venue ${index}`));
+
+    const sixthRegistration = await fetchFromSite("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.243" },
+      body: JSON.stringify({
+        name: "Sixth RR Player", email: `sixth-rr-${crypto.randomUUID()}@example.test`,
+        password: "correct-horse-battery-staple"
+      })
+    });
+    assert.equal(sixthRegistration.status, 200, await sixthRegistration.clone().text());
+    const sixthUserCookie = cookieFrom(sixthRegistration);
+    const sixthProfileResponse = await fetchFromSite("/api/me/profile", { headers: { cookie: sixthUserCookie } });
+    assert.equal(sixthProfileResponse.status, 200);
+    const sixthProfile = (await sixthProfileResponse.json()).profile;
+    response = await signingPostJson(`/api/leagues/${approval.league.id}/join`, sixthUserCookie, {});
+    assert.equal(response.status, 201);
+    response = await signingPostJson(`/api/leagues/${approval.league.id}/requests/${sixthProfile.userId}`, firstUserCookie, { action: "approve" });
+    assert.equal(response.status, 200);
+
+    const createSinglesEntry = async (userId, entryStatus = "approved") => {
+      const entryClient = await database.connect();
+      try {
+        await entryClient.query("BEGIN");
+        await entryClient.query("SELECT set_config('breakdish.actor_user_id',$1,true)", [firstUserId]);
+        const inserted = await entryClient.query(
+          `INSERT INTO competition_entries(entry_type,league_id,season_id,created_by)
+           VALUES('singles_league',$1,$2,$3) RETURNING id`, [approval.league.id, rrSeason.id, firstUserId]
+        );
+        const entryId = inserted.rows[0].id;
+        await entryClient.query(
+          "INSERT INTO competition_entry_participants(entry_id,user_id,added_by) VALUES($1,$2,$3)",
+          [entryId, userId, firstUserId]
+        );
+        if (entryStatus === "approved") {
+          await entryClient.query("UPDATE competition_entries SET status='payment_confirmed' WHERE id=$1", [entryId]);
+          await entryClient.query("UPDATE competition_entries SET status='approved' WHERE id=$1", [entryId]);
+        }
+        await entryClient.query("COMMIT");
+        return entryId;
+      } catch (error) {
+        await entryClient.query("ROLLBACK").catch(() => {});
+        throw error;
+      } finally {
+        entryClient.release();
+      }
+    };
+    const rrSingles = [firstUserId, secondProfile.userId, thirdProfile.userId];
+    for (const playerId of rrSingles) await createSinglesEntry(playerId);
+    const pendingSinglesPlayerId = fourthProfile.userId;
+    await createSinglesEntry(pendingSinglesPlayerId, "pending");
+    const rrDoublesEntries = [
+      await createDoublesEntry(approval.league.id, rrSeason.id, [firstUserId, secondProfile.userId]),
+      await createDoublesEntry(approval.league.id, rrSeason.id, [thirdProfile.userId, fourthProfile.userId]),
+      await createDoublesEntry(approval.league.id, rrSeason.id, [fifthProfile.userId, sixthProfile.userId])
+    ];
+
+    const rrParticipantsPath = `/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/participants`;
+    response = await fetchFromSite(rrParticipantsPath);
+    assert.equal(response.status, 401, "Anonymous visitors cannot read organiser participant choices.");
+    response = await fetchFromSite(rrParticipantsPath, { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 403, "Ordinary members cannot read organiser participant choices.");
+    response = await fetchFromSite(rrParticipantsPath, { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200, await response.clone().text());
+    const rrEligible = (await response.json()).participants;
+    assert.equal(rrEligible.teams.length, 9);
+    assert.equal(rrEligible.singles.length, 3, "Only approved Singles League entries are selectable.");
+    assert.equal(rrEligible.singles.some((entry) => entry.id === pendingSinglesPlayerId), false);
+    assert.deepEqual(rrEligible.doubles.map((entry) => entry.id).sort(), rrDoublesEntries.sort());
+    assert.ok(rrEligible.doubles.every((entry) => entry.players.length === 2));
+
+    const rrStartAt = new Date(Date.now() + 45 * 86400000).toISOString();
+    const teamRoundRobin = {
+      type: "team_league", divisionId: rrTeamDivision.id, meetings: 1,
+      participantIds: rrTeams.map((team) => team.id), firstScheduledAt: rrStartAt, intervalDays: 7,
+      defaultVenue: "Fallback venue"
+    };
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, "", teamRoundRobin);
+    assert.equal(response.status, 401, "Anonymous visitors cannot preview schedules.");
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, thirdUserCookie, teamRoundRobin);
+    assert.equal(response.status, 403, "Ordinary members cannot preview schedules.");
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, "", teamRoundRobin);
+    assert.equal(response.status, 401, "Anonymous visitors cannot save schedules.");
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, thirdUserCookie, {
+      ...teamRoundRobin, formatVersion: 1
+    });
+    assert.equal(response.status, 403, "Ordinary members cannot save schedules.");
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, teamRoundRobin);
+    assert.equal(response.status, 200, await response.clone().text());
+    let rrPreview = (await response.json()).preview;
+    assert.equal(rrPreview.fixtureCount, 5 * 4 / 2);
+    assert.equal(rrPreview.roundCount, 5);
+    assert.equal(rrPreview.rounds.reduce((sum, round) => sum + round.fixtures.length, 0), 10);
+    assert.ok(rrPreview.rounds.every((round) => round.fixtures.length === 2 && round.bye));
+    assert.equal(rrPreview.format.version, 1);
+    assert.equal(rrPreview.rounds.flatMap((round) => round.fixtures).some((fixture) => !fixture.sideOne.id || !fixture.sideTwo.id), false,
+      "A bye is shown separately and never creates a fake match.");
+    let rrDatabaseCount = await database.query("SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND match_type='team_league'", [rrSeason.id]);
+    assert.equal(rrDatabaseCount.rows[0].count, 0, "Generating a preview performs no match inserts.");
+    assert.ok(rrPreview.rounds.flatMap((round) => round.fixtures).every((fixture) => fixture.venue === rrTeams.find((team) => team.id === fixture.sideOne.id).homeVenue),
+      "Team fixtures use the home team's existing home venue where available.");
+    const teamSaveBody = { ...teamRoundRobin, formatVersion: rrPreview.format.version };
+    const teamSaveResponse = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie, teamSaveBody);
+    assert.equal(teamSaveResponse.status, 201, await teamSaveResponse.clone().text());
+    const teamSaved = await teamSaveResponse.json();
+    assert.equal(teamSaved.savedCount, 10);
+    assert.equal(teamSaved.removedCount, 0);
+    const teamRoundRows = await database.query(
+      `SELECT round_number, home_team_id, away_team_id, venue FROM matches
+       WHERE season_id=$1 AND division_id=$2 AND match_type='team_league' ORDER BY round_number, id`,
+      [rrSeason.id, rrTeamDivision.id]
+    );
+    assert.equal(teamRoundRows.rows.length, 10);
+    assert.deepEqual([...new Set(teamRoundRows.rows.map((row) => row.round_number))].sort((a, b) => a - b), [1, 2, 3, 4, 5]);
+    assert.ok(teamRoundRows.rows.every((row) => rrTeams.some((team) => team.id === row.home_team_id && team.homeVenue === row.venue)));
+    const listedRoundMatch = await fetchFromSite(`/api/matches?leagueId=${approval.league.id}`);
+    assert.equal(listedRoundMatch.status, 200);
+    const publicRoundMatch = (await listedRoundMatch.json()).matches.find((match) => match.id === teamSaved.matches[0].id);
+    assert.equal(publicRoundMatch?.roundNumber, teamSaved.matches[0].roundNumber,
+      "Match Centre listing exposes the saved round identifier.");
+    const detailedRoundMatch = await fetchFromSite(`/api/matches/${teamSaved.matches[0].id}`);
+    assert.equal((await detailedRoundMatch.json()).match.roundNumber, teamSaved.matches[0].roundNumber,
+      "Match details expose the saved round identifier.");
+    await assert.rejects(
+      database.query("UPDATE matches SET round_number=round_number+1 WHERE id=$1", [teamSaved.matches[0].id]),
+      (error) => error.constraint === "matches_round_number_immutable",
+      "Persisted fixture rounds cannot be silently rewritten."
+    );
+
+    const teamDoubleRoundRobin = {
+      ...teamRoundRobin, divisionId: rrTeamReturnDivision.id, meetings: 2,
+      participantIds: rrReturnTeams.map((team) => team.id)
+    };
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, teamDoubleRoundRobin);
+    assert.equal(response.status, 200, await response.clone().text());
+    rrPreview = (await response.json()).preview;
+    assert.equal(rrPreview.fixtureCount, 4 * 3);
+    assert.equal(rrPreview.roundCount, 6);
+    for (const round of rrPreview.rounds.slice(0, 3)) {
+      const returnRound = rrPreview.rounds[round.roundNumber + 2];
+      assert.ok(round.fixtures.every((fixture) => returnRound.fixtures.some((candidate) =>
+        candidate.sideOne.id === fixture.sideTwo.id && candidate.sideTwo.id === fixture.sideOne.id)),
+      "The second meeting reverses each home/away side.");
+    }
+    const teamDoubleSaveBody = { ...teamDoubleRoundRobin, formatVersion: rrPreview.format.version };
+    const concurrentTeamSaves = await Promise.all([
+      roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie, teamDoubleSaveBody),
+      roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie, teamDoubleSaveBody)
+    ]);
+    assert.deepEqual(concurrentTeamSaves.map((item) => item.status).sort(), [201, 409],
+      "Concurrent duplicate saves serialize; exactly one complete schedule is accepted.");
+    const teamDoubleSavedResponse = concurrentTeamSaves.find((item) => item.status === 201);
+    const teamDoubleSaved = await teamDoubleSavedResponse.json();
+    assert.equal(teamDoubleSaved.savedCount, 12);
+    rrDatabaseCount = await database.query("SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND division_id=$2 AND match_type='team_league'", [rrSeason.id, rrTeamReturnDivision.id]);
+    assert.equal(rrDatabaseCount.rows[0].count, 12, "The losing concurrent save leaves no partial fixtures.");
+
+    const maliciousSinglesBody = {
+      type: "singles_league", divisionId: rrSinglesDivision.id, meetings: 1,
+      participantIds: [...rrSingles, pendingSinglesPlayerId], firstScheduledAt: rrStartAt, intervalDays: 7
+    };
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, maliciousSinglesBody);
+    assert.equal(response.status, 409, "Pending Singles entries cannot be included in a generated schedule.");
+    const singlesRoundRobin = { ...maliciousSinglesBody, participantIds: rrSingles };
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, singlesRoundRobin);
+    assert.equal(response.status, 200, await response.clone().text());
+    rrPreview = (await response.json()).preview;
+    assert.equal(rrPreview.fixtureCount, 3);
+    assert.equal(rrPreview.roundCount, 3);
+    assert.ok(rrPreview.rounds.every((round) => round.fixtures.length === 1 && round.bye),
+      "Odd Singles participation produces one explicit bye per round and no fake player match.");
+    const singlesSave = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie,
+      { ...singlesRoundRobin, formatVersion: rrPreview.format.version });
+    assert.equal(singlesSave.status, 201, await singlesSave.clone().text());
+    assert.equal((await singlesSave.json()).savedCount, 3);
+    const singlesRows = await database.query(
+      `SELECT m.round_number, count(mp.user_id)::integer AS player_count, s.template_version
+       FROM matches m JOIN match_participants mp ON mp.match_id=m.id
+       JOIN match_format_snapshots s ON s.match_id=m.id
+       WHERE m.season_id=$1 AND m.division_id=$2 AND m.match_type='singles_league'
+       GROUP BY m.id,m.round_number,s.template_version ORDER BY m.round_number`, [rrSeason.id, rrSinglesDivision.id]
+    );
+    assert.equal(singlesRows.rows.length, 3);
+    assert.ok(singlesRows.rows.every((row) => row.player_count === 2 && row.template_version === 1));
+
+    const doublesRoundRobin = {
+      type: "doubles_league", divisionId: rrDoublesDivision.id, meetings: 2,
+      participantIds: rrDoublesEntries, firstScheduledAt: rrStartAt, intervalDays: 7,
+      defaultVenue: "Doubles test hall"
+    };
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, doublesRoundRobin);
+    assert.equal(response.status, 200, await response.clone().text());
+    rrPreview = (await response.json()).preview;
+    assert.equal(rrPreview.fixtureCount, 3 * 2);
+    assert.equal(rrPreview.roundCount, 6);
+    assert.ok(rrPreview.rounds.every((round) => round.fixtures.length === 1 && round.bye),
+      "Odd Doubles participation produces explicit pair byes without a fake pair.");
+    for (const round of rrPreview.rounds.slice(0, 3)) {
+      const returnRound = rrPreview.rounds[round.roundNumber + 2];
+      assert.ok(round.fixtures.every((fixture) => returnRound.fixtures.some((candidate) =>
+        candidate.sideOne.id === fixture.sideTwo.id && candidate.sideTwo.id === fixture.sideOne.id)));
+    }
+    const doublesSave = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie,
+      { ...doublesRoundRobin, formatVersion: rrPreview.format.version });
+    assert.equal(doublesSave.status, 201, await doublesSave.clone().text());
+    const doublesSaved = await doublesSave.json();
+    assert.equal(doublesSaved.savedCount, 6);
+    const doublesRoundRows = await database.query(
+      `SELECT m.round_number, count(DISTINCT s.entry_id)::integer AS sides,
+         count(DISTINCT mp.user_id)::integer AS players, fs.template_version
+       FROM matches m JOIN match_doubles_league_sides s ON s.match_id=m.id
+       JOIN match_participants mp ON mp.match_id=m.id JOIN match_format_snapshots fs ON fs.match_id=m.id
+       WHERE m.season_id=$1 AND m.division_id=$2 AND m.match_type='doubles_league'
+       GROUP BY m.id,m.round_number,fs.template_version ORDER BY m.round_number`, [rrSeason.id, rrDoublesDivision.id]
+    );
+    assert.equal(doublesRoundRows.rows.length, 6);
+    assert.ok(doublesRoundRows.rows.every((row) => row.sides === 2 && row.players === 4 && row.template_version === 1),
+      "Generated Doubles fixtures preserve two approved entry sides and four historical player snapshots with the current format.");
+    const teamCountBeforeRetry = await database.query("SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND division_id=$2 AND match_type='team_league'", [rrSeason.id, rrTeamReturnDivision.id]);
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie, teamDoubleSaveBody);
+    assert.equal(response.status, 409, "A repeated generator request is rejected rather than duplicating fixtures.");
+    const teamCountAfterRetry = await database.query("SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND division_id=$2 AND match_type='team_league'", [rrSeason.id, rrTeamReturnDivision.id]);
+    assert.equal(teamCountAfterRetry.rows[0].count, teamCountBeforeRetry.rows[0].count);
+
+    const collisionDivisionResponse = await signingPostJson(`/api/seasons/${rrSeason.id}/divisions`, firstUserCookie, { name: "Manual collision" });
+    assert.equal(collisionDivisionResponse.status, 201);
+    const collisionDivision = (await collisionDivisionResponse.json()).division;
+    const collisionTeams = [
+      await createRoundRobinTeam(collisionDivision.id, "Manual collision A", "Existing Hall"),
+      await createRoundRobinTeam(collisionDivision.id, "Manual collision B", "Other Hall")
+    ];
+    const manualCollision = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "team_league", leagueId: approval.league.id, seasonId: rrSeason.id, divisionId: collisionDivision.id,
+      homeTeamId: collisionTeams[0].id, awayTeamId: collisionTeams[1].id, scheduledAt: rrStartAt
+    });
+    assert.equal(manualCollision.status, 201, await manualCollision.clone().text());
+    const manualCollisionMatch = (await manualCollision.json()).match;
+    assert.equal(manualCollisionMatch.roundNumber, null, "Manually created historical fixtures do not receive invented round numbers.");
+    const collisionSchedule = {
+      ...teamRoundRobin, divisionId: collisionDivision.id, participantIds: collisionTeams.map((team) => team.id)
+    };
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, collisionSchedule);
+    assert.equal(response.status, 200);
+    let collisionPreview = (await response.json()).preview;
+    let collisionSave = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie,
+      { ...collisionSchedule, formatVersion: collisionPreview.format.version });
+    assert.equal(collisionSave.status, 409, "A manual fixture collision is rejected without partial saves.");
+    response = await matchPostJson(`/api/matches/${manualCollisionMatch.id}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 200);
+    response = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`, firstUserCookie, collisionSchedule);
+    collisionPreview = (await response.json()).preview;
+    collisionSave = await roundRobinPostJson(`/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`, firstUserCookie,
+      { ...collisionSchedule, formatVersion: collisionPreview.format.version });
+    assert.equal(collisionSave.status, 409, "Cancelled manual fixtures remain explicit duplicate conflicts.");
+    assert.match((await collisionSave.json()).error, /including cancelled fixtures/i);
+    const collisionGeneratedCount = await database.query("SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND division_id=$2 AND match_type='team_league'", [rrSeason.id, collisionDivision.id]);
+    assert.equal(collisionGeneratedCount.rows[0].count, 1, "Neither collision failure creates any round-robin fixture.");
+
     const createTeamMatch = async (cookie = firstUserCookie) => {
       const created = await matchPostJson("/api/matches", cookie, {
         type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
@@ -810,11 +1098,19 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal((await response.json()).frames.length, 1, "An explicitly selected future match receives the current format only.");
     response = await fetchFromSite(`/api/matches/${untouchedFutureMatch.id}`);
     assert.equal((await response.json()).frames.length, 5, "Updating one selected match leaves another future fixture unchanged.");
+    const expectedFutureFixtures = await database.query(
+      `SELECT count(*)::integer AS count FROM matches m
+       JOIN seasons sea ON sea.id = m.season_id
+       WHERE m.league_id = $1 AND m.status = 'scheduled' AND m.started_at IS NULL
+         AND sea.status <> 'completed' AND m.scheduled_at > now()
+         AND NOT EXISTS (SELECT 1 FROM match_frame_players fp WHERE fp.match_id = m.id)`,
+      [approval.league.id]
+    );
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
       name: "Restored mixed format", frames: formatV1Frames, applyToFuture: true
     });
     assert.equal(response.status, 200, await response.clone().text());
-    assert.equal((await response.json()).format.updatedMatches, 2,
+    assert.equal((await response.json()).format.updatedMatches, expectedFutureFixtures.rows[0].count,
       "League administrators can apply a new revision to all future unplayed fixtures.");
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
     assert.equal((await response.json()).frames.length, 5);
