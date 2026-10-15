@@ -17,6 +17,14 @@ if (menuButton && nav) {
     menuButton.focus();
   });
 
+  document.addEventListener("pointerdown", (event) => {
+    if (menuButton.getAttribute("aria-expanded") !== "true") return;
+    if (nav.contains(event.target) || menuButton.contains(event.target)) return;
+    nav.classList.remove("is-open");
+    menuButton.setAttribute("aria-expanded", "false");
+    menuButton.setAttribute("aria-label", "Open navigation");
+  });
+
   nav.querySelectorAll("a").forEach((link) => {
     link.addEventListener("click", () => {
       nav.classList.remove("is-open");
