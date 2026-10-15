@@ -45,6 +45,52 @@ textarea {
   font: inherit;
 }
 
+button {
+  -webkit-appearance: none;
+  appearance: none;
+  border-radius: 0;
+  background-color: transparent;
+  color: inherit;
+}
+
+button:disabled {
+  background-color: var(--panel-raised);
+  color: var(--muted);
+}
+
+input,
+select,
+textarea {
+  color-scheme: dark;
+}
+
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  border: 1px solid rgba(242, 234, 219, .2);
+  border-radius: 0;
+  background-color: var(--panel);
+  color: var(--cream);
+}
+
+select option {
+  background-color: var(--panel);
+  color: var(--cream);
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--gold);
+}
+
+:where(button, input, select, textarea):disabled {
+  cursor: not-allowed;
+  opacity: .58;
+}
+
+:where(input, textarea):read-only {
+  background-color: var(--panel-raised);
+  color: var(--muted);
+}
+
 button,
 a {
   -webkit-tap-highlight-color: transparent;
@@ -244,7 +290,7 @@ a {
 
 .primary-nav > .nav-logout:disabled {
   cursor: wait;
-  opacity: .65;
+  opacity: .62;
 }
 
 .primary-nav > .nav-logout {
@@ -261,7 +307,7 @@ a {
   text-align: left;
 }
 
-.primary-nav > .nav-logout:hover {
+.primary-nav > .nav-logout:hover:not(:disabled) {
   color: var(--gold-light);
 }
 
@@ -453,8 +499,19 @@ h1 em {
   transition: transform .2s ease, background .2s ease, border-color .2s ease;
 }
 
-.button:hover {
+.button:hover:not(:disabled) {
   transform: translateY(-2px);
+}
+
+.button:active:not(:disabled) {
+  transform: translateY(0);
+  filter: brightness(.94);
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  filter: saturate(.55);
+  transform: none;
 }
 
 .button span {
@@ -466,17 +523,30 @@ h1 em {
   color: #171114;
 }
 
-.button-gold:hover {
+.button-gold:hover:not(:disabled) {
   background: var(--gold-light);
+}
+
+.button-gold:disabled {
+  border-color: rgba(242, 234, 219, .12);
+  background: #3a3121;
+  color: #b3a47e;
 }
 
 .button-quiet {
   border-color: rgba(242, 234, 219, .3);
+  background: var(--panel-raised);
   color: var(--cream);
 }
 
-.button-quiet:hover,
-.button-outline:hover {
+.button-quiet:disabled {
+  border-color: rgba(242, 234, 219, .12);
+  background: #171318;
+  color: #8f8389;
+}
+
+.button-quiet:hover:not(:disabled),
+.button-outline:hover:not(:disabled) {
   border-color: var(--gold);
   background: rgba(213, 177, 107, .08);
 }
@@ -1117,6 +1187,7 @@ td:first-child {
 .button-outline {
   margin-top: 15px;
   border-color: rgba(213, 177, 107, .55);
+  background: transparent;
   color: var(--gold);
 }
 
@@ -1395,6 +1466,14 @@ td:first-child {
   border-color: var(--gold);
 }
 
+.contact-form input:focus-visible,
+.contact-form select:focus-visible,
+.contact-form textarea:focus-visible {
+  outline: 2px solid var(--gold-light);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px rgba(213, 177, 107, .16);
+}
+
 .contact-form textarea {
   resize: vertical;
 }
@@ -1432,7 +1511,7 @@ td:first-child {
 
 .contact-form [type="submit"]:disabled {
   cursor: wait;
-  opacity: .72;
+  opacity: .62;
 }
 
 .form-status[data-state="success"] {
@@ -1709,8 +1788,9 @@ td:first-child {
 }
 
 .league-card-action .button:disabled {
-  cursor: default;
-  opacity: .65;
+  cursor: not-allowed;
+  opacity: .58;
+  transform: none;
 }
 
 .league-card-status {
@@ -2622,6 +2702,12 @@ td:first-child {
   box-shadow: 0 0 0 2px rgba(213, 177, 107, .18);
 }
 
+.competition-field input:focus-visible,
+.competition-field select:focus-visible {
+  outline: 2px solid var(--gold-light);
+  outline-offset: 2px;
+}
+
 .competition-feedback {
   margin: 0;
   font-size: 12px;
@@ -3439,7 +3525,8 @@ td:first-child {
 }
 
 .match-field :disabled {
-  opacity: .78;
+  cursor: not-allowed;
+  opacity: .58;
 }
 
 .score-frame-card > .button,
