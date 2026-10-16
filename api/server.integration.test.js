@@ -794,6 +794,26 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       response = await signingPostJson(`/api/teams/${team.id}/members`, firstUserCookie, { userId: playerId });
       assert.equal(response.status, 201, await response.clone().text());
     }
+    const homePlayerRole = await database.query(
+      "SELECT role FROM team_memberships WHERE team_id=$1 AND user_id=$2 AND status='active'", [homeMatchTeam.id, firstUserId]
+    );
+    assert.equal(homePlayerRole.rows[0]?.role, "player", "The home-side scorer is not a captain.");
+    const otherMatchTeam = await createSigningTeam(matchSeason.id, "Match Other");
+    response = await signingPostJson(`/api/teams/${otherMatchTeam.id}/members`, firstUserCookie, { userId: fifthProfile.userId });
+    assert.equal(response.status, 201, await response.clone().text());
+    response = await fetchFromSite("/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": "192.0.2.246" },
+      body: JSON.stringify({
+        name: "Other League Match Player",
+        email: `other-league-match-${crypto.randomUUID()}@example.test`,
+        password: "correct-horse-battery-staple"
+      })
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const otherLeaguePlayerCookie = cookieFrom(response);
+    response = await signingPostJson(`/api/leagues/${open.league.id}/join`, otherLeaguePlayerCookie, {});
+    assert.ok([200, 201].includes(response.status), await response.clone().text());
 
     const formatV1Frames = ["singles", "singles", "doubles", "singles", "doubles"].map((type) => ({ type }));
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
@@ -1106,6 +1126,23 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const untouchedFutureMatch = await createTeamMatch();
     response = await matchPostJson(`/api/matches/${untouchedFutureMatch.id}/start`, "", {});
     assert.equal(response.status, 401, "Anonymous visitors cannot start a scheduled match.");
+    const nonCompetingMatch = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
+      homeTeamId: awayMatchTeam.id, awayTeamId: otherMatchTeam.id,
+      scheduledAt: new Date(Date.now() + 30 * 86400000).toISOString()
+    });
+    assert.equal(nonCompetingMatch.status, 201, await nonCompetingMatch.clone().text());
+    const nonCompetingMatchId = (await nonCompetingMatch.json()).match.id;
+    response = await matchPostJson(`/api/matches/${nonCompetingMatchId}/start`, firstUserCookie, {});
+    assert.equal(response.status, 403, "A player registered to Team A cannot operate a different Team B v Team C fixture.");
+    response = await matchPostJson(`/api/matches/${nonCompetingMatchId}/start`, secondUserCookie, {});
+    assert.equal(response.status, 403, "League administrator status alone does not grant normal scoreboard access.");
+    response = await matchPostJson(`/api/matches/${nonCompetingMatchId}/cancel`, firstUserCookie, {});
+    assert.equal(response.status, 200, "The existing manager permission remains available for fixture administration.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, otherLeaguePlayerCookie, {});
+    assert.equal(response.status, 403, "An authenticated player from another league cannot operate this fixture.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, fifthUserCookie, {});
+    assert.equal(response.status, 403, "A registered Team C player in this league cannot operate Team A v Team B.");
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
       homeTeamId: homeMatchTeam.id, awayTeamId: homeMatchTeam.id,
@@ -1220,9 +1257,16 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const eligibleHomePlayers = (await response.json()).players;
     assert.deepEqual(eligibleHomePlayers.map((player) => player.userId).sort(), [firstUserId, secondProfile.userId].sort(),
       "Team scoreboard choices come only from active registrations to the correct team.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=2`, { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 200, "A registered player from the opposing side can view the match's eligible selections.");
+    assert.deepEqual((await response.json()).players.map((player) => player.userId).sort(), [thirdProfile.userId, fourthProfile.userId].sort());
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`, { headers: { cookie: fifthUserCookie } });
+    assert.equal(response.status, 403, "A same-league player outside both competing teams cannot access scoreboard choices.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`, { headers: { cookie: otherLeaguePlayerCookie } });
+    assert.equal(response.status, 403, "A player from another league cannot access scoreboard choices.");
 
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, thirdUserCookie, {});
-    assert.equal(response.status, 200, "Any authenticated player can start an active scoreboard.");
+    assert.equal(response.status, 200, "A registered player from either competing team can start the scoreboard.");
     const startedDetail = await response.json();
     assert.ok(Number.isFinite(Date.parse(startedDetail.match.startedAt)), "The server stores the canonical match start timestamp.");
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, firstUserCookie, {});
@@ -1264,13 +1308,22 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       assert.equal(result.status, 200, await result.clone().text());
       return result.json();
     };
-    const recordFrame = async (matchId, frame, details) => {
-      const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/result`, firstUserCookie, details);
+    const setFrameSideAs = async (matchId, frame, side, selection, cookie) => {
+      const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/players`, cookie, { side, ...selection });
       assert.equal(result.status, 200, await result.clone().text());
       return result.json();
     };
+    const recordFrame = async (matchId, frame, details, cookie = firstUserCookie) => {
+      const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/result`, cookie, details);
+      assert.equal(result.status, 200, await result.clone().text());
+      return result.json();
+    };
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/players`, firstUserCookie, { side: 1, players: [fifthProfile.userId] });
+    assert.equal(response.status, 409, "A scorer cannot select a registered player from Team C for Team A's frame side.");
     await setFrameSide(matchUnderTest.id, 1, 1, { players: [firstUserId] });
-    await setFrameSide(matchUnderTest.id, 1, 2, { players: [thirdProfile.userId] });
+    await setFrameSideAs(matchUnderTest.id, 1, 2, { players: [thirdProfile.userId] }, thirdUserCookie);
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/players`, thirdUserCookie, { side: 2, players: [firstUserId] });
+    assert.equal(response.status, 409, "A scorer cannot move a competing player onto the wrong side.");
     response = await fetchFromSite("/api/matches/live");
     livePayload = await response.json();
     liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
@@ -1307,6 +1360,20 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.deepEqual(frameEvents.rows, [{ frame_number: 1, event_type: "dish" }, { frame_number: 3, event_type: "counter_dish" }]);
     const byeDecoration = await database.query("SELECT count(*)::integer AS count FROM match_frame_events WHERE match_id=$1 AND frame_number=2", [matchUnderTest.id]);
     assert.equal(byeDecoration.rows[0].count, 0, "Bye wins cannot carry Dish or Counter Dish records.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/event`, firstUserCookie, { type: "dish", userId: firstUserId });
+    assert.equal(response.status, 200, "A competing player can make an audited frame-event correction while results await confirmation.");
+    const scorerAudit = await database.query(
+      `SELECT DISTINCT actor_user_id, action_type FROM match_audit_events
+       WHERE match_id=$1 AND action_type IN ('match_started','player_selection_changed','frame_result_entered','frame_decoration_changed')`, [matchUnderTest.id]
+    );
+    assert.ok(scorerAudit.rows.some((event) => event.actor_user_id === thirdProfile.userId && event.action_type === "match_started"),
+      "The authenticated competing player who starts the scoreboard remains auditable.");
+    assert.ok(scorerAudit.rows.some((event) => event.actor_user_id === firstUserId && event.action_type === "player_selection_changed"),
+      "A non-captain player from the other competing team can make an audited selection.");
+    assert.ok(scorerAudit.rows.some((event) => event.actor_user_id === firstUserId && event.action_type === "frame_result_entered"),
+      "The authenticated scoring actor remains recorded for frame results.");
+    assert.ok(scorerAudit.rows.some((event) => event.actor_user_id === firstUserId && event.action_type === "frame_decoration_changed"),
+      "An awaiting-confirmation correction remains auditable and keeps its lifecycle unchanged.");
 
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/confirm`, firstUserCookie, { side: 1 });
     assert.equal(response.status, 200, await response.clone().text());
@@ -1477,6 +1544,12 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 201, await response.clone().text());
     const playingDoublesMatch = (await response.json()).match;
     response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 403, "A league administrator who is absent from both Doubles entries cannot operate the match.");
+    response = await fetchFromSite(`/api/matches/${playingDoublesMatch.id}/eligible-players?side=1`, { headers: { cookie: sixthUserCookie } });
+    assert.equal(response.status, 403, "An unrelated registered league player cannot access a Doubles match's player selections.");
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/start`, sixthUserCookie, {});
+    assert.equal(response.status, 403, "Only players in the two recorded Doubles entries can start that fixture.");
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/start`, secondUserCookie, {});
     assert.equal(response.status, 200);
     response = await fetchFromSite("/api/matches/live");
     livePayload = await response.json();
@@ -1491,18 +1564,18 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 409, "Started Doubles League fixture scheduling is locked.");
     response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/cancel`, firstUserCookie, {});
     assert.equal(response.status, 409, "Started Doubles League fixtures cannot be cancelled as unstarted.");
-    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [secondProfile.userId] });
+    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/1/players`, secondUserCookie, { side: 1, players: [secondProfile.userId] });
     assert.equal(response.status, 400, "Doubles League doubles frames require both pair players.");
-    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId, secondProfile.userId] });
+    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/1/players`, secondUserCookie, { side: 1, players: [firstUserId, secondProfile.userId] });
     assert.equal(response.status, 409, "Players removed from the current entry cannot replace a recorded match-side player.");
-    await setFrameSide(playingDoublesMatch.id, 1, 1, { players: [secondProfile.userId, fifthProfile.userId] });
-    await setFrameSide(playingDoublesMatch.id, 1, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
-    await recordFrame(playingDoublesMatch.id, 1, { outcome: "played", winnerSide: 1 });
-    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/2/players`, firstUserCookie, { side: 1, players: [secondProfile.userId, fifthProfile.userId] });
+    await setFrameSideAs(playingDoublesMatch.id, 1, 1, { players: [secondProfile.userId, fifthProfile.userId] }, secondUserCookie);
+    await setFrameSideAs(playingDoublesMatch.id, 1, 2, { players: [thirdProfile.userId, fourthProfile.userId] }, thirdUserCookie);
+    await recordFrame(playingDoublesMatch.id, 1, { outcome: "played", winnerSide: 1 }, secondUserCookie);
+    response = await matchPutJson(`/api/matches/${playingDoublesMatch.id}/frames/2/players`, secondUserCookie, { side: 1, players: [secondProfile.userId, fifthProfile.userId] });
     assert.equal(response.status, 400, "A Singles frame in a Doubles League fixture accepts only one player per side.");
-    await setFrameSide(playingDoublesMatch.id, 2, 1, { players: [fifthProfile.userId] });
-    await setFrameSide(playingDoublesMatch.id, 2, 2, { players: [thirdProfile.userId] });
-    await recordFrame(playingDoublesMatch.id, 2, { outcome: "played", winnerSide: 2 });
+    await setFrameSideAs(playingDoublesMatch.id, 2, 1, { players: [fifthProfile.userId] }, secondUserCookie);
+    await setFrameSideAs(playingDoublesMatch.id, 2, 2, { players: [thirdProfile.userId] }, thirdUserCookie);
+    await recordFrame(playingDoublesMatch.id, 2, { outcome: "played", winnerSide: 2 }, secondUserCookie);
     await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, secondUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, thirdUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/finalize`, firstUserCookie, {});
@@ -1539,10 +1612,16 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(listedSingles.homeSideName, profile.displayName);
     assert.equal(listedSingles.awaySideName, "Second Player Updated",
       "Match Centre lists the two registered player names for a Singles fixture.");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/start`, thirdUserCookie, {});
+    assert.equal(response.status, 403, "A registered player in the same league cannot operate a Singles match they are not entered in.");
+    response = await fetchFromSite(`/api/matches/${singlesMatch.id}/eligible-players?side=1`, { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 403, "Only one of the two Singles entrants can access the selectable players.");
     response = await matchPostJson(`/api/matches/${singlesMatch.id}/start`, firstUserCookie, {});
     assert.equal(response.status, 200);
     await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
-    await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 2, players: [secondProfile.userId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, secondUserCookie, { side: 2, players: [secondProfile.userId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [thirdProfile.userId] });
+    assert.equal(response.status, 409, "Singles scorers cannot substitute another active league member for the recorded entrant.");
     response = await fetchFromSite("/api/matches/live");
     livePayload = await response.json();
     const liveSinglesMatch = livePayload.matches.find((item) => item.id === singlesMatch.id);
@@ -1592,7 +1671,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       assert.equal(response.status, 200, await response.clone().text());
     }
     response = await matchPostJson(`/api/matches/${moneyMatch.id}/start`, thirdUserCookie, {});
-    assert.equal(response.status, 200, "Money Match start requires both players and the appointed admin's manual acknowledgements.");
+    assert.equal(response.status, 403, "The appointed Money Match Admin cannot score solely because of that role.");
+    response = await matchPostJson(`/api/matches/${moneyMatch.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 200, "A competing Money Match player can start after the required acknowledgements.");
 
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "practice", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],

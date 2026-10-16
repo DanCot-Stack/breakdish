@@ -96,6 +96,35 @@ async function requireMatch(client, matchId, lock = false) {
   return result.rows[0];
 }
 
+async function canOperateMatch(client, match, actorId, allowedStatuses = ["scheduled", "in_progress"]) {
+  if (!actorId || !allowedStatuses.includes(match.status)) return false;
+
+  if (match.match_type === "team_league") {
+    const result = await client.query(
+      `SELECT 1 FROM team_registrations tr
+       WHERE tr.user_id = $1 AND tr.league_id = $2 AND tr.season_id = $3
+         AND tr.team_id = ANY($4::uuid[]) AND tr.ended_at IS NULL
+         AND EXISTS (SELECT 1 FROM league_memberships lm
+           WHERE lm.league_id = tr.league_id AND lm.user_id = tr.user_id AND lm.status = 'active')
+       LIMIT 1 FOR SHARE OF tr`,
+      [actorId, match.league_id, match.season_id, [match.home_team_id, match.away_team_id]]
+    );
+    return Boolean(result.rows[0]);
+  }
+
+  const result = await client.query(
+    "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2 LIMIT 1",
+    [match.id, actorId]
+  );
+  return Boolean(result.rows[0]);
+}
+
+async function requireMatchOperator(client, match, actorId, allowedStatuses) {
+  if (!await canOperateMatch(client, match, actorId, allowedStatuses)) {
+    throw new LeagueStoreError(403, "Only a registered player on one of this match's competing sides can operate its scoreboard.");
+  }
+}
+
 async function requireLeagueManager(client, leagueId, actorId) {
   const result = await client.query(
     `SELECT role FROM league_memberships
@@ -1334,6 +1363,7 @@ export function createMatchStore(database) {
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
         if (match.status !== "scheduled") throw new LeagueStoreError(409, "Only a scheduled match can be started.");
+        await requireMatchOperator(client, match, actorId);
         if (match.match_type === "money_match") {
           const acknowledgements = await client.query(
             `SELECT count(DISTINCT acknowledgement_type) AS total FROM money_match_acknowledgements
@@ -1351,6 +1381,7 @@ export function createMatchStore(database) {
       if (![1, 2].includes(Number(side))) invalid("Choose a valid match side.");
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"));
+        await requireMatchOperator(client, match, actorId);
         const sideNumber = Number(side);
         if (match.match_type === "team_league") {
           const teamId = sideNumber === 1 ? match.home_team_id : match.away_team_id;
@@ -1375,10 +1406,10 @@ export function createMatchStore(database) {
             return result.rows.map((row) => ({ userId: row.user_id, displayName: row.display_name, registrationId: null }));
           }
           const result = await client.query(
-            `SELECT u.id AS user_id, coalesce(pp.display_name, u.name) AS display_name
-             FROM league_memberships lm JOIN "user" u ON u.id = lm.user_id
-             LEFT JOIN player_profiles pp ON pp.user_id = u.id
-             WHERE lm.league_id = $1 AND lm.status = 'active' ORDER BY display_name`, [match.league_id]
+            `SELECT mp.user_id, coalesce(pp.display_name, u.name) AS display_name
+             FROM match_participants mp JOIN "user" u ON u.id = mp.user_id
+             LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
+             WHERE mp.match_id = $1 AND mp.side = $2 ORDER BY display_name, mp.user_id`, [match.id, sideNumber]
           );
           return result.rows.map((row) => ({ userId: row.user_id, displayName: row.display_name, registrationId: null }));
         }
@@ -1401,6 +1432,7 @@ export function createMatchStore(database) {
         if (match.status !== "in_progress" && !amendment) {
           throw new LeagueStoreError(409, "Player selections can be changed only while the scoreboard is active.");
         }
+        if (!amendment) await requireMatchOperator(client, match, actorId);
         const frame = await client.query(
           `SELECT f.frame_number, f.status, sf.frame_type FROM match_frames f
            JOIN match_format_snapshot_frames sf ON sf.snapshot_id = f.snapshot_id AND sf.frame_number = f.frame_number
@@ -1458,12 +1490,11 @@ export function createMatchStore(database) {
               const participant = await client.query("SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2 AND side = $3", [match.id, userId, side]);
               if (!participant.rows[0]) throw new LeagueStoreError(403, "Choose a player already recorded on this match side.");
             } else {
-              const membership = await client.query("SELECT 1 FROM league_memberships WHERE league_id = $1 AND user_id = $2 AND status = 'active'", [match.league_id, userId]);
-              if (!membership.rows[0]) throw new LeagueStoreError(409, "Only active league members can be selected for this fixture.");
-              await client.query(
-                `INSERT INTO match_participants(match_id, user_id, side, added_by) VALUES($1,$2,$3,$4)
-                 ON CONFLICT(match_id,user_id) DO NOTHING`, [match.id, userId, side, actorId]
+              const participant = await client.query(
+                "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2 AND side = $3",
+                [match.id, userId, side]
               );
+              if (!participant.rows[0]) throw new LeagueStoreError(409, "Choose only the registered player recorded for this Singles side.");
             }
             await client.query(
               `INSERT INTO match_frame_players(match_id, frame_number, side, slot_number, user_id, is_bye, selected_by)
@@ -1481,6 +1512,7 @@ export function createMatchStore(database) {
         const amendment = await requireCompletedMatchAmendment(client, match, actorId);
         if (match.status === "disputed" && !amendment) throw new LeagueStoreError(409, "Resolve the active dispute before changing the scoreboard.");
         if (match.status !== "in_progress" && !amendment) throw new LeagueStoreError(409, "Start the match before entering a frame result.");
+        if (!amendment) await requireMatchOperator(client, match, actorId);
         const existing = await client.query(
           `SELECT f.*, sf.frame_type FROM match_frames f
            JOIN match_format_snapshot_frames sf ON sf.snapshot_id = f.snapshot_id AND sf.frame_number = f.frame_number
@@ -1541,6 +1573,7 @@ export function createMatchStore(database) {
         const amendment = await requireCompletedMatchAmendment(client, match, actorId);
         if (match.status === "cancelled") throw new LeagueStoreError(409, "Cancelled matches cannot be changed.");
         if (match.status === "disputed" && !amendment) throw new LeagueStoreError(409, "Resolve the active dispute before changing frame events.");
+        if (!amendment) await requireMatchOperator(client, match, actorId, ["in_progress", "awaiting_confirmation"]);
         const frame = await client.query("SELECT status, outcome_type FROM match_frames WHERE match_id = $1 AND frame_number = $2 FOR UPDATE", [match.id, frameNumber]);
         if (!frame.rows[0]) throw new LeagueStoreError(404, "This frame could not be found.");
         if (frame.rows[0].status !== "completed" || frame.rows[0].outcome_type !== "played") {
