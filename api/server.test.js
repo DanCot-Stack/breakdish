@@ -90,6 +90,57 @@ test("match API keeps public reads available and requires an authenticated user 
   }
 });
 
+test("historic results API provides the public league to season to final-results routes", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  const { createApp } = await import("./server.js");
+  const calls = [];
+  const leagueId = "123e4567-e89b-42d3-a456-426614174000";
+  const seasonId = "123e4567-e89b-42d3-a456-426614174001";
+  const store = {
+    async listHistoricResultLeagues() {
+      calls.push(["leagues"]);
+      return [{ id: leagueId, name: "North Division", seasonCount: 1, resultCount: 4 }];
+    },
+    async listHistoricResultSeasons(id) {
+      calls.push(["seasons", id]);
+      return [{ id: seasonId, name: "2025 Season", resultCount: 4 }];
+    },
+    async listMatches(filters, viewerId, options) {
+      calls.push(["matches", filters, viewerId, options]);
+      return [{ id: "result-1", status: "completed", homeScore: 5, awayScore: 3 }];
+    }
+  };
+  const app = createApp({ getMatchStore: async () => store });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const request = (path) => fetch(`${base}${path}`, { headers: { origin: "http://localhost:5500" } });
+  try {
+    let response = await request("/api/historic-results");
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("cache-control"), /no-store/i);
+    assert.equal((await response.json()).leagues[0].resultCount, 4);
+
+    response = await request(`/api/historic-results/${leagueId}/seasons`);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).seasons[0].id, seasonId);
+    assert.deepEqual(calls.at(-1), ["seasons", leagueId]);
+
+    response = await request(`/api/historic-results/${leagueId}/seasons/${seasonId}/matches`);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).matches[0].status, "completed");
+    assert.deepEqual(calls.at(-1), ["matches", { leagueId, seasonId }, null, { historicResults: true, unlimited: true }]);
+
+    response = await request("/api/historic-results/not-a-uuid/seasons");
+    assert.equal(response.status, 400);
+    response = await request(`/api/historic-results/${leagueId}/seasons/not-a-uuid/matches`);
+    assert.equal(response.status, 400);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 const sentEmails = [];
 const providerResponses = [];
 const emailSender = {

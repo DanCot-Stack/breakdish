@@ -651,6 +651,43 @@ function createApp({
     return Number.isInteger(number) && number >= 1 && number <= 99 ? number : null;
   };
 
+  app.get("/api/historic-results", async (_req, res, next) => {
+    try {
+      const leagues = await (await matchStore()).listHistoricResultLeagues();
+      res.set("Cache-Control", "no-store, max-age=0");
+      return res.json({ leagues });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/api/historic-results/:leagueId/seasons", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId)) return res.status(400).json({ error: "Enter a valid league ID." });
+      const seasons = await (await matchStore()).listHistoricResultSeasons(req.params.leagueId);
+      res.set("Cache-Control", "no-store, max-age=0");
+      return res.json({ seasons });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/api/historic-results/:leagueId/seasons/:seasonId/matches", async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.leagueId) || !isUuid(req.params.seasonId)) {
+        return res.status(400).json({ error: "Enter valid league and season IDs." });
+      }
+      const matches = await (await matchStore()).listMatches(
+        { leagueId: req.params.leagueId, seasonId: req.params.seasonId }, null,
+        { historicResults: true, unlimited: true }
+      );
+      res.set("Cache-Control", "no-store, max-age=0");
+      return res.json({ matches });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.get("/api/matches", async (req, res, next) => {
     try {
       const session = await matchSession(req);

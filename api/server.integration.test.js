@@ -1677,6 +1677,66 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     ).then(() => true);
     assert.equal(databaseGuard, true, "Database guards must protect team/season eligibility from direct writes.");
 
+    const historicSeasonsBeforeCompletion = await fetchFromSite(`/api/historic-results/${approval.league.id}/seasons`);
+    assert.equal(historicSeasonsBeforeCompletion.status, 200);
+    assert.equal((await historicSeasonsBeforeCompletion.json()).seasons.some((item) => item.id === matchSeason.id), false,
+      "Historic browsing excludes seasons until they are completed.");
+    response = await patchJson(`/api/seasons/${matchSeason.id}`, firstUserCookie, { status: "active" });
+    assert.equal(response.status, 200, await response.clone().text());
+    response = await patchJson(`/api/seasons/${matchSeason.id}`, firstUserCookie, { status: "completed" });
+    assert.equal(response.status, 200, await response.clone().text());
+
+    const historicDataCountsBefore = await database.query(
+      `SELECT (SELECT count(*)::integer FROM matches) AS matches,
+              (SELECT count(*)::integer FROM match_frames) AS frames,
+              (SELECT count(*)::integer FROM match_frame_events) AS frame_events,
+              (SELECT count(*)::integer FROM match_audit_events) AS audit_events`
+    );
+    const historicLeaguesResponse = await fetchFromSite("/api/historic-results");
+    assert.equal(historicLeaguesResponse.status, 200, await historicLeaguesResponse.clone().text());
+    const historicLeagues = (await historicLeaguesResponse.json()).leagues;
+    const historicLeague = historicLeagues.find((item) => item.id === approval.league.id);
+    assert.ok(historicLeague, "A public league appears when it has a completed season and a completed league result.");
+    assert.ok(historicLeague.seasonCount >= 1 && historicLeague.resultCount >= 1);
+
+    const historicSeasonsResponse = await fetchFromSite(`/api/historic-results/${approval.league.id}/seasons`);
+    assert.equal(historicSeasonsResponse.status, 200, await historicSeasonsResponse.clone().text());
+    const historicSeasons = (await historicSeasonsResponse.json()).seasons;
+    const historicSeason = historicSeasons.find((item) => item.id === matchSeason.id);
+    assert.ok(historicSeason, "Completed seasons with results are available within their league.");
+    assert.ok(historicSeason.resultCount >= 1);
+
+    const historicMatchesResponse = await fetchFromSite(
+      `/api/historic-results/${approval.league.id}/seasons/${matchSeason.id}/matches`
+    );
+    assert.equal(historicMatchesResponse.status, 200, await historicMatchesResponse.clone().text());
+    const historicMatches = (await historicMatchesResponse.json()).matches;
+    assert.ok(historicMatches.every((item) => item.status === "completed" && item.isOfficial === true),
+      "The historic results endpoint contains completed official league matches only.");
+    assert.ok(historicMatches.some((item) => item.id === matchUnderTest.id), "The finalized team league fixture is listed.");
+    assert.equal(historicMatches.some((item) => item.id === untouchedFutureMatch.id), false,
+      "Scheduled future matches are excluded from historic results.");
+    const historicTeamResult = historicMatches.find((item) => item.id === matchUnderTest.id);
+    assert.equal(historicTeamResult.type, "team_league");
+    assert.equal(historicTeamResult.homeTeam, homeMatchTeam.name);
+    assert.equal(historicTeamResult.awayTeam, awayMatchTeam.name);
+    assert.deepEqual([historicTeamResult.homeScore, historicTeamResult.awayScore], [2, 3]);
+    assert.ok(historicTeamResult.completedAt, "Final results use the stored completion timestamp.");
+
+    const unrelatedSeasonResults = await fetchFromSite(
+      `/api/historic-results/${approval.league.id}/seasons/${season.id}/matches`
+    );
+    assert.equal(unrelatedSeasonResults.status, 200);
+    assert.deepEqual((await unrelatedSeasonResults.json()).matches, [], "Historic results remain scoped to the selected league and season.");
+    const historicDataCountsAfter = await database.query(
+      `SELECT (SELECT count(*)::integer FROM matches) AS matches,
+              (SELECT count(*)::integer FROM match_frames) AS frames,
+              (SELECT count(*)::integer FROM match_frame_events) AS frame_events,
+              (SELECT count(*)::integer FROM match_audit_events) AS audit_events`
+    );
+    assert.deepEqual(historicDataCountsAfter.rows[0], historicDataCountsBefore.rows[0],
+      "Reading the historic results directory does not modify native match data.");
+
     response = await fetchFromSite("/api/auth/sign-out", {
       method: "POST", headers: { cookie: thirdUserCookie, "content-type": "application/json" }, body: "{}"
     });

@@ -616,8 +616,53 @@ function validateFrames(frames) {
 
 export function createMatchStore(database) {
   return {
+    async listHistoricResultLeagues() {
+      return withReadOnlyTransaction(database, async (client) => {
+        const result = await client.query(
+          `SELECT l.id, l.name, l.slug, l.location,
+             count(DISTINCT s.id)::integer AS season_count,
+             count(DISTINCT m.id)::integer AS result_count
+           FROM leagues l
+           JOIN seasons s ON s.league_id = l.id AND s.status = 'completed'
+           JOIN matches m ON m.league_id = l.id AND m.season_id = s.id
+             AND m.status = 'completed' AND m.is_official = true
+             AND m.match_type IN ('team_league', 'singles_league', 'doubles_league')
+           WHERE l.status IN ('open', 'active')
+           GROUP BY l.id
+           ORDER BY lower(l.name), l.id`
+        );
+        return result.rows.map((row) => ({
+          id: row.id, name: row.name, slug: row.slug, location: row.location,
+          seasonCount: Number(row.season_count), resultCount: Number(row.result_count)
+        }));
+      });
+    },
+
+    async listHistoricResultSeasons(leagueId) {
+      const leagueKey = cleanUuid(leagueId, "league ID");
+      return withReadOnlyTransaction(database, async (client) => {
+        const result = await client.query(
+          `SELECT s.id, s.name, s.starts_on, s.ends_on,
+             count(DISTINCT m.id)::integer AS result_count
+           FROM leagues l
+           JOIN seasons s ON s.league_id = l.id AND s.status = 'completed'
+           JOIN matches m ON m.league_id = l.id AND m.season_id = s.id
+             AND m.status = 'completed' AND m.is_official = true
+             AND m.match_type IN ('team_league', 'singles_league', 'doubles_league')
+           WHERE l.id = $1 AND l.status IN ('open', 'active')
+           GROUP BY s.id
+           ORDER BY s.starts_on DESC NULLS LAST, s.created_at DESC, s.id`,
+          [leagueKey]
+        );
+        return result.rows.map((row) => ({
+          id: row.id, name: row.name, startsOn: row.starts_on, endsOn: row.ends_on,
+          resultCount: Number(row.result_count)
+        }));
+      });
+    },
+
     async listMatches(filters = {}, viewerId = null, options = {}) {
-      return withTransaction(database, null, async (client) => {
+      const queryMatches = async (client) => {
         const values = [];
         const clauses = [];
         for (const [key, value, column] of [
@@ -645,6 +690,19 @@ export function createMatchStore(database) {
         if (filters.status !== undefined) {
           if (!MATCH_STATUSES.has(filters.status)) invalid("Choose a supported match status.");
           values.push(filters.status); clauses.push(`sb.status = $${values.length}`);
+        }
+        if (options.historicResults === true) {
+          clauses.push(`sb.status = 'completed'
+            AND sb.is_official = true
+            AND sb.match_type IN ('team_league', 'singles_league', 'doubles_league')
+            AND EXISTS (
+              SELECT 1 FROM seasons historic_season
+              JOIN leagues historic_league ON historic_league.id = historic_season.league_id
+              WHERE historic_season.id = sb.season_id
+                AND historic_season.league_id = sb.league_id
+                AND historic_season.status = 'completed'
+                AND historic_league.status IN ('open', 'active')
+            )`);
         }
         const currentFrameSelect = options.includeCurrentFrame
           ? "current_frame.current_frame"
@@ -715,7 +773,10 @@ export function createMatchStore(database) {
           values
         );
         return result.rows.map(toMatch);
-      });
+      };
+      return options.historicResults === true
+        ? withReadOnlyTransaction(database, queryMatches)
+        : withTransaction(database, null, queryMatches);
     },
 
     async getMatch(matchId, viewerId = null) {

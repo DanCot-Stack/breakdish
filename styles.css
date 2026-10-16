@@ -3424,6 +3424,47 @@ td:first-child {
   margin-bottom: 24px;
 }
 
+.historic-breadcrumb {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 20px;
+  color: #d0c4c8;
+  font-size: 15px;
+}
+
+.historic-breadcrumb a {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--gold-light);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.historic-breadcrumb span[aria-current="page"] {
+  color: var(--cream);
+}
+
+.historic-directory-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.historic-directory-card > div {
+  min-width: 0;
+}
+
+.historic-directory-card .button {
+  flex: 0 0 auto;
+}
+
+.historic-result-card .match-list-card-header {
+  justify-content: space-between;
+}
+
 .match-list,
 .score-frame-list {
   display: grid;
@@ -4049,6 +4090,15 @@ canvas {
 }
 
 @media (max-width: 640px) {
+  .historic-directory-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .historic-directory-card .button {
+    width: 100%;
+  }
+
   .live-match-row {
     grid-template-columns: minmax(0, 1fr);
     gap: 14px;

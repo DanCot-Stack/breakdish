@@ -86,6 +86,8 @@ test("all site headers use the required navigation groups without Contact Us or 
     assert.doesNotMatch(nav, /Contact Us|Log out|Log In|Sign Up/i, `${name} must not put contact or auth actions in the global navigation.`);
     assert.match(nav, /href="admin\.html" data-nav-admin hidden/, `${name} keeps Admin hidden until a managed-league role is confirmed.`);
     assert.match(nav, /<details class="nav-dropdown" data-nav-dropdown>[\s\S]*?href="my-leagues\.html"[\s\S]*?href="create-league\.html"[\s\S]*?href="join-league\.html"[\s\S]*?href="index\.html#tables"/);
+    assert.match(nav, /<a href="historic-results\.html"(?: aria-current="page")?>Historic Results<\/a>/, `${name} links to the Historic Results page.`);
+    assert.doesNotMatch(nav, /href="index\.html#results"[^>]*>Results<\/a>/, `${name} no longer sends the main Results link to the homepage section.`);
     const matchDropdown = nav.match(/<details class="nav-dropdown" data-nav-dropdown><summary aria-expanded="false">Match Centre[\s\S]*?<div class="nav-dropdown-menu">([\s\S]*?)<\/div><\/details>/)?.[1];
     assert.ok(matchDropdown, `${name} keeps Match Centre as the dropdown heading.`);
     assert.deepEqual([...matchDropdown.matchAll(/<a href="([^"]+)"/g)].map((link) => link[1]), [
@@ -95,4 +97,25 @@ test("all site headers use the required navigation groups without Contact Us or 
     assert.match(matchDropdown, /data-nav-previous-matches/);
     assert.match(nav, /data-nav-mobile-account/);
   }
+});
+
+test("Historic Results page uses the public league, completed-season and results API hierarchy", async () => {
+  const [page, historicScript] = await Promise.all([
+    readFile(join(projectRoot, "historic-results.html"), "utf8"),
+    readFile(join(projectRoot, "historic-results.js"), "utf8")
+  ]);
+  assert.match(page, /data-historic-results-page/);
+  assert.match(page, /data-historic-breadcrumb/);
+  assert.match(page, /historic-results\.js/);
+  assert.match(historicScript, /\/api\/historic-results/);
+  assert.match(historicScript, /\/seasons/);
+  assert.match(historicScript, /\/matches/);
+  assert.match(historicScript, /match\.completedAt \|\| match\.scheduledAt/);
+  assert.match(historicScript, /Round \$\{match\.roundNumber\}/);
+  assert.match(historicScript, /match\.homeScore/);
+  assert.match(historicScript, /match\.homeTeam \|\| match\.homeSideName/);
+  assert.match(historicScript, /match\.awayTeam \|\| match\.awaySideName/);
+  assert.match(historicScript, /match\.html\?id=/);
+  assert.doesNotMatch(page + historicScript, /upload|import file|platform admin/i,
+    "No history upload control is exposed before the project has a platform-admin role.");
 });
