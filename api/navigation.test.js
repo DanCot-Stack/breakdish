@@ -54,7 +54,14 @@ test("signed-in navigation, filtered Match Centre and league management shortcut
   assert.doesNotMatch(script, /data-nav-logout|nav-logout/);
   assert.match(script, /create-league\.html\?manage=/);
   assert.match(matchScript, /search\.get\("leagueId"\)/);
-  assert.match(matchScript, /\/api\/matches\?leagueId=/);
+  assert.match(matchScript, /filters\.set\("leagueId", filterLeagueId\)/);
+  assert.match(matchScript, /const endpoint = query \? `\/api\/matches\?\$\{query\}` : "\/api\/matches"/);
+  assert.match(matchScript, /previousMatches = search\.get\("status"\) === "completed"/);
+  assert.match(matchScript, /filters\.set\("status", "completed"\)/);
+  assert.match(matchScript, /match\.completedAt \|\| match\.scheduledAt/);
+  assert.match(matchScript, /previousMatches \? "View Match" : "Open scoreboard"/);
+  assert.match(matchScript, /const isFinal = match\.status === "completed"/);
+  assert.match(matchScript, /if \(!signedIn && !isFinal\)/);
   assert.match(matchScript, /\/api\/matches\/\$\{encodeURIComponent\(matchId\)\}/);
   assert.match(matchScript, /match\.startedAt/);
   assert.match(matchScript, /showModal\(\)/);
@@ -79,7 +86,13 @@ test("all site headers use the required navigation groups without Contact Us or 
     assert.doesNotMatch(nav, /Contact Us|Log out|Log In|Sign Up/i, `${name} must not put contact or auth actions in the global navigation.`);
     assert.match(nav, /href="admin\.html" data-nav-admin hidden/, `${name} keeps Admin hidden until a managed-league role is confirmed.`);
     assert.match(nav, /<details class="nav-dropdown" data-nav-dropdown>[\s\S]*?href="my-leagues\.html"[\s\S]*?href="create-league\.html"[\s\S]*?href="join-league\.html"[\s\S]*?href="index\.html#tables"/);
-    assert.match(nav, /<details class="nav-dropdown" data-nav-dropdown>[\s\S]*?href="match\.html"[\s\S]*?href="live-matches\.html"/);
+    const matchDropdown = nav.match(/<details class="nav-dropdown" data-nav-dropdown><summary aria-expanded="false">Match Centre[\s\S]*?<div class="nav-dropdown-menu">([\s\S]*?)<\/div><\/details>/)?.[1];
+    assert.ok(matchDropdown, `${name} keeps Match Centre as the dropdown heading.`);
+    assert.deepEqual([...matchDropdown.matchAll(/<a href="([^"]+)"/g)].map((link) => link[1]), [
+      "live-matches.html",
+      "match.html?status=completed"
+    ], `${name} lists Live Matches before Previous Matches.`);
+    assert.match(matchDropdown, /data-nav-previous-matches/);
     assert.match(nav, /data-nav-mobile-account/);
   }
 });

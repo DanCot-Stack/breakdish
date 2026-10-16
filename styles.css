@@ -3435,6 +3435,11 @@ td:first-child {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
 }
 
+.match-list.is-previous-matches {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 1000px;
+}
+
 .match-list-card,
 .match-scoreboard-header,
 .score-frame-card,

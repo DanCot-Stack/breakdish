@@ -20,6 +20,7 @@ if (page) {
   let signedIn = false;
   let matchData;
   let filterLeagueId = null;
+  let previousMatches = false;
   let serverOffsetMs = 0;
   let matchPollTimer = null;
   let matchClockTimer = null;
@@ -95,10 +96,13 @@ if (page) {
 
   function renderMatchList(matches) {
     list.replaceChildren();
+    list.classList.toggle("is-previous-matches", previousMatches);
     if (!matches.length) {
-      setStatus(filterLeagueId
-        ? "No fixtures or results have been published for this league yet."
-        : "No public matches are listed yet. Match schedules will appear here when organisers publish them.", "success");
+      setStatus(previousMatches
+        ? "No completed matches are available yet."
+        : filterLeagueId
+          ? "No fixtures or results have been published for this league yet."
+          : "No public matches are listed yet. Match schedules will appear here when organisers publish them.", "success");
       return;
     }
     for (const match of matches) {
@@ -106,14 +110,20 @@ if (page) {
       const header = textElement("div", "match-list-card-header");
       header.append(
         textElement("span", "match-category-tag", labels[match.type] || "Match"),
-        textElement("span", `match-state-tag is-${match.status}`, match.status.replaceAll("_", " "))
+        textElement("span", `match-state-tag is-${match.status}`, previousMatches ? "Final" : match.status.replaceAll("_", " "))
       );
       const name = textElement("h3", "", matchLabel(match));
-      const meta = textElement("p", "match-list-meta", `${formatDate(match.scheduledAt)}${match.divisionName ? ` · ${match.divisionName}` : ""}${match.venue ? ` · ${match.venue}` : ""}`);
+      const competition = previousMatches && (match.leagueName || match.tournamentName)
+        ? textElement("p", "match-list-meta", [match.leagueName || match.tournamentName, match.divisionName].filter(Boolean).join(" · "))
+        : null;
+      const date = previousMatches ? (match.completedAt || match.scheduledAt) : match.scheduledAt;
+      const meta = textElement("p", "match-list-meta", `${formatDate(date)}${match.venue ? ` · ${match.venue}` : ""}`);
       const score = textElement("p", "match-list-score", `${match.homeScore} — ${match.awayScore}`);
-      const link = textElement("a", "button button-gold", "Open scoreboard");
+      const link = textElement("a", "button button-gold", previousMatches ? "View Match" : "Open scoreboard");
       link.href = `match.html?id=${encodeURIComponent(match.id)}`;
-      card.append(header, name, meta, score, link);
+      card.append(header, name);
+      if (competition) card.append(competition);
+      card.append(meta, score, link);
       list.append(card);
     }
     setStatus(`${matches.length} ${matches.length === 1 ? "match" : "matches"} listed.`, "success");
@@ -329,9 +339,10 @@ if (page) {
   async function renderMatch(result) {
     matchData = result;
     const match = result.match;
-    title.innerHTML = "MATCH<br><em>SCOREBOARD.</em>";
-    sectionTitle.innerHTML = "LIVE<br><span>SCOREBOARD.</span>";
-    sectionKicker.textContent = labels[match.type] || "MATCH";
+    const isFinal = match.status === "completed";
+    title.innerHTML = isFinal ? "FINAL<br><em>RESULT.</em>" : "MATCH<br><em>SCOREBOARD.</em>";
+    sectionTitle.innerHTML = isFinal ? "COMPLETED<br><span>MATCH.</span>" : "LIVE<br><span>SCOREBOARD.</span>";
+    sectionKicker.textContent = isFinal ? "FINAL RESULT" : labels[match.type] || "MATCH";
     intro.textContent = `${matchLabel(match)} · ${match.status.replaceAll("_", " ")}`;
     list.hidden = true;
     detail.hidden = false;
@@ -341,7 +352,7 @@ if (page) {
     const state = textElement("p", `match-state-banner is-${match.status}`, `${stateText} ${match.framesCompleted} of ${match.framesTotal} frames complete.`);
     detail.append(state);
 
-    if (!signedIn) {
+    if (!signedIn && !isFinal) {
       const access = textElement("p", "match-access-note", "Sign in to update a scoreboard, select players or confirm a result.");
       const login = textElement("a", "button button-quiet", "Log in");
       login.href = `login.html?next=${encodeURIComponent(`match.html?id=${match.id}`)}`;
@@ -562,12 +573,21 @@ if (page) {
     const search = new URLSearchParams(window.location.search);
     const matchId = search.get("id");
     filterLeagueId = search.get("leagueId");
+    previousMatches = search.get("status") === "completed";
     if (matchId) {
       try { await loadMatch(matchId); }
       catch (error) { setStatus(error.message, "error"); }
       return;
     }
-    if (filterLeagueId) {
+    if (previousMatches) {
+      document.title = "Previous Matches | BREAK DISH";
+      title.innerHTML = "PREVIOUS<br><em>MATCHES.</em>";
+      sectionTitle.innerHTML = "COMPLETED<br><span>RESULTS.</span>";
+      sectionKicker.textContent = "PREVIOUS MATCHES";
+      intro.textContent = "Completed match scores and final details from leagues and competitions.";
+      page.querySelector(".match-hero > p").textContent = "Browse finished matches and their confirmed final scores. Open any match to review its read-only result and frame details.";
+      page.querySelector("[data-nav-previous-matches]")?.setAttribute("aria-current", "page");
+    } else if (filterLeagueId) {
       title.innerHTML = "LEAGUE<br><em>MATCHES.</em>";
       sectionTitle.innerHTML = "FIXTURES<br><span>&amp; RESULTS.</span>";
       sectionKicker.textContent = "LEAGUE MATCHES";
@@ -575,9 +595,13 @@ if (page) {
       const competitionLink = page.querySelector("[data-match-league-link]");
       if (competitionLink) competitionLink.href = `competition.html?id=${encodeURIComponent(filterLeagueId)}`;
     }
-    setStatus(filterLeagueId ? "Loading this league's matches…" : "Loading public matches…", "pending");
+    setStatus(previousMatches ? "Loading completed matches…" : filterLeagueId ? "Loading this league's matches…" : "Loading public matches…", "pending");
     try {
-      const endpoint = filterLeagueId ? `/api/matches?leagueId=${encodeURIComponent(filterLeagueId)}` : "/api/matches";
+      const filters = new URLSearchParams();
+      if (filterLeagueId) filters.set("leagueId", filterLeagueId);
+      if (previousMatches) filters.set("status", "completed");
+      const query = filters.toString();
+      const endpoint = query ? `/api/matches?${query}` : "/api/matches";
       const payload = await request(endpoint);
       if (filterLeagueId && payload.matches?.[0]?.leagueName) {
         intro.textContent = `${payload.matches[0].leagueName}: fixtures and recorded results published by league organisers.`;
