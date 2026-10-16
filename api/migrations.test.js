@@ -9,6 +9,7 @@ import * as signingStartMigration from "./migrations/006_require_official_start_
 import * as matchClassificationMigration from "./migrations/007_match_categories_and_practice_stats.js";
 import * as doublesLeagueSidesMigration from "./migrations/008_doubles_league_match_sides.js";
 import * as fixtureRoundNumbersMigration from "./migrations/009_fixture_round_numbers.js";
+import * as platformRolesMigration from "./migrations/010_platform_roles.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -237,4 +238,31 @@ test("migration 009 adds optional positive league fixture round numbers without 
   }));
   const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
   assert.match(downSql, /Cannot roll back migration 009 while fixture round history exists/);
+});
+
+test("migration 010 separates current platform roles from append-only role history", () => {
+  const upCalls = [];
+  platformRolesMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+  const tables = upCalls.filter(({ operation }) => operation === "createTable").map(({ args }) => args[0]);
+  assert.deepEqual(tables, ["platform_roles", "platform_role_events"]);
+  const indexes = upCalls.filter(({ operation }) => operation === "createIndex");
+  assert.ok(indexes.some(({ args }) => args[0] === "platform_roles" && args[1] === "role" &&
+    args[2].unique && args[2].where === "role = 'super_admin'"),
+  "A partial unique index must prevent concurrent active Super Admin assignments.");
+  const sql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(sql, /BEFORE UPDATE OR DELETE ON platform_role_events/);
+  assert.match(sql, /BEFORE TRUNCATE ON platform_role_events/);
+  assert.match(sql, /Platform role history is append-only/);
+  const roleChecks = upCalls.filter(({ operation, args }) => operation === "addConstraint" && args[0] === "platform_role_events");
+  assert.ok(roleChecks.some(({ args }) => args[2].check.includes("'bootstrap'")));
+  assert.ok(roleChecks.some(({ args }) => args[2].check.includes("'grant'") && args[2].check.includes("'revoke'")));
+
+  const downCalls = [];
+  platformRolesMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back migration 010 while platform role assignments or history exist/);
 });

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { PlatformRoleError } from "./platform-role-store.js";
 
 test("login page sends the checked state of Remember me as a boolean", async () => {
   const loginHtml = await readFile(new URL("../login.html", import.meta.url), "utf8");
@@ -135,6 +136,91 @@ test("historic results API provides the public league to season to final-results
     assert.equal(response.status, 400);
     response = await request(`/api/historic-results/${leagueId}/seasons/not-a-uuid/matches`);
     assert.equal(response.status, 400);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("platform role management routes require a Super Admin and expose no Super Admin grant endpoint", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  const { createApp } = await import("./server.js");
+  const calls = [];
+  const store = {
+    async listActivePlatformAdmins(actorId) {
+      calls.push(["admins", actorId]);
+      if (actorId !== "super-admin") throw new PlatformRoleError(403, "Super Admin required.");
+      return [{ userId: "platform-admin", role: "platform_admin" }];
+    },
+    async listRoleHistory(actorId, limit) {
+      calls.push(["history", actorId, limit]);
+      if (actorId !== "super-admin") throw new PlatformRoleError(403, "Super Admin required.");
+      return [{ action: "grant", role: "platform_admin" }];
+    },
+    async grantPlatformAdmin(actorId, userId, reason) {
+      calls.push(["grant", actorId, userId, reason]);
+      if (actorId !== "super-admin") throw new PlatformRoleError(403, "Super Admin required.");
+      return { assignment: { userId, role: "platform_admin" }, repeated: false };
+    },
+    async revokePlatformAdmin(actorId, userId, reason) {
+      calls.push(["revoke", actorId, userId, reason]);
+      if (actorId !== "super-admin") throw new PlatformRoleError(403, "Super Admin required.");
+      return { revoked: true, userId };
+    }
+  };
+  const auth = { api: { async getSession({ headers }) {
+    const userId = headers.get("x-test-session");
+    return userId ? { user: { id: userId } } : null;
+  } } };
+  const app = createApp({ getAuthInstance: async () => auth, getPlatformRoleStore: async () => store });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const request = (path, options = {}, actor = "") => fetch(`${base}${path}`, {
+    ...options,
+    headers: {
+      origin: "http://localhost:5500",
+      ...(actor ? { "x-test-session": actor } : {}),
+      ...(options.headers || {})
+    }
+  });
+  try {
+    let response = await request("/api/platform/roles/admins");
+    assert.equal(response.status, 401);
+    response = await request("/api/platform/roles/history", {}, "platform-admin");
+    assert.equal(response.status, 403);
+    response = await request("/api/platform/roles/admins", {}, "platform-admin");
+    assert.equal(response.status, 403);
+    response = await request("/api/platform/roles/admins/target", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason: "Not permitted" })
+    }, "platform-admin");
+    assert.equal(response.status, 403);
+    response = await request("/api/platform/roles/admins/target", { method: "DELETE" }, "platform-admin");
+    assert.equal(response.status, 403);
+
+    response = await request("/api/platform/roles/admins", {}, "super-admin");
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).admins[0].role, "platform_admin");
+    response = await request("/api/platform/roles/history?limit=10", {}, "super-admin");
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).events[0].action, "grant");
+    response = await request("/api/platform/roles/history?limit=201", {}, "super-admin");
+    assert.equal(response.status, 400);
+    response = await request("/api/platform/roles/admins/target", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason: "Approved" })
+    }, "super-admin");
+    assert.equal(response.status, 201);
+    assert.deepEqual(calls.filter(([kind]) => kind === "grant").at(-1), ["grant", "super-admin", "target", "Approved"]);
+    response = await request("/api/platform/roles/admins/target", {
+      method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason: "Ended" })
+    }, "super-admin");
+    assert.equal(response.status, 200);
+
+    response = await request("/api/platform/roles/super-admins/target", {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    }, "super-admin");
+    assert.equal(response.status, 404, "No HTTP endpoint can grant Super Admin.");
+    assert.equal(calls.some(([kind]) => kind === "superAdminGrant"), false);
   } finally {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));

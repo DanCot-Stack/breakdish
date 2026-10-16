@@ -1,6 +1,7 @@
 import "dotenv/config";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createPlatformRoleStore, PlatformRoleError } from "./platform-role-store.js";
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL?.trim();
 
@@ -26,9 +27,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     import("./auth.js"),
     import("./server.js")
   ]);
+  const platformRoles = createPlatformRoleStore(database);
   const server = await start({
     emailSender: { async sendContactEmail() {} },
-    getAuthInstance: async () => auth
+    getAuthInstance: async () => auth,
+    getPlatformRoleStore: async () => platformRoles
   });
   const endpoint = `http://127.0.0.1:${server.address().port}`;
   const testIp = `198.51.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`;
@@ -42,6 +45,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     .join("; ");
 
   try {
+    const initialPlatformRoles = await database.query("SELECT count(*)::integer AS count FROM platform_roles");
+    assert.equal(initialPlatformRoles.rows[0].count, 0, "A fresh database begins with no Super Admin or Platform Admin.");
+    assert.equal(await platformRoles.isSuperAdmin("not-yet-registered"), false);
+
     const email = `test-${crypto.randomUUID()}@example.test`;
     let response = await fetchFromSite("/api/me");
     assert.equal(response.status, 401, "Anonymous requests must not receive an authenticated session.");
@@ -204,6 +211,161 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       headers: { cookie: sessionCookie, "content-type": "application/json" },
       body: JSON.stringify(body)
     });
+
+    await assert.rejects(
+      platformRoles.bootstrapSuperAdmin("missing-bootstrap-account"),
+      (error) => error instanceof PlatformRoleError && error.status === 404,
+      "Bootstrap must reject a user ID that does not exist in Better Auth."
+    );
+    const bootstrapAttempts = await Promise.allSettled([
+      platformRoles.bootstrapSuperAdmin(firstUserId, "Local concurrency verification"),
+      platformRoles.bootstrapSuperAdmin(secondProfile.userId, "Local concurrency verification")
+    ]);
+    const successfulBootstrapIndex = bootstrapAttempts.findIndex((attempt) => attempt.status === "fulfilled");
+    assert.notEqual(successfulBootstrapIndex, -1, "One concurrent bootstrap may create the first Super Admin.");
+    assert.equal(bootstrapAttempts.filter((attempt) => attempt.status === "fulfilled").length, 1,
+      "Concurrent bootstrap attempts must never create two active Super Admins.");
+    const rejectedBootstrap = bootstrapAttempts.find((attempt) => attempt.status === "rejected");
+    assert.ok(rejectedBootstrap.reason instanceof PlatformRoleError);
+    assert.equal(rejectedBootstrap.reason.status, 409);
+    const superAdminUserId = successfulBootstrapIndex === 0 ? firstUserId : secondProfile.userId;
+    const superAdminCookie = successfulBootstrapIndex === 0 ? firstUserCookie : secondUserCookie;
+    const platformAdminUserId = successfulBootstrapIndex === 0 ? secondProfile.userId : firstUserId;
+    const platformAdminCookie = successfulBootstrapIndex === 0 ? secondUserCookie : firstUserCookie;
+    assert.equal(await platformRoles.isSuperAdmin(superAdminUserId), true);
+    assert.equal(await platformRoles.isPlatformAdmin(superAdminUserId), true,
+      "Super Admin must satisfy the broader platform administrator permission.");
+    await platformRoles.requireSuperAdmin(superAdminUserId);
+    await platformRoles.requirePlatformAdmin(superAdminUserId);
+    const bootstrapEvents = await database.query(
+      "SELECT role, action, actor_user_id FROM platform_role_events WHERE role='super_admin'"
+    );
+    assert.deepEqual(bootstrapEvents.rows, [{ role: "super_admin", action: "bootstrap", actor_user_id: null }],
+      "Bootstrap must write an auditable event without misrepresenting a user as its own actor.");
+    const activeSuperAdmins = await database.query("SELECT count(*)::integer AS count FROM platform_roles WHERE role='super_admin'");
+    assert.equal(activeSuperAdmins.rows[0].count, 1);
+    await assert.rejects(
+      database.query("INSERT INTO platform_roles(user_id, role, granted_by) VALUES($1, 'super_admin', NULL)", [
+        successfulBootstrapIndex === 0 ? secondProfile.userId : firstUserId
+      ]),
+      (error) => error.code === "23505" && error.constraint === "platform_roles_single_super_admin",
+      "The database unique index must reject a second active Super Admin even if application locking is bypassed."
+    );
+    await assert.rejects(
+      platformRoles.bootstrapSuperAdmin(platformAdminUserId),
+      (error) => error instanceof PlatformRoleError && error.status === 409,
+      "Bootstrap must refuse after an active Super Admin exists."
+    );
+
+    let roleResponse = await fetchFromSite("/api/platform/roles/admins");
+    assert.equal(roleResponse.status, 401, "Anonymous users cannot list platform roles.");
+    roleResponse = await fetchFromSite("/api/platform/roles/history");
+    assert.equal(roleResponse.status, 401, "Anonymous users cannot view platform role history.");
+    roleResponse = await postJson(`/api/platform/roles/admins/${platformAdminUserId}`, "", {});
+    assert.equal(roleResponse.status, 401, "Anonymous users cannot grant Platform Admin.");
+    roleResponse = await fetchFromSite(`/api/platform/roles/admins/${platformAdminUserId}`, { method: "DELETE" });
+    assert.equal(roleResponse.status, 401, "Anonymous users cannot revoke Platform Admin.");
+    roleResponse = await postJson(`/api/platform/roles/admins/${platformAdminUserId}`, superAdminCookie, {
+      reason: "Local integration permission check",
+      role: "super_admin"
+    });
+    assert.equal(roleResponse.status, 201, await roleResponse.clone().text());
+    assert.equal((await roleResponse.json()).assignment.role, "platform_admin",
+      "Client-supplied role names cannot change the fixed Platform Admin grant target.");
+    assert.equal(await platformRoles.hasPlatformRole(platformAdminUserId, "platform_admin"), true);
+    assert.equal(await platformRoles.isSuperAdmin(platformAdminUserId), false,
+      "Platform Admin must not satisfy the Super Admin-only permission used for future Historic Results imports.");
+    await platformRoles.requirePlatformAdmin(platformAdminUserId);
+    await assert.rejects(
+      platformRoles.requireSuperAdmin(platformAdminUserId),
+      (error) => error instanceof PlatformRoleError && error.status === 403
+    );
+    await assert.rejects(
+      platformRoles.grantPlatformAdmin(superAdminUserId, "missing-platform-account"),
+      (error) => error instanceof PlatformRoleError && error.status === 404,
+      "Grant must reject an unknown Better Auth account."
+    );
+    await assert.rejects(
+      platformRoles.revokePlatformAdmin(superAdminUserId, "missing-platform-account"),
+      (error) => error instanceof PlatformRoleError && error.status === 404,
+      "Revoke must reject an unknown Better Auth account."
+    );
+
+    roleResponse = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: superAdminCookie } });
+    assert.equal(roleResponse.status, 200);
+    assert.ok((await roleResponse.json()).admins.some((admin) => admin.userId === platformAdminUserId));
+    roleResponse = await fetchFromSite("/api/platform/roles/history", { headers: { cookie: superAdminCookie } });
+    assert.equal(roleResponse.status, 200);
+    assert.ok((await roleResponse.json()).events.some((event) => event.action === "bootstrap"));
+
+    roleResponse = await postJson(`/api/platform/roles/admins/${secondProfile.userId}`, platformAdminCookie, {});
+    assert.equal(roleResponse.status, 403, "Platform Admin cannot appoint another Platform Admin.");
+    roleResponse = await fetchFromSite(`/api/platform/roles/admins/${platformAdminUserId}`, {
+      method: "DELETE", headers: { cookie: platformAdminCookie }
+    });
+    assert.equal(roleResponse.status, 403, "Platform Admin cannot revoke a Platform Admin.");
+    roleResponse = await postJson(`/api/platform/roles/admins/${superAdminUserId}`, platformAdminCookie, { role: "platform_admin" });
+    assert.equal(roleResponse.status, 403, "Platform Admin cannot replace the active Super Admin.");
+    roleResponse = await fetchFromSite(`/api/platform/roles/admins/${superAdminUserId}`, {
+      method: "DELETE", headers: { cookie: platformAdminCookie }
+    });
+    assert.equal(roleResponse.status, 403, "Platform Admin cannot revoke or modify the active Super Admin.");
+    roleResponse = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: platformAdminCookie } });
+    assert.equal(roleResponse.status, 403, "Platform Admin cannot view or manage role assignments.");
+
+    roleResponse = await postJson(`/api/platform/roles/admins/${platformAdminUserId}`, superAdminCookie, {});
+    assert.equal(roleResponse.status, 200, "Repeated Platform Admin grants are idempotent.");
+    assert.equal((await roleResponse.json()).repeated, true);
+    const grantsBeforeRevoke = await database.query(
+      "SELECT count(*)::integer AS count FROM platform_role_events WHERE target_user_id=$1 AND role='platform_admin' AND action='grant'",
+      [platformAdminUserId]
+    );
+    assert.equal(grantsBeforeRevoke.rows[0].count, 1, "An idempotent grant must not duplicate audit events.");
+
+    roleResponse = await fetchFromSite(`/api/platform/roles/admins/${platformAdminUserId}`, {
+      method: "DELETE", headers: { cookie: superAdminCookie, "content-type": "application/json" },
+      body: JSON.stringify({ reason: "Local revocation verification" })
+    });
+    assert.equal(roleResponse.status, 200);
+    assert.equal((await roleResponse.json()).revoked, true);
+    assert.equal(await platformRoles.isPlatformAdmin(platformAdminUserId), false,
+      "A revoked Platform Admin must immediately lose platform permissions.");
+    await assert.rejects(
+      platformRoles.requirePlatformAdmin(platformAdminUserId),
+      (error) => error instanceof PlatformRoleError && error.status === 403
+    );
+    roleResponse = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: platformAdminCookie } });
+    assert.equal(roleResponse.status, 403, "A revoked Platform Admin loses management API access.");
+    roleResponse = await fetchFromSite(`/api/platform/roles/admins/${platformAdminUserId}`, {
+      method: "DELETE", headers: { cookie: superAdminCookie }
+    });
+    assert.equal(roleResponse.status, 200, "Repeated revocation is idempotent.");
+    assert.equal((await roleResponse.json()).revoked, false);
+    const retainedRoleHistory = await database.query(
+      "SELECT action, actor_user_id, reason FROM platform_role_events WHERE target_user_id=$1 AND role='platform_admin' ORDER BY created_at",
+      [platformAdminUserId]
+    );
+    assert.deepEqual(retainedRoleHistory.rows.map((event) => event.action), ["grant", "revoke"],
+      "The complete role history remains after the active assignment is removed.");
+    assert.ok(retainedRoleHistory.rows.every((event) => event.actor_user_id === superAdminUserId),
+      "Grant and revocation audit events retain the authorizing Super Admin.");
+    assert.equal(retainedRoleHistory.rows[1].reason, "Local revocation verification");
+    await assert.rejects(
+      database.query("UPDATE platform_role_events SET reason='changed' WHERE target_user_id=$1", [platformAdminUserId]),
+      (error) => error.code === "55000" && error.constraint === "platform_role_events_append_only",
+      "The database must reject changes to recorded platform role history."
+    );
+    await assert.rejects(
+      database.query("DELETE FROM platform_role_events WHERE target_user_id=$1", [platformAdminUserId]),
+      (error) => error.code === "55000" && error.constraint === "platform_role_events_append_only",
+      "The database must reject deletion of platform role history."
+    );
+    await assert.rejects(
+      database.query("TRUNCATE platform_role_events"),
+      (error) => error.code === "55000" && error.constraint === "platform_role_events_append_only",
+      "The database trigger must also reject ordinary TRUNCATE attempts against role history."
+    );
+
     const createLeague = async (sessionCookie, details) => {
       const created = await postJson("/api/leagues", sessionCookie, details);
       assert.equal(created.status, 201, await created.clone().text());
@@ -415,14 +577,121 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       assert.equal(created.status, 201, await created.clone().text());
       return (await created.json()).season;
     };
+    let signUpTestAddress = 10;
     const signUpPlayer = async (name) => {
+      const testAddress = `192.0.2.${signUpTestAddress++}`;
       const created = await fetchFromSite("/api/auth/sign-up/email", {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": testAddress },
         body: JSON.stringify({ name, email: `${name.toLowerCase().replace(/\s+/g, "-")}-${crypto.randomUUID()}@example.test`, password: "correct-horse-battery-staple" })
       });
       assert.equal(created.status, 200, await created.clone().text());
       return cookieFrom(created);
     };
+    roleResponse = await postJson(`/api/platform/roles/admins/${platformAdminUserId}`, platformAdminCookie, {
+      role: "super_admin"
+    });
+    assert.equal(roleResponse.status, 403, "A Platform Admin cannot grant a role to themselves or elevate the requested role.");
+    const secondPlatformAdminCookie = await signUpPlayer("Platform Role Second Admin");
+    const secondPlatformAdminUserResponse = await fetchFromSite("/api/me", { headers: { cookie: secondPlatformAdminCookie } });
+    const secondPlatformAdminUserId = (await secondPlatformAdminUserResponse.json()).user.id;
+    await platformRoles.grantPlatformAdmin(superAdminUserId, secondPlatformAdminUserId, "Second administrator permission test");
+    roleResponse = await postJson(`/api/platform/roles/admins/${secondPlatformAdminUserId}`, platformAdminCookie, {});
+    assert.equal(roleResponse.status, 403, "A Platform Admin cannot grant or change another Platform Admin assignment.");
+    roleResponse = await fetchFromSite(`/api/platform/roles/admins/${secondPlatformAdminUserId}`, {
+      method: "DELETE", headers: { cookie: platformAdminCookie }
+    });
+    assert.equal(roleResponse.status, 403, "A Platform Admin cannot revoke another Platform Admin assignment.");
+    const secondPlatformAdminCleanup = await platformRoles.revokePlatformAdmin(
+      superAdminUserId, secondPlatformAdminUserId, "Clean up second administrator permission test"
+    );
+    assert.equal(secondPlatformAdminCleanup.revoked, true);
+
+    const auditFailureCookie = await signUpPlayer("Platform Role Audit Failure");
+    const auditFailureUserResponse = await fetchFromSite("/api/me", { headers: { cookie: auditFailureCookie } });
+    const auditFailureUserId = (await auditFailureUserResponse.json()).user.id;
+    await database.query(`
+      CREATE FUNCTION breakdish_test_fail_platform_role_audit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.reason = 'force audit write failure' THEN
+          RAISE EXCEPTION 'test-only audit write failure' USING ERRCODE = 'P0001';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER breakdish_test_fail_platform_role_audit
+        BEFORE INSERT ON platform_role_events
+        FOR EACH ROW EXECUTE FUNCTION breakdish_test_fail_platform_role_audit();
+    `);
+    try {
+      await assert.rejects(
+        platformRoles.grantPlatformAdmin(superAdminUserId, auditFailureUserId, "force audit write failure"),
+        (error) => error.code === "P0001",
+        "A failed grant audit insert must abort the role assignment transaction."
+      );
+      let failedGrantState = await database.query("SELECT count(*)::integer AS count FROM platform_roles WHERE user_id=$1", [auditFailureUserId]);
+      assert.equal(failedGrantState.rows[0].count, 0);
+      let failedGrantHistory = await database.query("SELECT count(*)::integer AS count FROM platform_role_events WHERE target_user_id=$1", [auditFailureUserId]);
+      assert.equal(failedGrantHistory.rows[0].count, 0);
+
+      await platformRoles.grantPlatformAdmin(superAdminUserId, auditFailureUserId, "Grant for revoke rollback test");
+      await assert.rejects(
+        platformRoles.revokePlatformAdmin(superAdminUserId, auditFailureUserId, "force audit write failure"),
+        (error) => error.code === "P0001",
+        "A failed revoke audit insert must roll back the role removal."
+      );
+      failedGrantState = await database.query("SELECT role FROM platform_roles WHERE user_id=$1", [auditFailureUserId]);
+      assert.deepEqual(failedGrantState.rows, [{ role: "platform_admin" }]);
+      failedGrantHistory = await database.query("SELECT action FROM platform_role_events WHERE target_user_id=$1", [auditFailureUserId]);
+      assert.deepEqual(failedGrantHistory.rows, [{ action: "grant" }]);
+    } finally {
+      await database.query(`
+        DROP TRIGGER breakdish_test_fail_platform_role_audit ON platform_role_events;
+        DROP FUNCTION breakdish_test_fail_platform_role_audit();
+      `);
+    }
+    const auditFailureCleanup = await platformRoles.revokePlatformAdmin(
+      superAdminUserId, auditFailureUserId, "Clean up transaction integration test"
+    );
+    assert.equal(auditFailureCleanup.revoked, true);
+
+    const assertPlatformRoleMutationsDenied = async (sessionCookie, description) => {
+      const grant = await postJson(`/api/platform/roles/admins/${superAdminUserId}`, sessionCookie, { reason: "Unauthorized test" });
+      assert.equal(grant.status, 403, `${description} cannot grant a platform role.`);
+      const revoke = await fetchFromSite(`/api/platform/roles/admins/${superAdminUserId}`, {
+        method: "DELETE", headers: { cookie: sessionCookie, "content-type": "application/json" },
+        body: JSON.stringify({ reason: "Unauthorized test" })
+      });
+      assert.equal(revoke.status, 403, `${description} cannot revoke a platform role.`);
+    };
+    const ordinaryRoleCookie = await signUpPlayer("Platform Role Ordinary User");
+    response = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: ordinaryRoleCookie } });
+    assert.equal(response.status, 403, "An ordinary signed-in user cannot view platform role assignments.");
+    await assertPlatformRoleMutationsDenied(ordinaryRoleCookie, "An ordinary user");
+
+    const scopedOwnerCookie = await signUpPlayer("Platform Scope League Owner");
+    const scopedOwnerProfileResponse = await fetchFromSite("/api/me/profile", { headers: { cookie: scopedOwnerCookie } });
+    const scopedOwnerProfile = (await scopedOwnerProfileResponse.json()).profile;
+    const scopedAdminCookie = await signUpPlayer("Platform Scope League Administrator");
+    const scopedAdminProfileResponse = await fetchFromSite("/api/me/profile", { headers: { cookie: scopedAdminCookie } });
+    const scopedAdminProfile = (await scopedAdminProfileResponse.json()).profile;
+    const scopedLeague = await createLeague(scopedOwnerCookie, {
+      name: `Platform Scope League ${crypto.randomUUID()}`, joinPolicy: "open"
+    });
+    response = await postJson(`/api/leagues/${scopedLeague.league.id}/join`, scopedAdminCookie, {});
+    assert.ok([200, 201].includes(response.status));
+    response = await fetchFromSite(`/api/leagues/${scopedLeague.league.id}/members/${scopedAdminProfile.userId}/role`, {
+      method: "PATCH", headers: { cookie: scopedOwnerCookie, "content-type": "application/json" },
+      body: JSON.stringify({ role: "administrator" })
+    });
+    assert.equal(response.status, 200);
+    assert.notEqual(scopedOwnerProfile.userId, scopedAdminProfile.userId);
+    response = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: scopedOwnerCookie } });
+    assert.equal(response.status, 403, "League ownership alone does not grant platform role management.");
+    await assertPlatformRoleMutationsDenied(scopedOwnerCookie, "A League Owner without a platform role");
+    response = await fetchFromSite("/api/platform/roles/history", { headers: { cookie: scopedAdminCookie } });
+    assert.equal(response.status, 403, "League administrator status alone does not grant platform role history access.");
+    await assertPlatformRoleMutationsDenied(scopedAdminCookie, "A League Administrator without a platform role");
+
     const createDoublesEntry = async (leagueId, seasonId, userIds, status = "approved") => {
       const client = await database.connect();
       try {
@@ -589,6 +858,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await fetchFromSite("/api/me/managed-leagues", { headers: { cookie: thirdUserCookie } });
     assert.equal((await response.json()).leagues.some((league) => league.id === approval.league.id), false,
       "Team captaincy alone must not grant the league-wide Admin role.");
+    response = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 403, "Team captaincy alone does not grant platform role management.");
+    await assertPlatformRoleMutationsDenied(thirdUserCookie, "A Team Captain without a platform role");
     await assert.rejects(
       database.query("UPDATE team_memberships SET role = 'captain' WHERE team_id = $1 AND user_id = $2", [northTeam.id, secondProfile.userId]),
       (error) => error.code === "23505" && error.constraint === "team_memberships_single_active_captain",

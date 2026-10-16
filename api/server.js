@@ -9,6 +9,7 @@ import { createCompetitionStore } from "./competition-store.js";
 import { createMatchStore } from "./match-store.js";
 import { createEmailSender } from "./mailer.js";
 import { createProfileStore } from "./profile-store.js";
+import { createPlatformRoleStore, PlatformRoleError } from "./platform-role-store.js";
 import { validateSubmission } from "./validation.js";
 
 const configuredPort = Number(process.env.PORT);
@@ -27,6 +28,7 @@ let profileStorePromise;
 let leagueStorePromise;
 let competitionStorePromise;
 let matchStorePromise;
+let platformRoleStorePromise;
 
 async function getConfiguredAuth() {
   authModulePromise ??= import("./auth.js");
@@ -53,6 +55,11 @@ async function getConfiguredMatchStore() {
   return matchStorePromise;
 }
 
+async function getConfiguredPlatformRoleStore() {
+  platformRoleStorePromise ??= import("./auth.js").then(({ database }) => createPlatformRoleStore(database));
+  return platformRoleStorePromise;
+}
+
 function createConfiguredEmailSender() {
   const hasContactSettings = ["RESEND_API_KEY", "CONTACT_TO_EMAIL", "CONTACT_FROM_EMAIL"]
     .some((key) => typeof process.env[key] === "string" && process.env[key].trim());
@@ -65,7 +72,8 @@ function createApp({
   getProfileStore = getConfiguredProfileStore,
   getLeagueStore = getConfiguredLeagueStore,
   getCompetitionStore = getConfiguredCompetitionStore,
-  getMatchStore = getConfiguredMatchStore
+  getMatchStore = getConfiguredMatchStore,
+  getPlatformRoleStore = getConfiguredPlatformRoleStore
 } = {}) {
   const app = express();
 
@@ -158,6 +166,13 @@ function createApp({
     standardHeaders: "draft-8",
     legacyHeaders: false,
     handler: (_req, res) => res.status(429).json({ error: "Too many scoreboard changes. Please wait before trying again." })
+  });
+  const platformRoleMutationLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 30,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    handler: (_req, res) => res.status(429).json({ error: "Too many platform role changes. Please wait before trying again." })
   });
 
   app.get("/healthz", (_req, res) => res.json({ ok: true }));
@@ -641,6 +656,65 @@ function createApp({
     }
   });
 
+  const platformSession = async (req) => {
+    const auth = await getAuthInstance();
+    return auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+  };
+
+  app.get("/api/platform/roles/admins", async (req, res, next) => {
+    try {
+      const session = await platformSession(req);
+      if (!session) return res.status(401).json({ error: "Please sign in to continue." });
+      const admins = await (await getPlatformRoleStore()).listActivePlatformAdmins(session.user.id);
+      return res.json({ admins });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.get("/api/platform/roles/history", async (req, res, next) => {
+    try {
+      const session = await platformSession(req);
+      if (!session) return res.status(401).json({ error: "Please sign in to continue." });
+      const rawLimit = req.query.limit;
+      const limit = rawLimit === undefined ? 100 : Number(rawLimit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+        return res.status(400).json({ error: "History limit must be a whole number from 1 to 200." });
+      }
+      const events = await (await getPlatformRoleStore()).listRoleHistory(session.user.id, limit);
+      return res.json({ events });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/platform/roles/admins/:userId", platformRoleMutationLimiter, async (req, res, next) => {
+    try {
+      const session = await platformSession(req);
+      if (!session) return res.status(401).json({ error: "Please sign in to continue." });
+      if (!isValidAccountId(req.params.userId)) return res.status(400).json({ error: "Enter a valid account ID." });
+      const roleStore = await getPlatformRoleStore();
+      const result = await roleStore.grantPlatformAdmin(session.user.id, req.params.userId, req.body?.reason);
+      return res.status(result.repeated ? 200 : 201).json(result);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.delete("/api/platform/roles/admins/:userId", platformRoleMutationLimiter, async (req, res, next) => {
+    try {
+      const session = await platformSession(req);
+      if (!session) return res.status(401).json({ error: "Please sign in to continue." });
+      if (!isValidAccountId(req.params.userId)) return res.status(400).json({ error: "Enter a valid account ID." });
+      const result = await (await getPlatformRoleStore()).revokePlatformAdmin(
+        session.user.id, req.params.userId, req.body?.reason
+      );
+      return res.json(result);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   const matchStore = () => getMatchStore();
   const matchSession = async (req) => {
     const auth = await getAuthInstance();
@@ -1054,7 +1128,7 @@ function createApp({
   });
 
   app.use((error, _req, res, _next) => {
-    if (error instanceof LeagueStoreError) {
+    if (error instanceof LeagueStoreError || error instanceof PlatformRoleError) {
       return res.status(error.status).json({ error: error.message });
     }
     if (error.type === "entity.too.large") {
@@ -1075,8 +1149,8 @@ let app = createApp();
 
 async function start(options = {}) {
   emailSender = Object.hasOwn(options, "emailSender") ? options.emailSender : createConfiguredEmailSender();
-  const { getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore, getMatchStore } = options;
-  app = createApp({ getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore, getMatchStore });
+  const { getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore, getMatchStore, getPlatformRoleStore } = options;
+  app = createApp({ getAuthInstance, getProfileStore, getLeagueStore, getCompetitionStore, getMatchStore, getPlatformRoleStore });
   server = app.listen(port, "0.0.0.0", () => {
     console.log(`BREAK DISH API listening on port ${server.address().port}`);
   });
@@ -1103,6 +1177,7 @@ async function shutDown() {
   leagueStorePromise = undefined;
   competitionStorePromise = undefined;
   matchStorePromise = undefined;
+  platformRoleStorePromise = undefined;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
