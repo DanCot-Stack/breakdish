@@ -20,6 +20,17 @@ if (page) {
   let signedIn = false;
   let matchData;
   let filterLeagueId = null;
+  let serverOffsetMs = 0;
+  let matchPollTimer = null;
+  let matchClockTimer = null;
+  let matchRefreshInFlight = false;
+  let mutationPending = false;
+  let pendingFormChanges = false;
+  let lastRenderedSnapshot = "";
+  const startDialog = page.querySelector("[data-start-match-dialog]");
+  const startDialogMatchup = startDialog?.querySelector("[data-start-matchup]");
+  const startDialogStatus = startDialog?.querySelector("[data-start-match-status]");
+  const confirmStartButton = startDialog?.querySelector("[data-confirm-start]");
 
   function textElement(tag, className, text) {
     const element = document.createElement(tag);
@@ -39,6 +50,18 @@ if (page) {
     return Number.isNaN(parsed.valueOf()) ? "Date to be confirmed" : new Intl.DateTimeFormat("en-GB", {
       dateStyle: "medium", timeStyle: "short", timeZone: "Europe/London"
     }).format(parsed);
+  }
+
+  function formatElapsed(startedAt, completedAt = null) {
+    const start = Date.parse(startedAt || "");
+    if (!Number.isFinite(start)) return "Time unavailable";
+    const end = completedAt ? Date.parse(completedAt) : Date.now() + serverOffsetMs;
+    if (!Number.isFinite(end)) return "Time unavailable";
+    const elapsed = Math.max(0, Math.floor((end - start) / 1000));
+    const hours = Math.floor(elapsed / 3600);
+    const minutes = Math.floor((elapsed % 3600) / 60);
+    const seconds = elapsed % 60;
+    return [hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":");
   }
 
   async function request(path, options) {
@@ -114,6 +137,12 @@ if (page) {
       textElement("h2", "", matchLabel(match)),
       textElement("p", "match-list-meta", `${formatDate(match.scheduledAt)}${match.venue ? ` · ${match.venue}` : ""}`)
     );
+    if (match.status === "in_progress") identity.append(textElement("span", "live-indicator", "LIVE"));
+    if (match.startedAt) {
+      const timer = textElement("time", "live-match-timer match-scoreboard-timer");
+      timer.dataset.matchTimer = "";
+      identity.append(timer);
+    }
     const score = textElement("div", "match-score-summary");
     score.setAttribute("aria-label", `Score ${match.homeScore} to ${match.awayScore}`);
     score.append(
@@ -153,18 +182,33 @@ if (page) {
     return { wrapper, select };
   }
 
-  async function buildFrameCard(frame, match) {
-    const card = textElement("article", `score-frame-card${frame.status === "completed" ? " is-complete" : ""}`);
+  async function buildFrameCard(frame, match, isCurrent = false) {
+    const card = textElement("article", `score-frame-card${frame.status === "completed" ? " is-complete" : ""}${isCurrent ? " is-current" : ""}`);
     const heading = textElement("div", "score-frame-heading");
     heading.append(
       textElement("span", "score-frame-number", `FRAME ${frame.number}`),
       textElement("span", "match-category-tag", frame.type === "singles" ? "Singles" : "Doubles"),
       textElement("span", `match-state-tag is-${frame.status}`, frame.status.replaceAll("_", " "))
     );
+    if (isCurrent) heading.append(textElement("span", "match-state-tag is-in_progress", "Current frame"));
     card.append(heading);
     if (frame.status === "completed") {
       const winning = sideName(match, frame.winnerSide);
       card.append(textElement("p", "score-frame-result", `${winning} won${frame.outcome === "bye" ? " by Bye" : frame.outcome === "forfeit" ? " by forfeit" : ""}.`));
+    }
+    const selectedBySide = [1, 2].map((side) => {
+      const selected = (frame.players || []).filter((player) => Number(player.side) === side);
+      if (selected.some((player) => player.isBye)) return "Bye";
+      return selected.map((player) => player.name).filter(Boolean).join(" / ");
+    });
+    if (selectedBySide.some(Boolean)) {
+      card.append(textElement("p", "score-frame-current-players",
+        `${sideName(match, 1)}: ${selectedBySide[0] || "Players not selected"} · ${sideName(match, 2)}: ${selectedBySide[1] || "Players not selected"}`));
+    }
+    if (frame.event?.type) {
+      const eventLabel = frame.event.type === "counter_dish" ? "Counter Dish" : "Dish";
+      const eventPlayer = (frame.players || []).find((player) => player.userId === frame.event.userId)?.name;
+      card.append(textElement("p", "score-frame-event", `${eventLabel}${eventPlayer ? ` · ${eventPlayer}` : ""}`));
     }
     const grid = textElement("div", "score-frame-sides");
     const canEditResult = signedIn && match.status === "in_progress";
@@ -293,7 +337,8 @@ if (page) {
     detail.hidden = false;
     detail.replaceChildren();
     detail.append(buildCardHeader(match));
-    const state = textElement("p", `match-state-banner is-${match.status}`, `Match state: ${match.status.replaceAll("_", " ")}. ${match.framesCompleted} of ${match.framesTotal} frames complete.`);
+    const stateText = match.status === "in_progress" ? "LIVE · Match in progress." : `Match state: ${match.status.replaceAll("_", " ")}.`;
+    const state = textElement("p", `match-state-banner is-${match.status}`, `${stateText} ${match.framesCompleted} of ${match.framesTotal} frames complete.`);
     detail.append(state);
 
     if (!signedIn) {
@@ -302,16 +347,23 @@ if (page) {
       login.href = `login.html?next=${encodeURIComponent(`match.html?id=${match.id}`)}`;
       detail.append(access, login);
     } else if (match.status === "scheduled") {
-      const start = textElement("button", "button button-gold", "Start match");
+      const start = textElement("button", "button button-gold", "Start Match");
       start.type = "button";
-      start.addEventListener("click", () => mutate(async () => {
-        await request(`/api/matches/${encodeURIComponent(match.id)}/start`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      }, "Scoreboard started."));
+      start.addEventListener("click", () => {
+        if (!startDialog || !startDialogMatchup) return;
+        startDialogMatchup.textContent = matchLabel(match);
+        if (startDialogStatus) startDialogStatus.textContent = "";
+        startDialog.showModal();
+        confirmStartButton?.focus();
+      });
       detail.append(start);
     }
 
     const frames = textElement("div", "score-frame-list");
-    for (const frame of result.frames || []) frames.append(await buildFrameCard(frame, match));
+    const currentFrameNumber = match.status === "in_progress"
+      ? (result.frames || []).find((frame) => frame.status !== "completed")?.number
+      : null;
+    for (const frame of result.frames || []) frames.append(await buildFrameCard(frame, match, frame.number === currentFrameNumber));
     detail.append(frames);
 
     const confirmationSection = textElement("section", "match-confirmation-panel");
@@ -389,29 +441,121 @@ if (page) {
       });
       detail.append(audit);
     }
+    updateMatchTimer();
+    syncMatchPolling();
   }
 
-  async function loadMatch(matchId) {
-    setStatus("Loading match details…", "pending");
-    const result = await request(`/api/matches/${encodeURIComponent(matchId)}`);
+  function matchSnapshot(result) {
+    return JSON.stringify({ match: result.match, frames: result.frames, confirmations: result.confirmations, disputes: result.disputes });
+  }
+
+  function updateMatchTimer() {
+    const match = matchData?.match;
+    if (!match?.startedAt) return;
+    const value = formatElapsed(match.startedAt, match.completedAt);
+    detail.querySelectorAll("[data-match-timer]").forEach((timer) => {
+      timer.textContent = value;
+      timer.setAttribute("aria-label", `Elapsed match time ${value}`);
+    });
+  }
+
+  function syncMatchPolling() {
+    const match = matchData?.match;
+    const shouldPoll = ["in_progress", "awaiting_confirmation", "disputed"].includes(match?.status);
+    if (shouldPoll && !matchPollTimer) {
+      matchPollTimer = window.setInterval(refreshCurrentMatch, 4000);
+      matchClockTimer = window.setInterval(updateMatchTimer, 1000);
+    } else if (!shouldPoll) {
+      if (matchPollTimer) window.clearInterval(matchPollTimer);
+      if (matchClockTimer) window.clearInterval(matchClockTimer);
+      matchPollTimer = null;
+      matchClockTimer = null;
+    }
+  }
+
+  async function loadMatch(matchId, { quiet = false, onlyIfChanged = false } = {}) {
+    if (!quiet) setStatus("Loading match details…", "pending");
+    const requestStartedAt = Date.now();
+    const result = await request(`/api/matches/${encodeURIComponent(matchId)}`, { cache: "no-store" });
+    const requestFinishedAt = Date.now();
+    const serverTime = Date.parse(result.serverTime || "");
+    if (Number.isFinite(serverTime)) serverOffsetMs = serverTime - ((requestStartedAt + requestFinishedAt) / 2);
+    const snapshot = matchSnapshot(result);
+    if (onlyIfChanged && snapshot === lastRenderedSnapshot) {
+      matchData = result;
+      updateMatchTimer();
+      return;
+    }
     await renderMatch(result);
-    setStatus("Match details loaded.", "success");
+    lastRenderedSnapshot = snapshot;
+    if (!quiet) setStatus("Match details loaded.", "success");
+  }
+
+  async function refreshCurrentMatch() {
+    if (matchRefreshInFlight || mutationPending || document.visibilityState !== "visible" || !matchData?.match?.id) return;
+    const active = document.activeElement;
+    const scoringControlFocused = detail.contains(active) && active.matches("select, input, textarea, button");
+    if (scoringControlFocused || pendingFormChanges || detail.querySelector("details[open]")) return;
+    matchRefreshInFlight = true;
+    try {
+      await loadMatch(matchData.match.id, { quiet: true, onlyIfChanged: true });
+    } catch (error) {
+      setStatus(error instanceof TypeError ? "Live updates are temporarily unavailable. The displayed score may be out of date." : error.message, "error");
+    } finally {
+      matchRefreshInFlight = false;
+    }
   }
 
   async function mutate(action, successMessage) {
+    if (mutationPending) return false;
+    mutationPending = true;
     const buttons = detail.querySelectorAll("button");
     buttons.forEach((button) => { button.disabled = true; });
     setStatus("Saving scoreboard update…", "pending");
     try {
       await action();
-      if (successMessage) setStatus(successMessage, "success");
+      pendingFormChanges = false;
       const id = new URLSearchParams(window.location.search).get("id");
-      await loadMatch(id);
+      await loadMatch(id, { quiet: true });
+      if (successMessage) setStatus(successMessage, "success");
+      return true;
     } catch (error) {
       setStatus(error instanceof TypeError ? "We couldn't reach the match service. Your changes were not confirmed." : error.message, "error");
       buttons.forEach((button) => { button.disabled = false; });
+      return false;
+    } finally {
+      mutationPending = false;
     }
   }
+
+  detail.addEventListener("change", (event) => {
+    if (event.target.matches("select, input, textarea")) pendingFormChanges = true;
+  });
+  detail.addEventListener("input", (event) => {
+    if (event.target.matches("input, textarea")) pendingFormChanges = true;
+  });
+  confirmStartButton?.addEventListener("click", async () => {
+    if (!matchData?.match?.id || mutationPending) return;
+    confirmStartButton.disabled = true;
+    const started = await mutate(async () => {
+      await request(`/api/matches/${encodeURIComponent(matchData.match.id)}/start`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
+      });
+    }, "Match started.");
+    if (started) startDialog?.close();
+    else if (startDialogStatus) startDialogStatus.textContent = status.textContent;
+    confirmStartButton.disabled = false;
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      updateMatchTimer();
+      refreshCurrentMatch();
+    }
+  });
+  window.addEventListener("pagehide", () => {
+    if (matchPollTimer) window.clearInterval(matchPollTimer);
+    if (matchClockTimer) window.clearInterval(matchClockTimer);
+  }, { once: true });
 
   async function initialise() {
     await loadSession();

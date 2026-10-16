@@ -1104,6 +1104,8 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     const matchUnderTest = await createTeamMatch();
     const untouchedFutureMatch = await createTeamMatch();
+    response = await matchPostJson(`/api/matches/${untouchedFutureMatch.id}/start`, "", {});
+    assert.equal(response.status, 401, "Anonymous visitors cannot start a scheduled match.");
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
       homeTeamId: homeMatchTeam.id, awayTeamId: homeMatchTeam.id,
@@ -1221,6 +1223,25 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, thirdUserCookie, {});
     assert.equal(response.status, 200, "Any authenticated player can start an active scoreboard.");
+    const startedDetail = await response.json();
+    assert.ok(Number.isFinite(Date.parse(startedDetail.match.startedAt)), "The server stores the canonical match start timestamp.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, firstUserCookie, {});
+    assert.equal(response.status, 409, "A repeated Start Match request is safely rejected after the first transition.");
+    response = await fetchFromSite("/api/matches/live");
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.match(response.headers.get("cache-control"), /no-store/i);
+    let livePayload = await response.json();
+    assert.ok(Number.isFinite(Date.parse(livePayload.serverTime)), "The live feed supplies the server clock used by viewers.");
+    let liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
+    assert.ok(liveFixture, "Anonymous visitors can read public in-progress matches.");
+    assert.equal(liveFixture.status, "in_progress");
+    assert.equal(new Date(liveFixture.startedAt).toISOString(), new Date(startedDetail.match.startedAt).toISOString(),
+      "The live feed and detail page share the server-side started_at timestamp.");
+    assert.equal(liveFixture.homeTeam, homeMatchTeam.name);
+    assert.equal(liveFixture.awayTeam, awayMatchTeam.name);
+    assert.equal(liveFixture.currentFrame.number, 1);
+    assert.ok(!livePayload.matches.some((item) => item.id === untouchedFutureMatch.id), "Scheduled fixtures do not appear as live.");
+    assert.ok(livePayload.matches.every((item) => item.status === "in_progress"), "The Live Matches endpoint returns only in-progress status.");
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/format`, firstUserCookie, {
       name: "Too late", frames: [{ type: "singles" }]
     });
@@ -1250,7 +1271,17 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     };
     await setFrameSide(matchUnderTest.id, 1, 1, { players: [firstUserId] });
     await setFrameSide(matchUnderTest.id, 1, 2, { players: [thirdProfile.userId] });
+    response = await fetchFromSite("/api/matches/live");
+    livePayload = await response.json();
+    liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
+    assert.deepEqual(liveFixture.currentFrame.players.map((player) => player.name), [profile.displayName, thirdProfile.displayName],
+      "Live frame player selections are reflected from the server.");
     await recordFrame(matchUnderTest.id, 1, { outcome: "played", winnerSide: 1, dishEvent: "dish", dishPlayerId: firstUserId });
+    response = await fetchFromSite("/api/matches/live");
+    livePayload = await response.json();
+    liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
+    assert.deepEqual([liveFixture.homeScore, liveFixture.awayScore], [1, 0], "The live score comes from completed frame results.");
+    assert.equal(liveFixture.currentFrame.number, 2, "Completing a frame advances the live current-frame display.");
     await setFrameSide(matchUnderTest.id, 2, 1, { bye: true, players: [] });
     await setFrameSide(matchUnderTest.id, 2, 2, { players: [fourthProfile.userId] });
     await recordFrame(matchUnderTest.id, 2, { outcome: "bye" });
@@ -1264,6 +1295,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     await setFrameSide(matchUnderTest.id, 5, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
     matchDetail = await recordFrame(matchUnderTest.id, 5, { outcome: "played", winnerSide: 2 });
     assert.equal(matchDetail.match.status, "awaiting_confirmation", "Completing all snapshot frames moves the match to confirmation, not directly to final.");
+    response = await fetchFromSite("/api/matches/live");
+    assert.ok(!(await response.json()).matches.some((item) => item.id === matchUnderTest.id),
+      "A match leaves the Live Matches feed as soon as it moves to awaiting confirmation.");
     assert.equal(matchDetail.match.homeScore, 2);
     assert.equal(matchDetail.match.awayScore, 3);
     assert.equal(matchDetail.match.framesRemaining, 0);
@@ -1282,6 +1316,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200, "Both distinct sides' confirmations allow finalization.");
     matchDetail = await response.json();
     assert.equal(matchDetail.match.status, "completed");
+    response = await fetchFromSite("/api/matches/live");
+    assert.ok(!(await response.json()).matches.some((item) => item.id === matchUnderTest.id),
+      "Completed matches do not remain in the Live Matches feed.");
     const finalizedAudit = await fetchFromSite(`/api/matches/${matchUnderTest.id}/audit`, { headers: { cookie: firstUserCookie } });
     assert.equal(finalizedAudit.status, 200);
     const auditActions = (await finalizedAudit.json()).events.map((event) => event.action_type);
@@ -1441,6 +1478,13 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const playingDoublesMatch = (await response.json()).match;
     response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/start`, firstUserCookie, {});
     assert.equal(response.status, 200);
+    response = await fetchFromSite("/api/matches/live");
+    livePayload = await response.json();
+    const liveDoublesMatch = livePayload.matches.find((item) => item.id === playingDoublesMatch.id);
+    assert.ok(liveDoublesMatch);
+    assert.equal(liveDoublesMatch.homeSideName, "Fifth Player / Second Player Updated");
+    assert.equal(liveDoublesMatch.awaySideName, "Fourth Player / Third Player",
+      "Live Doubles sides show approved pair names instead of fabricated team names.");
     response = await matchPatchJson(`/api/matches/${playingDoublesMatch.id}/schedule`, firstUserCookie, {
       scheduledAt: new Date(Date.now() + 90 * 86400000).toISOString(), venue: "Too late"
     });
@@ -1499,6 +1543,13 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200);
     await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/players`, firstUserCookie, { side: 2, players: [secondProfile.userId] }).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await fetchFromSite("/api/matches/live");
+    livePayload = await response.json();
+    const liveSinglesMatch = livePayload.matches.find((item) => item.id === singlesMatch.id);
+    assert.equal(liveSinglesMatch.homeSideName, profile.displayName);
+    assert.equal(liveSinglesMatch.awaySideName, "Second Player Updated",
+      "Live Singles fixtures identify the individual players, not team labels.");
+    assert.deepEqual(liveSinglesMatch.currentFrame.players.map((player) => player.name), [profile.displayName, "Second Player Updated"]);
     response = await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1 });
     assert.equal(response.status, 200, await response.clone().text());
     response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes`, secondUserCookie, { reason: "Local integration dispute test" });

@@ -501,7 +501,12 @@ function toMatch(row) {
     winnerSide: row.winner_side === null ? null : Number(row.winner_side),
     createdAt: row.created_at,
     startedAt: row.started_at,
-    completedAt: row.completed_at
+    completedAt: row.completed_at,
+    currentFrame: row.current_frame ? {
+      ...row.current_frame,
+      number: Number(row.current_frame.number),
+      players: Array.isArray(row.current_frame.players) ? row.current_frame.players : []
+    } : null
   };
 }
 
@@ -611,7 +616,7 @@ function validateFrames(frames) {
 
 export function createMatchStore(database) {
   return {
-    async listMatches(filters = {}, viewerId = null) {
+    async listMatches(filters = {}, viewerId = null, options = {}) {
       return withTransaction(database, null, async (client) => {
         const values = [];
         const clauses = [];
@@ -641,8 +646,44 @@ export function createMatchStore(database) {
           if (!MATCH_STATUSES.has(filters.status)) invalid("Choose a supported match status.");
           values.push(filters.status); clauses.push(`sb.status = $${values.length}`);
         }
+        const currentFrameSelect = options.includeCurrentFrame
+          ? "current_frame.current_frame"
+          : "NULL::jsonb AS current_frame";
+        const currentFrameJoin = options.includeCurrentFrame ? `
+           LEFT JOIN LATERAL (
+             SELECT jsonb_build_object(
+               'number', f.frame_number,
+               'type', sf.frame_type,
+               'status', f.status,
+               'outcome', f.outcome_type,
+               'winnerSide', f.winner_side,
+               'players', coalesce((
+                 SELECT jsonb_agg(jsonb_build_object(
+                   'side', fp.side, 'slot', fp.slot_number, 'userId', fp.user_id,
+                   'name', coalesce(pp.display_name, u.name), 'isBye', fp.is_bye
+                 ) ORDER BY fp.side, fp.slot_number)
+                 FROM match_frame_players fp
+                 LEFT JOIN "user" u ON u.id = fp.user_id
+                 LEFT JOIN player_profiles pp ON pp.user_id = fp.user_id
+                 WHERE fp.match_id = f.match_id AND fp.frame_number = f.frame_number
+               ), '[]'::jsonb),
+               'event', (
+                 SELECT jsonb_build_object('type', e.event_type, 'userId', e.user_id)
+                 FROM match_frame_events e
+                 WHERE e.match_id = f.match_id AND e.frame_number = f.frame_number
+                 ORDER BY e.recorded_at DESC, e.id DESC LIMIT 1
+               )
+             ) AS current_frame
+             FROM match_frames f
+             JOIN match_format_snapshots s ON s.match_id = f.match_id AND s.id = f.snapshot_id
+             JOIN match_format_snapshot_frames sf ON sf.snapshot_id = s.id AND sf.frame_number = f.frame_number
+             WHERE f.match_id = sb.match_id AND f.status <> 'completed'
+             ORDER BY f.frame_number LIMIT 1
+           ) current_frame ON true` : "";
+        const limitClause = options.unlimited === true ? "" : "LIMIT 100";
         const result = await client.query(
-          `SELECT sb.*, m.round_number AS round_number, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
+          `SELECT sb.*, m.round_number AS round_number, ${currentFrameSelect},
+             l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
              at.name AS away_team_name, te.name AS tournament_name,
              hp.display_names AS home_side_name, ap.display_names AS away_side_name
            FROM match_scoreboard sb
@@ -668,8 +709,9 @@ export function createMatchStore(database) {
              LEFT JOIN player_profiles pp ON pp.user_id = mp.user_id
              WHERE mp.match_id = sb.match_id AND mp.side = 2
            ) ap ON true
+           ${currentFrameJoin}
            ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-           ORDER BY sb.scheduled_at NULLS LAST, sb.created_at DESC LIMIT 100`,
+           ORDER BY sb.scheduled_at NULLS LAST, sb.created_at DESC ${limitClause}`,
           values
         );
         return result.rows.map(toMatch);

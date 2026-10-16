@@ -19,8 +19,12 @@ test("match API keeps public reads available and requires an authenticated user 
   const { createApp } = await import("./server.js");
   const calls = [];
   const match = { id: "123e4567-e89b-42d3-a456-426614174000", type: "team_league", status: "scheduled" };
+  const liveMatch = { ...match, status: "in_progress", startedAt: "2026-10-16T10:00:00.000Z", currentFrame: { number: 1 } };
   const store = {
-    async listMatches(filters, viewerId) { calls.push(["list", filters, viewerId]); return [match]; },
+    async listMatches(filters, viewerId, options) {
+      calls.push(["list", filters, viewerId, options]);
+      return filters.status === "in_progress" ? [liveMatch] : [match];
+    },
     async createMatch(actorId, details) { calls.push(["create", actorId, details]); return { match }; },
     async getMatch(id, viewerId) { calls.push(["get", id, viewerId]); return { match, frames: [], confirmations: [], disputes: [] }; },
     async startMatch(id, actorId) { calls.push(["start", id, actorId]); return { match }; }
@@ -40,7 +44,24 @@ test("match API keeps public reads available and requires an authenticated user 
     let response = await request("/api/matches?type=team_league");
     assert.equal(response.status, 200);
     assert.deepEqual((await response.json()).matches, [match]);
-    assert.deepEqual(calls[0], ["list", { type: "team_league" }, null]);
+    assert.deepEqual(calls[0], ["list", { type: "team_league" }, null, undefined]);
+
+    response = await request("/api/matches/live");
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("cache-control"), /no-store/i);
+    const livePayload = await response.json();
+    assert.deepEqual(livePayload.matches, [liveMatch]);
+    assert.ok(Number.isFinite(Date.parse(livePayload.serverTime)), "Live responses include a server clock for consistent elapsed timers.");
+    assert.deepEqual(calls.at(-1), ["list", { status: "in_progress" }, null, { includeCurrentFrame: true, unlimited: true }]);
+
+    response = await request("/api/matches/live", { headers: { "x-test-session": "player-1" } });
+    assert.equal(response.status, 200);
+    assert.equal(calls.at(-1)[2], "player-1", "Authenticated live listing preserves the existing private-match visibility rules.");
+
+    response = await request(`/api/matches/${match.id}`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("cache-control"), /no-store/i);
+    assert.ok(Number.isFinite(Date.parse((await response.json()).serverTime)));
 
     response = await request("/api/matches", {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "practice" })

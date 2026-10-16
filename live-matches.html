@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#100e11">
+  <meta name="description" content="Follow BREAK DISH matches currently being played." />
+  <meta name="breakdish-api-url" content="https://api.break-dish.com">
+  <title>Live Matches | BREAK DISH</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
+  <script src="live-matches.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header legal-header">
+    <a class="brand" href="index.html#home" aria-label="Break Dish Pool League home"><img class="brand-emblem" src="assets/break-dish-pool-league-emblem.png" alt="Break Dish Pool League"><span class="brand-tagline">Home of Pool</span></a>
+    <div class="header-controls">
+      <div class="header-account-actions" role="group" aria-label="Account access"><a class="header-login" href="login.html">Log In</a><a class="header-signup" href="signup.html">Sign Up</a></div>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="primary-nav" aria-label="Open navigation"><span></span><span></span><span></span></button>
+    </div>
+    <nav id="primary-nav" class="primary-nav" aria-label="Main navigation">
+      <a href="index.html#home">Home</a><a href="admin.html" data-nav-admin hidden>Admin</a>
+      <details class="nav-dropdown" data-nav-dropdown><summary aria-expanded="false">My Leagues <span aria-hidden="true">▾</span></summary><div class="nav-dropdown-menu"><a href="my-leagues.html">My Leagues</a><a href="create-league.html">Create League</a><a href="join-league.html">Join League</a><a href="index.html#tables">League Tables</a></div></details>
+      <details class="nav-dropdown" data-nav-dropdown><summary aria-expanded="false">Match Centre <span aria-hidden="true">▾</span></summary><div class="nav-dropdown-menu"><a href="match.html">Match Centre</a><a href="live-matches.html" aria-current="page">Live Matches</a></div></details>
+      <a href="join-league.html#league-directory">Leagues</a><a href="index.html#fixtures">Fixtures</a><a href="index.html#results">Results</a><a href="index.html#players">Teams &amp; Players</a><a href="index.html#news">News</a>
+      <div class="nav-account-section" data-nav-account-section hidden><a href="account.html" data-nav-mobile-account>My Account</a></div>
+    </nav>
+  </header>
+  <main id="main" class="guide-main match-main live-matches-main" data-live-matches-page>
+    <section class="guide-hero match-hero">
+      <div class="section-kicker">BREAK DISH / PLAYING NOW</div>
+      <h1>LIVE<br><em>MATCHES.</em></h1>
+      <p>Follow matches currently in progress. Scores, frame details and match timers update automatically while this page is open.</p>
+      <div class="hero-actions"><a class="button button-quiet" href="match.html">Open Match Centre <span aria-hidden="true">↗</span></a></div>
+    </section>
+    <section class="match-centre-content" aria-labelledby="live-matches-heading">
+      <div class="section-heading">
+        <div><div class="section-kicker">LIVE / UPDATED AUTOMATICALLY</div><h2 id="live-matches-heading">ON THE TABLE.<br><span>RIGHT NOW.</span></h2></div>
+        <p>Only matches with an active playing status appear here. Matches awaiting confirmation leave the live list.</p>
+      </div>
+      <p class="form-status" data-live-status role="status" aria-live="polite" aria-atomic="true" tabindex="-1">Loading live matches…</p>
+      <div class="live-match-list" data-live-match-list></div>
+    </section>
+  </main>
+  <footer class="site-footer"><div class="footer-main"><a class="brand footer-brand" href="index.html#home" aria-label="Break Dish Pool League home"><img class="brand-emblem" src="assets/break-dish-pool-league-emblem.png" alt="Break Dish Pool League"><span class="brand-tagline">Home of Pool</span></a><p>One game. A thousand stories.<br>Welcome to Break Dish.</p><div class="footer-links"><a href="index.html#home">Home</a><a href="match.html">Match Centre</a><a href="live-matches.html">Live Matches</a><a href="join-league.html#league-directory">Leagues</a><a href="index.html#contact">Contact Us</a><a href="privacy.html">Privacy</a><a href="terms.html">Terms</a></div></div></footer>
+</body>
+</html>

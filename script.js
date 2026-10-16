@@ -34,6 +34,41 @@ if (menuButton && nav) {
   });
 }
 
+if (nav) {
+  nav.querySelectorAll("details[data-nav-dropdown]").forEach((dropdown) => {
+    const summary = dropdown.querySelector("summary");
+    const syncExpanded = () => summary?.setAttribute("aria-expanded", String(dropdown.open));
+    syncExpanded();
+    dropdown.addEventListener("toggle", syncExpanded);
+    dropdown.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && dropdown.open) {
+        dropdown.open = false;
+        summary?.focus();
+      } else if (event.key === "ArrowDown" && dropdown.open) {
+        const firstLink = dropdown.querySelector(".nav-dropdown-menu a");
+        if (firstLink) {
+          event.preventDefault();
+          firstLink.focus();
+        }
+      }
+    });
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    nav.querySelectorAll("details[data-nav-dropdown][open]").forEach((dropdown) => {
+      if (!dropdown.contains(event.target)) dropdown.open = false;
+    });
+  });
+
+  nav.addEventListener("click", (event) => {
+    if (!event.target.closest("a")) return;
+    nav.querySelectorAll("details[data-nav-dropdown][open]").forEach((dropdown) => { dropdown.open = false; });
+    nav.classList.remove("is-open");
+    menuButton?.setAttribute("aria-expanded", "false");
+    menuButton?.setAttribute("aria-label", "Open navigation");
+  });
+}
+
 const year = document.querySelector("#year");
 if (year) year.textContent = new Date().getFullYear();
 
@@ -136,56 +171,24 @@ function setStatus(status, message, state) {
   status.textContent = message;
 }
 
-function ensureSessionNavLink(navigation, selector, href, label, dataAttribute) {
-  let link = navigation.querySelector(selector);
-  if (!link) {
-    link = createTextElement("a", "", label);
-    link.href = href;
-    link.dataset[dataAttribute] = "";
-  }
-  link.textContent = label;
-  if (window.location.pathname.endsWith(`/${href}`)) link.setAttribute("aria-current", "page");
-  else link.removeAttribute("aria-current");
-  return link;
-}
-
-function placeSessionNavLinks(navigation, adminAvailable) {
-  const home = navigation.querySelector('a[href="index.html#home"], a[href="#home"]');
-  const myLeagues = ensureSessionNavLink(navigation, "[data-nav-my-leagues]", "my-leagues.html", "My Leagues", "navMyLeagues");
-  if (home) home.after(myLeagues);
-
-  let admin = navigation.querySelector("[data-nav-admin]");
-  if (adminAvailable) {
-    admin = ensureSessionNavLink(navigation, "[data-nav-admin]", "admin.html", "Admin", "navAdmin");
-    myLeagues.after(admin);
-  } else {
-    admin?.remove();
-    admin = null;
-  }
-
-  let matchCentre = navigation.querySelector('a[href="match.html"]');
-  if (!matchCentre) {
-    matchCentre = ensureSessionNavLink(navigation, "[data-nav-match-centre]", "match.html", "Match Centre", "navMatchCentre");
-  }
-  (admin || myLeagues).after(matchCentre);
-
-  const createLeague = navigation.querySelector('a[href="create-league.html"]');
-  if (createLeague) matchCentre.after(createLeague);
-}
-
 async function updateAccountNavigation() {
   const accountActions = document.querySelector(".header-account-actions");
   const navigation = document.querySelector("#primary-nav");
   if (!accountActions || !navigation) return;
-  const pageHasLogoutAction = Boolean(document.querySelector("[data-logout]"));
   const loginLink = accountActions.querySelector('a[href="login.html"]');
   const signupLink = accountActions.querySelector('a[href="signup.html"]');
+  const adminLink = navigation.querySelector("[data-nav-admin]");
+  const mobileAccountSection = navigation.querySelector("[data-nav-account-section]");
+  const mobileAccountLink = navigation.querySelector("[data-nav-mobile-account]");
 
   try {
     const { response } = await apiRequest("/api/me");
     const signedIn = response.ok;
     if (loginLink) loginLink.hidden = signedIn;
     if (signupLink) signupLink.hidden = signedIn;
+    if (mobileAccountSection) mobileAccountSection.hidden = !signedIn;
+    if (mobileAccountLink && window.location.pathname.endsWith("/account.html")) mobileAccountLink.setAttribute("aria-current", "page");
+    else mobileAccountLink?.removeAttribute("aria-current");
 
     if (signedIn) {
       let adminAvailable = false;
@@ -195,16 +198,12 @@ async function updateAccountNavigation() {
       } catch {
         adminAvailable = false;
       }
-      placeSessionNavLinks(navigation, adminAvailable);
-    } else {
-      navigation.querySelector("[data-nav-my-leagues]")?.remove();
-      navigation.querySelector("[data-nav-admin]")?.remove();
-      navigation.querySelector("[data-nav-match-centre]")?.remove();
+      if (adminLink) adminLink.hidden = !adminAvailable;
+    } else if (adminLink) {
+      adminLink.hidden = true;
     }
 
     let accountLink = accountActions.querySelector("[data-nav-account]");
-    let logoutButton = navigation.querySelector("[data-nav-logout]");
-    let logoutStatus = navigation.querySelector("[data-nav-auth-status]");
     if (signedIn && !accountLink) {
       accountLink = createTextElement("a", "header-login", "My Account");
       accountLink.href = "account.html";
@@ -212,45 +211,7 @@ async function updateAccountNavigation() {
       if (window.location.pathname.endsWith("/account.html")) accountLink.setAttribute("aria-current", "page");
       accountActions.insertBefore(accountLink, loginLink || accountActions.firstChild);
     }
-    if (signedIn && !logoutButton && !pageHasLogoutAction) {
-      logoutButton = createTextElement("button", "nav-logout", "Log out");
-      logoutButton.type = "button";
-      logoutButton.dataset.navLogout = "";
-      navigation.append(logoutButton);
-
-      logoutStatus = createTextElement("span", "nav-auth-status");
-      logoutStatus.dataset.navAuthStatus = "";
-      logoutStatus.setAttribute("role", "status");
-      logoutStatus.setAttribute("aria-live", "polite");
-      logoutStatus.setAttribute("aria-atomic", "true");
-      logoutStatus.hidden = true;
-      navigation.append(logoutStatus);
-
-      logoutButton.addEventListener("click", async () => {
-        logoutButton.disabled = true;
-        logoutStatus.hidden = false;
-        setStatus(logoutStatus, "Signing out…", "pending");
-        try {
-          const { response } = await apiRequest("/api/auth/sign-out", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: "{}"
-          });
-          if (!response.ok) throw new Error("We couldn't sign you out. Please try again.");
-          window.location.assign("login.html?signed-out=1");
-        } catch (error) {
-          logoutButton.disabled = false;
-          setStatus(logoutStatus, error instanceof TypeError
-            ? "We couldn't reach the account service. Please try again."
-            : error.message, "error");
-        }
-      });
-    }
     if (accountLink) accountLink.hidden = !signedIn;
-    if (!signedIn) {
-      logoutButton?.remove();
-      logoutStatus?.remove();
-    }
   } catch {
     // Leave the standard sign-in links available when the API cannot be reached.
   }

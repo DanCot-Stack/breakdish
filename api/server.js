@@ -665,6 +665,20 @@ function createApp({
     }
   });
 
+  app.get("/api/matches/live", async (req, res, next) => {
+    try {
+      const session = await matchSession(req);
+      const matches = await (await matchStore()).listMatches(
+        { status: "in_progress" }, session?.user.id || null,
+        { includeCurrentFrame: true, unlimited: true }
+      );
+      res.set("Cache-Control", "no-store, max-age=0");
+      return res.json({ matches, serverTime: new Date().toISOString() });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.post("/api/matches", matchMutationLimiter, async (req, res, next) => {
     try {
       const session = await matchSession(req);
@@ -844,7 +858,8 @@ function createApp({
       const session = await matchSession(req);
       const result = await (await matchStore()).getMatch(req.params.matchId, session?.user.id || null);
       if (!result) return res.status(404).json({ error: "This match could not be found." });
-      return res.json(result);
+      res.set("Cache-Control", "no-store, max-age=0");
+      return res.json({ ...result, serverTime: new Date().toISOString() });
     } catch (error) {
       return next(error);
     }
