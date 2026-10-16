@@ -253,6 +253,18 @@ function createApp({
     }
   });
 
+  app.get("/api/me/managed-leagues", async (req, res, next) => {
+    try {
+      const auth = await getAuthInstance();
+      const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+      if (!session) return res.status(401).json({ error: "Please sign in to view leagues you manage." });
+      const leagues = await (await getLeagueStore()).listManaged(session.user.id);
+      return res.json({ leagues });
+    } catch (error) {
+      return next(error);
+    }
+  });
+
   app.get("/api/leagues/:leagueId", async (req, res, next) => {
     try {
       if (!isUuid(req.params.leagueId)) return res.status(400).json({ error: "Enter a valid league ID." });

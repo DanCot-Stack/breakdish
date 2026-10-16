@@ -254,6 +254,16 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       role: "owner", status: "active", created_by: firstUserId, join_policy: "approval"
     }, "The database trigger must assign the authenticated creator as active owner.");
 
+    response = await fetchFromSite("/api/me/leagues", { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).leagues.some((league) => league.id === approval.league.id), false,
+      "Automatic owner membership alone must not make a league appear in My Leagues as player participation.");
+    response = await fetchFromSite("/api/me/managed-leagues", { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200);
+    const ownerManagedLeagues = (await response.json()).leagues;
+    assert.equal(ownerManagedLeagues.find((league) => league.id === approval.league.id)?.viewerMembership.role, "owner",
+      "League creators must appear in Admin with the distinct Owner role.");
+
     const publicDirectoryResponse = await fetchFromSite("/api/leagues", { headers: { cookie: secondUserCookie } });
     assert.equal(publicDirectoryResponse.status, 200);
     const publicLeagues = (await publicDirectoryResponse.json()).leagues;
@@ -278,6 +288,15 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(openMemberCount.rows[0].count, 1, "The unique league/user constraint must prevent duplicate memberships.");
     response = await postJson(`/api/leagues/${open.league.id}/join`, secondUserCookie, {});
     assert.equal(response.status, 200, "Repeated joins must be idempotent.");
+    response = await fetchFromSite("/api/me/leagues", { headers: { cookie: secondUserCookie } });
+    assert.ok((await response.json()).leagues.some((league) => league.id === open.league.id),
+      "An ordinary active league member must see the league in My Leagues.");
+    response = await fetchFromSite("/api/me/managed-leagues", { headers: { cookie: secondUserCookie } });
+    assert.equal((await response.json()).leagues.some((league) => league.id === open.league.id), false,
+      "An ordinary member must not receive Admin access to their league.");
+    response = await fetchFromSite(`/api/me/managed-leagues?userId=${encodeURIComponent(firstUserId)}`, { headers: { cookie: secondUserCookie } });
+    assert.equal((await response.json()).leagues.some((league) => league.id === approval.league.id), false,
+      "The Admin endpoint must ignore attempts to request another account's managed leagues.");
 
     response = await postJson(`/api/leagues/${approval.league.id}/join`, secondUserCookie, {});
     assert.equal(response.status, 201);
@@ -315,6 +334,15 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       body: JSON.stringify({ role: "administrator" })
     });
     assert.equal(response.status, 200, "Only the owner may assign an administrator.");
+    response = await fetchFromSite("/api/me/managed-leagues", { headers: { cookie: secondUserCookie } });
+    const secondManagedLeagues = (await response.json()).leagues;
+    assert.equal(secondManagedLeagues.find((league) => league.id === approval.league.id)?.viewerMembership.role, "administrator",
+      "An administrator must receive Admin access for the league they administer.");
+    assert.equal(secondManagedLeagues.some((league) => league.id === open.league.id), false,
+      "The Admin Control Centre must exclude leagues the administrator does not manage.");
+    response = await fetchFromSite("/api/me/leagues", { headers: { cookie: secondUserCookie } });
+    assert.equal((await response.json()).leagues.some((league) => league.id === approval.league.id), false,
+      "An administrator who has not separately joined or played must not be described as a player.");
     response = await fetchFromSite(`/api/leagues/${approval.league.id}/members/${firstUserId}/role`, {
       method: "PATCH", headers: { cookie: firstUserCookie, "content-type": "application/json" },
       body: JSON.stringify({ role: "member" })
@@ -521,6 +549,13 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(rosterResponses.filter((item) => item.repeated).length, 1);
     response = await postJson(`/api/teams/${northTeam.id}/members`, firstUserCookie, { userId: secondProfile.userId });
     assert.equal(response.status, 201);
+    response = await fetchFromSite("/api/me/leagues", { headers: { cookie: secondUserCookie } });
+    const overlappingMembership = (await response.json()).leagues.find((league) => league.id === approval.league.id);
+    assert.equal(overlappingMembership?.viewerMembership.role, "administrator");
+    assert.equal(overlappingMembership?.viewerIsPlayer, true,
+      "An administrator with an active team registration must appear in both My Leagues and Admin.");
+    response = await fetchFromSite("/api/me/managed-leagues", { headers: { cookie: secondUserCookie } });
+    assert.equal((await response.json()).leagues.find((league) => league.id === approval.league.id)?.viewerMembership.role, "administrator");
     response = await postJson(`/api/teams/${northTeam.id}/members`, thirdUserCookie, { userId: fourthProfile.userId });
     assert.equal(response.status, 403, "A player cannot edit a roster unless they are its captain or a league manager.");
     response = await postJson(`/api/teams/${northTeam.id}/members`, firstUserCookie, { userId: fifthProfile.userId });
@@ -551,6 +586,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       body: JSON.stringify({ userId: thirdProfile.userId })
     });
     assert.equal(response.status, 200);
+    response = await fetchFromSite("/api/me/managed-leagues", { headers: { cookie: thirdUserCookie } });
+    assert.equal((await response.json()).leagues.some((league) => league.id === approval.league.id), false,
+      "Team captaincy alone must not grant the league-wide Admin role.");
     await assert.rejects(
       database.query("UPDATE team_memberships SET role = 'captain' WHERE team_id = $1 AND user_id = $2", [northTeam.id, secondProfile.userId]),
       (error) => error.code === "23505" && error.constraint === "team_memberships_single_active_captain",

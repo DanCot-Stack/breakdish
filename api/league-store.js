@@ -17,6 +17,11 @@ function toLeague(row) {
     joinPolicy: row.join_policy,
     memberCount: row.member_count === undefined ? undefined : Number(row.member_count),
     viewerMembership: row.viewer_role ? { role: row.viewer_role, status: row.viewer_status } : null,
+    viewerIsPlayer: row.viewer_is_player === undefined ? undefined : row.viewer_is_player === true,
+    currentSeason: row.current_season_name ? {
+      name: row.current_season_name,
+      status: row.current_season_status
+    } : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -99,6 +104,40 @@ const PUBLIC_LEAGUE_SELECT = `
   LEFT JOIN league_memberships viewer ON viewer.league_id = l.id AND viewer.user_id = $1
 `;
 
+const PLAYER_PARTICIPATION = `(
+  EXISTS (
+    SELECT 1 FROM team_registrations tr
+    JOIN seasons registered_season ON registered_season.id = tr.season_id
+    JOIN teams registered_team ON registered_team.id = tr.team_id
+    WHERE tr.league_id = l.id AND tr.user_id = $1 AND tr.ended_at IS NULL
+      AND registered_season.status <> 'completed' AND registered_team.status = 'active'
+  ) OR EXISTS (
+    SELECT 1 FROM competition_entries ce
+    JOIN competition_entry_participants cep ON cep.entry_id = ce.id
+    JOIN seasons entry_season ON entry_season.id = ce.season_id
+    WHERE ce.league_id = l.id AND cep.user_id = $1 AND ce.status = 'approved'
+      AND ce.entry_type IN ('singles_league', 'doubles_league')
+      AND entry_season.status <> 'completed'
+  ) OR EXISTS (
+    SELECT 1 FROM match_participants mp
+    JOIN matches player_match ON player_match.id = mp.match_id
+    JOIN seasons player_season ON player_season.id = player_match.season_id
+    WHERE player_match.league_id = l.id AND mp.user_id = $1
+      AND player_match.match_type IN ('team_league', 'singles_league', 'doubles_league')
+      AND player_match.status <> 'cancelled'
+      AND player_season.status <> 'completed'
+  )
+)`;
+
+const CURRENT_SEASON_JOIN = `
+  LEFT JOIN LATERAL (
+    SELECT s.name, s.status FROM seasons s WHERE s.league_id = l.id
+    ORDER BY CASE s.status WHEN 'active' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END,
+      s.created_at DESC
+    LIMIT 1
+  ) current_season ON true
+`;
+
 export function createLeagueStore(database) {
   return {
     async create(userId, details) {
@@ -156,9 +195,28 @@ export function createLeagueStore(database) {
     async listMine(userId) {
       const result = await database.query(
         `SELECT l.id, l.name, l.slug, l.description, l.location, l.status, l.join_policy,
-          l.created_at, l.updated_at, m.role AS viewer_role, m.status AS viewer_status
+          l.created_at, l.updated_at, m.role AS viewer_role, m.status AS viewer_status,
+          ${PLAYER_PARTICIPATION} AS viewer_is_player,
+          current_season.name AS current_season_name, current_season.status AS current_season_status
          FROM league_memberships m JOIN leagues l ON l.id = m.league_id
+         ${CURRENT_SEASON_JOIN}
          WHERE m.user_id = $1 AND m.status = 'active'
+           AND (m.role = 'member' OR ${PLAYER_PARTICIPATION})
+         ORDER BY l.name ASC, l.created_at ASC`,
+        [userId]
+      );
+      return result.rows.map(toLeague);
+    },
+
+    async listManaged(userId) {
+      const result = await database.query(
+        `SELECT l.id, l.name, l.slug, l.description, l.location, l.status, l.join_policy,
+          l.created_at, l.updated_at, m.role AS viewer_role, m.status AS viewer_status,
+          current_season.name AS current_season_name, current_season.status AS current_season_status
+         FROM league_memberships m JOIN leagues l ON l.id = m.league_id
+         ${CURRENT_SEASON_JOIN}
+         WHERE m.user_id = $1 AND m.status = 'active'
+           AND m.role IN ('owner', 'administrator')
          ORDER BY l.name ASC, l.created_at ASC`,
         [userId]
       );

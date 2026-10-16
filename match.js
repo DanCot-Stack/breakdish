@@ -19,6 +19,7 @@ if (page) {
   };
   let signedIn = false;
   let matchData;
+  let filterLeagueId = null;
 
   function textElement(tag, className, text) {
     const element = document.createElement(tag);
@@ -72,7 +73,9 @@ if (page) {
   function renderMatchList(matches) {
     list.replaceChildren();
     if (!matches.length) {
-      setStatus("No public matches are listed yet. Match schedules will appear here when organisers publish them.", "success");
+      setStatus(filterLeagueId
+        ? "No fixtures or results have been published for this league yet."
+        : "No public matches are listed yet. Match schedules will appear here when organisers publish them.", "success");
       return;
     }
     for (const match of matches) {
@@ -412,15 +415,29 @@ if (page) {
 
   async function initialise() {
     await loadSession();
-    const matchId = new URLSearchParams(window.location.search).get("id");
+    const search = new URLSearchParams(window.location.search);
+    const matchId = search.get("id");
+    filterLeagueId = search.get("leagueId");
     if (matchId) {
       try { await loadMatch(matchId); }
       catch (error) { setStatus(error.message, "error"); }
       return;
     }
-    setStatus("Loading public matches…", "pending");
+    if (filterLeagueId) {
+      title.innerHTML = "LEAGUE<br><em>MATCHES.</em>";
+      sectionTitle.innerHTML = "FIXTURES<br><span>&amp; RESULTS.</span>";
+      sectionKicker.textContent = "LEAGUE MATCHES";
+      intro.textContent = "Fixtures and recorded results for this league will appear here when organisers publish them.";
+      const competitionLink = page.querySelector("[data-match-league-link]");
+      if (competitionLink) competitionLink.href = `competition.html?id=${encodeURIComponent(filterLeagueId)}`;
+    }
+    setStatus(filterLeagueId ? "Loading this league's matches…" : "Loading public matches…", "pending");
     try {
-      const payload = await request("/api/matches");
+      const endpoint = filterLeagueId ? `/api/matches?leagueId=${encodeURIComponent(filterLeagueId)}` : "/api/matches";
+      const payload = await request(endpoint);
+      if (filterLeagueId && payload.matches?.[0]?.leagueName) {
+        intro.textContent = `${payload.matches[0].leagueName}: fixtures and recorded results published by league organisers.`;
+      }
       renderMatchList(payload.matches || []);
     } catch (error) {
       setStatus(error instanceof TypeError ? "We couldn't reach the match service. Please try again later." : error.message, "error");

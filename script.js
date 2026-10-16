@@ -25,12 +25,12 @@ if (menuButton && nav) {
     menuButton.setAttribute("aria-label", "Open navigation");
   });
 
-  nav.querySelectorAll("a").forEach((link) => {
-    link.addEventListener("click", () => {
+  nav.addEventListener("click", (event) => {
+    if (event.target.closest("a")) {
       nav.classList.remove("is-open");
       menuButton.setAttribute("aria-expanded", "false");
       menuButton.setAttribute("aria-label", "Open navigation");
-    });
+    }
   });
 }
 
@@ -122,7 +122,7 @@ function getSafeNextPage(candidate) {
   try {
     const destination = new URL(candidate, window.location.href);
     const page = destination.pathname.split("/").pop();
-    const allowedPages = new Set(["account.html", "join-league.html", "create-league.html", "competition.html"]);
+    const allowedPages = new Set(["account.html", "join-league.html", "create-league.html", "competition.html", "my-leagues.html", "admin.html"]);
     if (destination.origin !== window.location.origin || !allowedPages.has(page)) return fallback;
     return `${page}${destination.search}${destination.hash}`;
   } catch {
@@ -134,6 +134,43 @@ function setStatus(status, message, state) {
   if (!status) return;
   status.dataset.state = state;
   status.textContent = message;
+}
+
+function ensureSessionNavLink(navigation, selector, href, label, dataAttribute) {
+  let link = navigation.querySelector(selector);
+  if (!link) {
+    link = createTextElement("a", "", label);
+    link.href = href;
+    link.dataset[dataAttribute] = "";
+  }
+  link.textContent = label;
+  if (window.location.pathname.endsWith(`/${href}`)) link.setAttribute("aria-current", "page");
+  else link.removeAttribute("aria-current");
+  return link;
+}
+
+function placeSessionNavLinks(navigation, adminAvailable) {
+  const home = navigation.querySelector('a[href="index.html#home"], a[href="#home"]');
+  const myLeagues = ensureSessionNavLink(navigation, "[data-nav-my-leagues]", "my-leagues.html", "My Leagues", "navMyLeagues");
+  if (home) home.after(myLeagues);
+
+  let admin = navigation.querySelector("[data-nav-admin]");
+  if (adminAvailable) {
+    admin = ensureSessionNavLink(navigation, "[data-nav-admin]", "admin.html", "Admin", "navAdmin");
+    myLeagues.after(admin);
+  } else {
+    admin?.remove();
+    admin = null;
+  }
+
+  let matchCentre = navigation.querySelector('a[href="match.html"]');
+  if (!matchCentre) {
+    matchCentre = ensureSessionNavLink(navigation, "[data-nav-match-centre]", "match.html", "Match Centre", "navMatchCentre");
+  }
+  (admin || myLeagues).after(matchCentre);
+
+  const createLeague = navigation.querySelector('a[href="create-league.html"]');
+  if (createLeague) matchCentre.after(createLeague);
 }
 
 async function updateAccountNavigation() {
@@ -149,6 +186,21 @@ async function updateAccountNavigation() {
     const signedIn = response.ok;
     if (loginLink) loginLink.hidden = signedIn;
     if (signupLink) signupLink.hidden = signedIn;
+
+    if (signedIn) {
+      let adminAvailable = false;
+      try {
+        const managedResult = await apiRequest("/api/me/managed-leagues");
+        adminAvailable = managedResult.response.ok && Array.isArray(managedResult.payload.leagues) && managedResult.payload.leagues.length > 0;
+      } catch {
+        adminAvailable = false;
+      }
+      placeSessionNavLinks(navigation, adminAvailable);
+    } else {
+      navigation.querySelector("[data-nav-my-leagues]")?.remove();
+      navigation.querySelector("[data-nav-admin]")?.remove();
+      navigation.querySelector("[data-nav-match-centre]")?.remove();
+    }
 
     let accountLink = accountActions.querySelector("[data-nav-account]");
     let logoutButton = navigation.querySelector("[data-nav-logout]");
@@ -610,31 +662,41 @@ async function loadLeagueManagement() {
   setStatus(status, "Loading your leagues…", "pending");
   list.replaceChildren();
   try {
-    const { response, payload } = await apiRequest("/api/me/leagues");
+    const { response, payload } = await apiRequest("/api/me/managed-leagues");
     if (response.status === 401) {
       appendLoginLink(status, "Sign in to see and manage your leagues.", "create-league.html");
       status.dataset.state = "error";
       return;
     }
     if (!response.ok) throw new Error(payload.error || "We couldn't load your leagues.");
-    const leagues = payload.leagues || [];
-    if (!leagues.length) {
-      setStatus(status, "You do not have an active league membership yet. Create a league or browse the public directory.", "success");
+    const managedLeagues = payload.leagues || [];
+    const requestedLeagueId = new URLSearchParams(window.location.search).get("manage");
+    if (requestedLeagueId && !managedLeagues.some((league) => league.id === requestedLeagueId)) {
+      setStatus(status, "You do not have owner or administrator access to that league.", "error");
       return;
     }
-    setStatus(status, `${leagues.length} league ${leagues.length === 1 ? "membership" : "memberships"} found.`, "success");
+    const leagues = requestedLeagueId
+      ? managedLeagues.filter((league) => league.id === requestedLeagueId)
+      : managedLeagues;
+    if (!leagues.length) {
+      setStatus(status, "You do not manage any active leagues yet. Create a league or ask an owner to grant administrator access.", "success");
+      return;
+    }
+    setStatus(status, `${leagues.length} managed ${leagues.length === 1 ? "league" : "leagues"} found.`, "success");
 
     for (const league of leagues) {
       const card = createTextElement("article", "managed-league-card");
       const header = createTextElement("div", "managed-league-header");
       const titleBlock = document.createElement("div");
-      titleBlock.append(createTextElement("h3", "", league.name), createTextElement("p", "", `${league.location || "Location not provided"} · ${league.viewerMembership?.role || "member"}`));
+      const role = league.viewerMembership?.role;
+      const roleLabel = role === "owner" ? "Owner" : "Administrator";
+      titleBlock.append(createTextElement("h3", "", league.name), createTextElement("p", "", `${league.location || "Location not provided"} · ${roleLabel}`));
       header.append(titleBlock, createTextElement("span", "demo-tag", league.joinPolicy === "open" ? "OPEN JOINING" : "APPROVAL REQUIRED"));
       card.append(header);
-      const competitionLink = createTextElement("a", "text-link", "Manage seasons, divisions & teams ↗");
+      const competitionLink = createTextElement("a", "text-link", "Manage seasons, divisions, teams & fixtures ↗");
       competitionLink.href = `competition.html?id=${encodeURIComponent(league.id)}`;
       card.append(competitionLink);
-      if (["owner", "administrator"].includes(league.viewerMembership?.role)) {
+      if (["owner", "administrator"].includes(role)) {
         const [requestResult, memberResult] = await Promise.all([
           apiRequest(`/api/leagues/${encodeURIComponent(league.id)}/requests`),
           apiRequest(`/api/leagues/${encodeURIComponent(league.id)}/members`)
@@ -678,7 +740,7 @@ async function loadLeagueManagement() {
           (memberResult.payload.members || []).forEach((member) => {
             const row = createTextElement("div", "management-row member-management-row");
             row.append(createTextElement("span", "", `${member.displayName || "Player"} · ${member.role}`));
-            if (league.viewerMembership?.role === "owner" && member.role !== "owner") {
+            if (role === "owner" && member.role !== "owner") {
               const roleSelect = document.createElement("select");
               roleSelect.setAttribute("aria-label", `Role for ${member.displayName || "player"}`);
               [["member", "Member"], ["administrator", "Administrator"]].forEach(([value, label]) => {
@@ -721,6 +783,113 @@ async function loadLeagueManagement() {
 }
 
 if (leagueManagement) loadLeagueManagement();
+
+function createLeagueContextCard(league, context) {
+  const card = createTextElement("article", "league-context-card");
+  const top = createTextElement("div", "league-context-card-top");
+  top.append(
+    createTextElement("h3", "", league.name),
+    createTextElement("p", "", league.location || "Location not provided")
+  );
+  card.append(top);
+
+  const roles = createTextElement("div", "league-context-role");
+  if (context === "member") {
+    if (league.viewerIsPlayer) roles.append(createTextElement("span", "", "Player"));
+    const role = league.viewerMembership?.role;
+    const roleLabel = role === "owner" ? "Owner" : role === "administrator" ? "Administrator" : "Member";
+    roles.append(createTextElement("span", "", roleLabel));
+  } else {
+    const roleLabel = league.viewerMembership?.role === "owner" ? "Owner" : "Administrator";
+    roles.append(createTextElement("span", "", roleLabel));
+  }
+  card.append(roles);
+
+  const seasonMessage = league.currentSeason
+    ? `${league.currentSeason.name} · ${league.currentSeason.status.charAt(0).toUpperCase()}${league.currentSeason.status.slice(1)}`
+    : "No season has been set up yet.";
+  card.append(createTextElement("p", "league-context-status", seasonMessage));
+  return card;
+}
+
+function addLeagueContextAction(container, label, href, style = "button button-quiet") {
+  const link = createTextElement("a", style, label);
+  link.href = href;
+  container.append(link);
+  return link;
+}
+
+const myLeaguesPage = document.querySelector("[data-my-leagues-page]");
+if (myLeaguesPage) {
+  const status = myLeaguesPage.querySelector("[data-my-leagues-status]");
+  const list = myLeaguesPage.querySelector("[data-my-leagues-list]");
+  (async () => {
+    setStatus(status, "Loading leagues you participate in…", "pending");
+    try {
+      const { response, payload } = await apiRequest("/api/me/leagues");
+      if (response.status === 401) {
+        appendLoginLink(status, "Sign in to view My Leagues.", "my-leagues.html");
+        status.dataset.state = "error";
+        return;
+      }
+      if (!response.ok) throw new Error(payload.error || "We couldn't load your leagues.");
+      const leagues = Array.isArray(payload.leagues) ? payload.leagues : [];
+      list.replaceChildren();
+      if (!leagues.length) {
+        setStatus(status, "No active league memberships or player entries are linked to this account yet. Browse public leagues to get started.", "success");
+        return;
+      }
+      for (const league of leagues) {
+        const card = createLeagueContextCard(league, "member");
+        const actions = createTextElement("div", "league-context-actions");
+        addLeagueContextAction(actions, "League details & fixtures", `competition.html?id=${encodeURIComponent(league.id)}`, "button button-gold");
+        addLeagueContextAction(actions, "Fixtures & results", `match.html?leagueId=${encodeURIComponent(league.id)}`);
+        card.append(actions);
+        list.append(card);
+      }
+      setStatus(status, `${leagues.length} participating ${leagues.length === 1 ? "league" : "leagues"}.`, "success");
+    } catch (error) {
+      setStatus(status, error instanceof TypeError ? "We couldn't reach the league service. Try again later." : error.message, "error");
+    }
+  })();
+}
+
+const adminPage = document.querySelector("[data-admin-page]");
+if (adminPage) {
+  const status = adminPage.querySelector("[data-admin-status]");
+  const list = adminPage.querySelector("[data-admin-league-list]");
+  (async () => {
+    setStatus(status, "Loading leagues you manage…", "pending");
+    try {
+      const { response, payload } = await apiRequest("/api/me/managed-leagues");
+      if (response.status === 401) {
+        appendLoginLink(status, "Sign in to open the Admin Control Centre.", "admin.html");
+        status.dataset.state = "error";
+        return;
+      }
+      if (!response.ok) throw new Error(payload.error || "We couldn't load the Admin Control Centre.");
+      const leagues = Array.isArray(payload.leagues) ? payload.leagues : [];
+      list.replaceChildren();
+      if (!leagues.length) {
+        setStatus(status, "No active owner or administrator access is linked to this account. Team captaincy alone does not grant league-wide Admin access.", "success");
+        return;
+      }
+      for (const league of leagues) {
+        const card = createLeagueContextCard(league, "admin");
+        const actions = createTextElement("div", "league-context-actions league-context-admin-actions");
+        const role = league.viewerMembership?.role;
+        const memberLabel = role === "owner" ? "Manage members & admin roles" : "Review members & join requests";
+        addLeagueContextAction(actions, memberLabel, `create-league.html?manage=${encodeURIComponent(league.id)}#league-management`, "button button-quiet");
+        addLeagueContextAction(actions, "Manage seasons, divisions, teams & fixtures", `competition.html?id=${encodeURIComponent(league.id)}`, "button button-gold");
+        card.append(actions);
+        list.append(card);
+      }
+      setStatus(status, `${leagues.length} managed ${leagues.length === 1 ? "league" : "leagues"}.`, "success");
+    } catch (error) {
+      setStatus(status, error instanceof TypeError ? "We couldn't reach the league service. Try again later." : error.message, "error");
+    }
+  })();
+}
 
 const competitionPage = document.querySelector("[data-competition-page]");
 if (competitionPage) {

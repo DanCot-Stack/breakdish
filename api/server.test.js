@@ -184,7 +184,16 @@ test("contact API emails accepted submissions and safely handles failures, abuse
       return { id: leagueId, name: "Test League" };
     },
     async listMine(userId) {
-      return [{ id: leagueId, userId }];
+      leagueCalls.push(["listMine", userId]);
+      if (userId === "ordinary-member") return [{ id: leagueId, viewerMembership: { role: "member", status: "active" }, viewerIsPlayer: false }];
+      if (userId === "participating-admin") return [{ id: leagueId, viewerMembership: { role: "administrator", status: "active" }, viewerIsPlayer: true }];
+      return [];
+    },
+    async listManaged(userId) {
+      leagueCalls.push(["listManaged", userId]);
+      if (userId === "league-owner") return [{ id: leagueId, viewerMembership: { role: "owner", status: "active" } }];
+      if (userId === "league-admin" || userId === "participating-admin") return [{ id: leagueId, viewerMembership: { role: "administrator", status: "active" } }];
+      return [];
     },
     async create(userId, details) {
       leagueCalls.push(["create", userId, details]);
@@ -337,6 +346,42 @@ test("contact API emails accepted submissions and safely handles failures, abuse
 
     response = await fetch(`${endpoint}/api/me/leagues`, { headers: { origin: "http://localhost:5500" } });
     assert.equal(response.status, 200);
+    const sessionBeforeLeagueViews = fakeAuthSession;
+    fakeAuthSession = null;
+    response = await fetch(`${endpoint}/api/me/leagues`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal(response.status, 401, "My Leagues must require a server-validated session.");
+    response = await fetch(`${endpoint}/api/me/managed-leagues`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal(response.status, 401, "The Admin Control Centre API must require a server-validated session.");
+
+    fakeAuthSession = { user: { id: "ordinary-member" }, session: {} };
+    response = await fetch(`${endpoint}/api/me/leagues`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).leagues[0].viewerMembership.role, "member");
+    response = await fetch(`${endpoint}/api/me/managed-leagues?userId=league-owner`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).leagues, [], "An ordinary member must not receive another user's managed leagues.");
+    assert.deepEqual(leagueCalls.at(-1), ["listManaged", "ordinary-member"], "The API derives identity from the authenticated session, not the request query.");
+
+    fakeAuthSession = { user: { id: "league-admin" }, session: {} };
+    response = await fetch(`${endpoint}/api/me/managed-leagues`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).leagues[0].viewerMembership.role, "administrator");
+
+    fakeAuthSession = { user: { id: "league-owner" }, session: {} };
+    response = await fetch(`${endpoint}/api/me/managed-leagues`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).leagues[0].viewerMembership.role, "owner", "The owner role must remain visibly distinct from Administrator.");
+
+    fakeAuthSession = { user: { id: "participating-admin" }, session: {} };
+    response = await fetch(`${endpoint}/api/me/leagues`, { headers: { origin: "http://localhost:5500" } });
+    const overlapMembership = (await response.json()).leagues[0];
+    assert.equal(overlapMembership.viewerIsPlayer, true);
+    assert.equal(overlapMembership.viewerMembership.role, "administrator");
+    response = await fetch(`${endpoint}/api/me/managed-leagues`, { headers: { origin: "http://localhost:5500" } });
+    assert.equal((await response.json()).leagues[0].viewerMembership.role, "administrator",
+      "A participating administrator can appear in both user contexts.");
+    fakeAuthSession = sessionBeforeLeagueViews;
+
     response = await fetch(`${endpoint}/api/leagues/${leagueId}/requests`, { headers: { origin: "http://localhost:5500" } });
     assert.equal(response.status, 403, "A member must not view private join requests.");
     response = await fetch(`${endpoint}/api/leagues/${leagueId}/requests/other-user`, {
