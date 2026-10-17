@@ -15,6 +15,7 @@
     "db:up": "node migrate.js up",
     "db:down": "node migrate.js down",
     "platform:bootstrap-super-admin": "node bootstrap-super-admin.js",
+    "platform:assign-backup-super-admin": "node assign-backup-super-admin.js",
     "test:integration": "node --test server.integration.test.js"
   },
   "engines": {

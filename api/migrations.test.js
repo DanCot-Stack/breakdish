@@ -10,6 +10,7 @@ import * as matchClassificationMigration from "./migrations/007_match_categories
 import * as doublesLeagueSidesMigration from "./migrations/008_doubles_league_match_sides.js";
 import * as fixtureRoundNumbersMigration from "./migrations/009_fixture_round_numbers.js";
 import * as platformRolesMigration from "./migrations/010_platform_roles.js";
+import * as backupSuperAdminMigration from "./migrations/011_backup_super_admin.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -265,4 +266,47 @@ test("migration 010 separates current platform roles from append-only role histo
   }));
   const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
   assert.match(downSql, /Cannot roll back migration 010 while platform role assignments or history exist/);
+});
+
+test("migration 011 preserves the founder and enforces one auditable recovery Super Admin slot", () => {
+  const upCalls = [];
+  backupSuperAdminMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+  assert.ok(upCalls.some(({ operation, args }) => operation === "addColumn" &&
+    args[0] === "platform_roles" && args[1].assignment_type));
+  assert.ok(upCalls.some(({ operation, args }) => operation === "addColumn" &&
+    args[0] === "platform_role_events" && args[1].assignment_type));
+  const allowedAssignmentType = upCalls.find(({ operation, args }) => operation === "addConstraint" &&
+    args[0] === "platform_roles" && args[1] === "platform_roles_assignment_type_allowed");
+  assert.match(allowedAssignmentType.args[2].check,
+    /assignment_type IS NOT NULL AND assignment_type IN \('founder', 'recovery'\)/,
+    "A Super Admin cannot use a NULL assignment slot that would evade PostgreSQL's unique index semantics.");
+  assert.ok(upCalls.some(({ operation, args }) => operation === "sql" &&
+    args[0].includes("UPDATE platform_roles SET assignment_type = 'founder'")),
+  "The existing active Super Admin is migrated in place as founder.");
+  const indexes = upCalls.filter(({ operation }) => operation === "createIndex");
+  assert.ok(indexes.some(({ args }) => args[0] === "platform_roles" &&
+    args[1].join(",") === "role,assignment_type" && args[2].unique &&
+    args[2].where === "role = 'super_admin'"));
+  const sql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(sql, /pg_advisory_xact_lock\(1363351362, 10\)/);
+  assert.match(sql, /active_count <> 1 OR founder_count <> 1/);
+  assert.match(sql, /NEW\.granted_by IS DISTINCT FROM founder_user_id/);
+  assert.match(sql, /NEW\.assignment_type IS NULL OR NEW\.assignment_type NOT IN/,
+    "The database trigger rejects unclassified Super Admin assignments before counting slots.");
+  assert.match(sql, /platform_roles_super_admin_guard/);
+  assert.match(sql, /platform_role_events_super_admin_guard/);
+  assert.match(sql, /A Super Admin audit event must match an active assignment/);
+  assert.match(sql, /DEFERRABLE INITIALLY DEFERRED/);
+  assert.match(sql, /A Super Admin assignment requires its matching audit event/);
+  assert.match(sql, /Super Admin removal requires a separately reviewed recovery procedure/);
+
+  const downCalls = [];
+  backupSuperAdminMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back migration 011 after a recovery Super Admin assignment has been recorded/);
+  assert.match(downSql, /CREATE UNIQUE INDEX platform_roles_single_super_admin/);
 });

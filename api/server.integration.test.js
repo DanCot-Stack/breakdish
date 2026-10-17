@@ -1,9 +1,22 @@
 import "dotenv/config";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
+import { runner } from "node-pg-migrate";
 import { createPlatformRoleStore, PlatformRoleError } from "./platform-role-store.js";
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL?.trim();
+
+async function runLatestApplicationMigration(direction) {
+  await runner({
+    databaseUrl: testDatabaseUrl,
+    direction,
+    count: 1,
+    dir: fileURLToPath(new URL("./migrations", import.meta.url)),
+    migrationsTable: "breakdish_app_migrations",
+    createSchema: false
+  });
+}
 
 test("Better Auth, league management and the Match Engine use PostgreSQL", {
   skip: testDatabaseUrl ? false : "Set TEST_DATABASE_URL to a disposable local PostgreSQL database ending in _test."
@@ -43,6 +56,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
   const cookieFrom = (response) => setCookiesFrom(response)
     .map((cookie) => cookie.split(";", 1)[0])
     .join("; ");
+  let roleTestSignupOrdinal = 0;
 
   try {
     const initialPlatformRoles = await database.query("SELECT count(*)::integer AS count FROM platform_roles");
@@ -212,6 +226,23 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       body: JSON.stringify(body)
     });
 
+    const createRegisteredPlayer = async (name) => {
+      const playerEmail = `role-test-${crypto.randomUUID()}@example.test`;
+      const signup = await fetchFromSite("/api/auth/sign-up/email", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-forwarded-for": `198.51.100.${++roleTestSignupOrdinal}`
+        },
+        body: JSON.stringify({ name, email: playerEmail, password: "correct-horse-battery-staple" })
+      });
+      assert.equal(signup.status, 200, await signup.clone().text());
+      const playerCookie = cookieFrom(signup);
+      const playerProfileResponse = await fetchFromSite("/api/me/profile", { headers: { cookie: playerCookie } });
+      assert.equal(playerProfileResponse.status, 200);
+      return { userId: (await playerProfileResponse.json()).profile.userId, cookie: playerCookie };
+    };
+
     await assert.rejects(
       platformRoles.bootstrapSuperAdmin("missing-bootstrap-account"),
       (error) => error instanceof PlatformRoleError && error.status === 404,
@@ -232,6 +263,36 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const superAdminCookie = successfulBootstrapIndex === 0 ? firstUserCookie : secondUserCookie;
     const platformAdminUserId = successfulBootstrapIndex === 0 ? secondProfile.userId : firstUserId;
     const platformAdminCookie = successfulBootstrapIndex === 0 ? secondUserCookie : firstUserCookie;
+
+    const founderAssignmentBeforeUpgrade = await database.query(
+      "SELECT user_id, assignment_type FROM platform_roles WHERE role = 'super_admin'"
+    );
+    assert.deepEqual(founderAssignmentBeforeUpgrade.rows, [{ user_id: superAdminUserId, assignment_type: "founder" }]);
+    await runLatestApplicationMigration("down");
+    const founderAfterLegacySchema = await database.query("SELECT user_id FROM platform_roles WHERE role = 'super_admin'");
+    assert.deepEqual(founderAfterLegacySchema.rows, [{ user_id: superAdminUserId }],
+      "Rolling back 011 before any recovery grant keeps the original migration-010 founder assignment.");
+    const founderEventAfterLegacySchema = await database.query(
+      "SELECT action, actor_user_id FROM platform_role_events WHERE role = 'super_admin'"
+    );
+    assert.deepEqual(founderEventAfterLegacySchema.rows, [{ action: "bootstrap", actor_user_id: null }],
+      "The migration-010 bootstrap audit event remains untouched across the upgrade path.");
+    await runLatestApplicationMigration("up");
+    const founderAfterUpgrade = await database.query(
+      "SELECT user_id, assignment_type FROM platform_roles WHERE role = 'super_admin'"
+    );
+    assert.deepEqual(founderAfterUpgrade.rows, [{ user_id: superAdminUserId, assignment_type: "founder" }],
+      "Applying 011 after a founder exists preserves and classifies that assignment in place.");
+
+    const recoveryCandidate = await createRegisteredPlayer("Recovery Candidate");
+    const concurrentCandidate = await createRegisteredPlayer("Concurrent Candidate");
+    const thirdCandidate = await createRegisteredPlayer("Third Candidate");
+
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(platformAdminUserId, recoveryCandidate.userId, "Unauthorised ordinary account"),
+      (error) => error instanceof PlatformRoleError && error.status === 403,
+      "An ordinary account cannot assign the recovery Super Admin role."
+    );
     assert.equal(await platformRoles.isSuperAdmin(superAdminUserId), true);
     assert.equal(await platformRoles.isPlatformAdmin(superAdminUserId), true,
       "Super Admin must satisfy the broader platform administrator permission.");
@@ -244,13 +305,6 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       "Bootstrap must write an auditable event without misrepresenting a user as its own actor.");
     const activeSuperAdmins = await database.query("SELECT count(*)::integer AS count FROM platform_roles WHERE role='super_admin'");
     assert.equal(activeSuperAdmins.rows[0].count, 1);
-    await assert.rejects(
-      database.query("INSERT INTO platform_roles(user_id, role, granted_by) VALUES($1, 'super_admin', NULL)", [
-        successfulBootstrapIndex === 0 ? secondProfile.userId : firstUserId
-      ]),
-      (error) => error.code === "23505" && error.constraint === "platform_roles_single_super_admin",
-      "The database unique index must reject a second active Super Admin even if application locking is bypassed."
-    );
     await assert.rejects(
       platformRoles.bootstrapSuperAdmin(platformAdminUserId),
       (error) => error instanceof PlatformRoleError && error.status === 409,
@@ -281,6 +335,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       (error) => error instanceof PlatformRoleError && error.status === 403
     );
     await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(platformAdminUserId, recoveryCandidate.userId, "Unauthorised platform administrator"),
+      (error) => error instanceof PlatformRoleError && error.status === 403,
+      "Platform Admin cannot assign a recovery Super Admin."
+    );
+    await assert.rejects(
       platformRoles.grantPlatformAdmin(superAdminUserId, "missing-platform-account"),
       (error) => error instanceof PlatformRoleError && error.status === 404,
       "Grant must reject an unknown Better Auth account."
@@ -289,6 +348,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       platformRoles.revokePlatformAdmin(superAdminUserId, "missing-platform-account"),
       (error) => error instanceof PlatformRoleError && error.status === 404,
       "Revoke must reject an unknown Better Auth account."
+    );
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(superAdminUserId, platformAdminUserId, "Local verification"),
+      (error) => error instanceof PlatformRoleError && error.status === 409,
+      "Recovery assignment rejects a target who already holds a different platform role."
     );
 
     roleResponse = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: superAdminCookie } });
@@ -341,6 +405,194 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     });
     assert.equal(roleResponse.status, 200, "Repeated revocation is idempotent.");
     assert.equal((await roleResponse.json()).revoked, false);
+
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(superAdminUserId, "missing-recovery-account", "Local verification"),
+      (error) => error instanceof PlatformRoleError && error.status === 404,
+      "Recovery assignment rejects a target ID that does not identify an existing Better Auth account."
+    );
+    const ownerLeagueResponse = await postJson("/api/leagues", recoveryCandidate.cookie, {
+      name: `Role protection ${crypto.randomUUID()}`,
+      location: "Local integration test"
+    });
+    assert.equal(ownerLeagueResponse.status, 201, await ownerLeagueResponse.clone().text());
+    const ownerLeague = await ownerLeagueResponse.json();
+    const ownerMembership = await database.query(
+      "SELECT role, status FROM league_memberships WHERE league_id=$1 AND user_id=$2",
+      [ownerLeague.league.id, recoveryCandidate.userId]
+    );
+    assert.deepEqual(ownerMembership.rows, [{ role: "owner", status: "active" }],
+      "The unauthorized actor is a real league owner in the integration database.");
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(recoveryCandidate.userId, concurrentCandidate.userId, "Unauthorised league owner"),
+      (error) => error instanceof PlatformRoleError && error.status === 403,
+      "League ownership does not grant permission to assign a recovery Super Admin."
+    );
+
+    await assert.rejects(
+      database.query(
+        `INSERT INTO platform_role_events(target_user_id, role, action, assignment_type, actor_user_id)
+         VALUES($1, 'super_admin', 'recovery_grant', 'recovery', $2)`,
+        [recoveryCandidate.userId, superAdminUserId]
+      ),
+      (error) => error.code === "23514" && error.constraint === "platform_role_events_super_admin_assignment_required",
+      "A Super Admin audit event cannot be fabricated without its active role assignment."
+    );
+    await assert.rejects(
+      database.query(
+        `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+         VALUES($1, 'super_admin', 'recovery', $2)`,
+        [recoveryCandidate.userId, superAdminUserId]
+      ),
+      (error) => error.code === "23514" && error.constraint === "platform_roles_super_admin_audit_required",
+      "A direct database assignment cannot commit without its matching append-only audit event."
+    );
+    const countAfterUnauditedInsert = await database.query(
+      "SELECT count(*)::integer AS count FROM platform_roles WHERE role='super_admin'"
+    );
+    assert.equal(countAfterUnauditedInsert.rows[0].count, 1);
+
+    await database.query(`
+      CREATE FUNCTION breakdish_test_fail_recovery_audit() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.role = 'super_admin' AND NEW.action = 'recovery_grant' THEN
+          RAISE EXCEPTION 'forced recovery audit failure' USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER breakdish_test_fail_recovery_audit
+        BEFORE INSERT ON platform_role_events
+        FOR EACH ROW EXECUTE FUNCTION breakdish_test_fail_recovery_audit();
+    `);
+    try {
+      await assert.rejects(
+        platformRoles.assignRecoverySuperAdmin(superAdminUserId, recoveryCandidate.userId, "Force audit rollback"),
+        (error) => error.code === "23514",
+        "A failed audit insert must reject the recovery assignment transaction."
+      );
+      const recoveryRollbackState = await database.query(
+        `SELECT
+          (SELECT count(*)::integer FROM platform_roles WHERE role='super_admin') AS active_count,
+          (SELECT count(*)::integer FROM platform_role_events WHERE role='super_admin' AND action='recovery_grant') AS recovery_events`
+      );
+      assert.deepEqual(recoveryRollbackState.rows, [{ active_count: 1, recovery_events: 0 }],
+        "A failed audit write leaves both role state and audit history unchanged.");
+    } finally {
+      await database.query(`
+        DROP TRIGGER breakdish_test_fail_recovery_audit ON platform_role_events;
+        DROP FUNCTION breakdish_test_fail_recovery_audit();
+      `);
+    }
+
+    const recoveryAttempts = await Promise.allSettled([
+      platformRoles.assignRecoverySuperAdmin(superAdminUserId, recoveryCandidate.userId, "Local recovery assignment test"),
+      platformRoles.assignRecoverySuperAdmin(superAdminUserId, concurrentCandidate.userId, "Concurrent local recovery attempt")
+    ]);
+    const recoverySuccessIndex = recoveryAttempts.findIndex((attempt) => attempt.status === "fulfilled");
+    assert.notEqual(recoverySuccessIndex, -1, "One concurrent backup assignment may succeed.");
+    assert.equal(recoveryAttempts.filter((attempt) => attempt.status === "fulfilled").length, 1,
+      "Concurrent backup assignments must not create more than two active Super Admins.");
+    const recoveryRejected = recoveryAttempts.find((attempt) => attempt.status === "rejected");
+    assert.ok(recoveryRejected.reason instanceof PlatformRoleError);
+    assert.equal(recoveryRejected.reason.status, 409);
+    const recoveryAssignment = recoveryAttempts[recoverySuccessIndex].value;
+    const recoveryUserId = recoveryAssignment.userId;
+    assert.equal(recoveryAssignment.role, "super_admin");
+    assert.equal(recoveryAssignment.assignmentType, "recovery");
+    assert.equal(recoveryAssignment.grantedBy, superAdminUserId);
+    assert.equal(await platformRoles.isSuperAdmin(superAdminUserId), true);
+    assert.equal(await platformRoles.isSuperAdmin(recoveryUserId), true);
+    await platformRoles.requireSuperAdmin(superAdminUserId);
+    await platformRoles.requireSuperAdmin(recoveryUserId);
+    await platformRoles.requirePlatformAdmin(recoveryUserId);
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(superAdminUserId, thirdCandidate.userId, "Third Super Admin attempt"),
+      (error) => error instanceof PlatformRoleError && error.status === 409,
+      "The application must refuse a third active Super Admin."
+    );
+    const recoveryEvent = await database.query(
+      `SELECT role, action, assignment_type, actor_user_id
+       FROM platform_role_events WHERE target_user_id = $1 AND role = 'super_admin'`,
+      [recoveryUserId]
+    );
+    assert.deepEqual(recoveryEvent.rows, [{
+      role: "super_admin", action: "recovery_grant", assignment_type: "recovery", actor_user_id: superAdminUserId
+    }], "The recovery assignment writes a correctly classified, authorising audit event.");
+    const activeSuperAdminCount = await database.query(
+      "SELECT count(*)::integer AS count FROM platform_roles WHERE role = 'super_admin'"
+    );
+    assert.equal(activeSuperAdminCount.rows[0].count, 2);
+    const foundersAfterRecovery = await database.query(
+      "SELECT user_id FROM platform_roles WHERE role = 'super_admin' AND assignment_type = 'founder'"
+    );
+    assert.deepEqual(foundersAfterRecovery.rows, [{ user_id: superAdminUserId }]);
+    await assert.rejects(
+      database.query(
+        `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+         VALUES($1, 'super_admin', NULL, $2)`,
+        [thirdCandidate.userId, superAdminUserId]
+      ),
+      (error) => error.code === "23514" && error.constraint === "platform_roles_assignment_type_allowed",
+      "A third Super Admin cannot bypass the two-slot unique index by using a NULL assignment type."
+    );
+    await assert.rejects(
+      database.query(
+        `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+         VALUES($1, 'super_admin', 'founder', NULL)`,
+        [thirdCandidate.userId]
+      ),
+      (error) => error.code === "23505" || error.code === "23514",
+      "Database triggers and slot constraints must reject a third assignment even when application checks are bypassed."
+    );
+    await assert.rejects(
+      database.query(
+        `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+         VALUES($1, 'super_admin', 'recovery', $2)`,
+        [thirdCandidate.userId, superAdminUserId]
+      ),
+      (error) => error.code === "23514",
+      "The database must reject a concurrent or direct third recovery assignment."
+    );
+    await assert.rejects(
+      database.query(
+        "UPDATE platform_role_events SET reason='changed' WHERE target_user_id=$1 AND action='bootstrap'",
+        [superAdminUserId]
+      ),
+      (error) => error.code === "55000" && error.constraint === "platform_role_events_append_only",
+      "The immutable migration-010 founder bootstrap audit event cannot be rewritten."
+    );
+    await assert.rejects(
+      database.query(
+        "UPDATE platform_roles SET user_id=$1 WHERE user_id=$2 AND role='super_admin'",
+        [thirdCandidate.userId, superAdminUserId]
+      ),
+      (error) => error.code === "55000" && error.constraint === "platform_roles_super_admin_immutable",
+      "The founder Super Admin identity and assignment cannot be edited or replaced."
+    );
+    await assert.rejects(
+      database.query("DELETE FROM platform_roles WHERE user_id=$1 AND role='super_admin'", [superAdminUserId]),
+      (error) => error.code === "55000" && error.constraint === "platform_roles_super_admin_removal_review",
+      "The founder Super Admin slot cannot be removed through direct DML."
+    );
+    await assert.rejects(
+      database.query(
+        "DELETE FROM platform_role_events WHERE target_user_id=$1 AND action='bootstrap'",
+        [superAdminUserId]
+      ),
+      (error) => error.code === "55000" && error.constraint === "platform_role_events_append_only",
+      "Founder audit history cannot be deleted."
+    );
+    await assert.rejects(
+      runLatestApplicationMigration("down"),
+      /Cannot roll back migration 011 after a recovery Super Admin assignment has been recorded/,
+      "Rollback must stop once a recovery assignment has been recorded."
+    );
+    const latestMigration = await database.query(
+      "SELECT name FROM breakdish_app_migrations ORDER BY run_on DESC, id DESC LIMIT 1"
+    );
+    assert.match(latestMigration.rows[0].name, /^011_backup_super_admin$/,
+      "A blocked rollback must leave migration 011 applied.");
     const retainedRoleHistory = await database.query(
       "SELECT action, actor_user_id, reason FROM platform_role_events WHERE target_user_id=$1 AND role='platform_admin' ORDER BY created_at",
       [platformAdminUserId]
@@ -548,6 +800,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await postJson(`/api/leagues/${approval.league.id}/requests/${thirdProfile.userId}`, secondUserCookie, { action: "approve" });
     assert.equal(response.status, 200);
     assert.equal((await response.json()).membership.status, "active");
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(thirdProfile.userId, thirdProfile.userId, "League member privilege check"),
+      (error) => error instanceof PlatformRoleError && error.status === 403,
+      "An active League Member cannot assign a recovery Super Admin."
+    );
     response = await postJson(`/api/leagues/${approval.league.id}/requests/${thirdProfile.userId}`, secondUserCookie, { action: "decline" });
     assert.equal(response.status, 409, "A resolved request cannot be decided twice.");
     response = await fetchFromSite(`/api/leagues/${approval.league.id}/members/${thirdProfile.userId}/role`, {
@@ -685,6 +942,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     });
     assert.equal(response.status, 200);
     assert.notEqual(scopedOwnerProfile.userId, scopedAdminProfile.userId);
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(scopedAdminProfile.userId, recoveryCandidate.userId, "League administrator privilege check"),
+      (error) => error instanceof PlatformRoleError && error.status === 403,
+      "A League Administrator cannot assign a recovery Super Admin."
+    );
     response = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: scopedOwnerCookie } });
     assert.equal(response.status, 403, "League ownership alone does not grant platform role management.");
     await assertPlatformRoleMutationsDenied(scopedOwnerCookie, "A League Owner without a platform role");
@@ -861,6 +1123,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await fetchFromSite("/api/platform/roles/admins", { headers: { cookie: thirdUserCookie } });
     assert.equal(response.status, 403, "Team captaincy alone does not grant platform role management.");
     await assertPlatformRoleMutationsDenied(thirdUserCookie, "A Team Captain without a platform role");
+    await assert.rejects(
+      platformRoles.assignRecoverySuperAdmin(thirdProfile.userId, fourthProfile.userId, "Team captain privilege check"),
+      (error) => error instanceof PlatformRoleError && error.status === 403,
+      "A Team Captain cannot assign a recovery Super Admin."
+    );
     await assert.rejects(
       database.query("UPDATE team_memberships SET role = 'captain' WHERE team_id = $1 AND user_id = $2", [northTeam.id, secondProfile.userId]),
       (error) => error.code === "23505" && error.constraint === "team_memberships_single_active_captain",

@@ -27,6 +27,7 @@ function mapAssignment(row) {
   return {
     userId: row.user_id,
     role: row.role,
+    assignmentType: row.assignment_type ?? null,
     grantedAt: row.granted_at,
     grantedBy: row.granted_by ?? null
   };
@@ -120,14 +121,54 @@ export function createPlatformRoleStore(database) {
         }
 
         const assignment = await client.query(
-          `INSERT INTO platform_roles(user_id, role, granted_by)
-           VALUES($1, 'super_admin', NULL) RETURNING user_id, role, granted_at, granted_by`,
+          `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+           VALUES($1, 'super_admin', 'founder', NULL) RETURNING user_id, role, assignment_type, granted_at, granted_by`,
           [targetUserId]
         );
         await client.query(
           `INSERT INTO platform_role_events(target_user_id, role, action, actor_user_id, reason)
            VALUES($1, 'super_admin', 'bootstrap', NULL, $2)`,
           [targetUserId, detail]
+        );
+        return mapAssignment(assignment.rows[0]);
+      });
+    },
+
+    async assignRecoverySuperAdmin(actorUserId, targetUserId, reason) {
+      const actor = cleanUserId(actorUserId);
+      const target = cleanUserId(targetUserId);
+      const detail = cleanReason(reason);
+      return withRoleTransaction(database, async (client) => {
+        await requireSuperAdminOn(client, actor);
+
+        const activeSuperAdmins = await client.query(
+          `SELECT user_id, assignment_type FROM platform_roles
+           WHERE role = 'super_admin' ORDER BY granted_at FOR UPDATE`
+        );
+        if (activeSuperAdmins.rows.length !== 1 ||
+            activeSuperAdmins.rows[0].assignment_type !== "founder" ||
+            activeSuperAdmins.rows[0].user_id !== actor) {
+          throw new PlatformRoleError(409, "A recovery Super Admin requires the single active founder account as authoriser.");
+        }
+
+        const user = await client.query('SELECT id FROM "user" WHERE id = $1', [target]);
+        if (!user.rows[0]) throw new PlatformRoleError(404, "The target account could not be found.");
+
+        const existingTargetRole = await client.query("SELECT role FROM platform_roles WHERE user_id = $1 FOR UPDATE", [target]);
+        if (existingTargetRole.rows[0]) {
+          throw new PlatformRoleError(409, "The target account already holds a platform role.");
+        }
+
+        const assignment = await client.query(
+          `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+           VALUES($1, 'super_admin', 'recovery', $2)
+           RETURNING user_id, role, assignment_type, granted_at, granted_by`,
+          [target, actor]
+        );
+        await client.query(
+          `INSERT INTO platform_role_events(target_user_id, role, action, assignment_type, actor_user_id, reason)
+           VALUES($1, 'super_admin', 'recovery_grant', 'recovery', $2, $3)`,
+          [target, actor, detail]
         );
         return mapAssignment(assignment.rows[0]);
       });
@@ -161,7 +202,7 @@ export function createPlatformRoleStore(database) {
       await requireSuperAdmin(actorId);
       const boundedLimit = Number.isInteger(limit) && limit >= 1 && limit <= 200 ? limit : 100;
       const result = await database.query(
-        `SELECT e.id, e.target_user_id, e.role, e.action, e.actor_user_id, e.reason, e.created_at,
+        `SELECT e.id, e.target_user_id, e.role, e.action, e.assignment_type, e.actor_user_id, e.reason, e.created_at,
            coalesce(target_profile.display_name, target_user.name) AS target_name,
            actor.name AS actor_name
          FROM platform_role_events e
@@ -178,6 +219,7 @@ export function createPlatformRoleStore(database) {
         targetName: row.target_name,
         role: row.role,
         action: row.action,
+        assignmentType: row.assignment_type ?? (row.action === "bootstrap" ? "founder" : null),
         actorUserId: row.actor_user_id ?? null,
         actorName: row.actor_name ?? null,
         reason: row.reason ?? null,
@@ -194,15 +236,15 @@ export function createPlatformRoleStore(database) {
         const user = await client.query('SELECT id FROM "user" WHERE id = $1', [target]);
         if (!user.rows[0]) throw new PlatformRoleError(404, "The target account could not be found.");
 
-        const existing = await client.query("SELECT user_id, role, granted_at, granted_by FROM platform_roles WHERE user_id = $1 FOR UPDATE", [target]);
+        const existing = await client.query("SELECT user_id, role, assignment_type, granted_at, granted_by FROM platform_roles WHERE user_id = $1 FOR UPDATE", [target]);
         if (existing.rows[0]?.role === "platform_admin") {
           return { assignment: mapAssignment(existing.rows[0]), repeated: true };
         }
         if (existing.rows[0]) throw new PlatformRoleError(409, "The target account already holds a different platform role.");
 
         const assignment = await client.query(
-          `INSERT INTO platform_roles(user_id, role, granted_by)
-           VALUES($1, 'platform_admin', $2) RETURNING user_id, role, granted_at, granted_by`,
+          `INSERT INTO platform_roles(user_id, role, assignment_type, granted_by)
+           VALUES($1, 'platform_admin', NULL, $2) RETURNING user_id, role, assignment_type, granted_at, granted_by`,
           [target, actor]
         );
         await client.query(
