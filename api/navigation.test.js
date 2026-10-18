@@ -61,7 +61,8 @@ test("signed-in navigation, filtered Match Centre and league management shortcut
   assert.match(matchScript, /match\.completedAt \|\| match\.scheduledAt/);
   assert.match(matchScript, /previousMatches \? "View Match" : "Open scoreboard"/);
   assert.match(matchScript, /const isFinal = match\.status === "completed"/);
-  assert.match(matchScript, /if \(!signedIn && !isFinal\)/);
+  assert.match(matchScript, /permissions\.canOperate !== true/);
+  assert.match(matchScript, /SCHEDULED · This match has not started yet/);
   assert.match(matchScript, /\/api\/matches\/\$\{encodeURIComponent\(matchId\)\}/);
   assert.match(matchScript, /match\.startedAt/);
   assert.match(matchScript, /showModal\(\)/);

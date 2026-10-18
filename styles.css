@@ -3640,6 +3640,7 @@ td:first-child {
 
 .match-state-banner,
 .match-access-note,
+.match-read-only-note,
 .match-inline-status,
 .match-final-note {
   margin: 0;

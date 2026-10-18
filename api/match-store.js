@@ -153,6 +153,17 @@ async function canFinalizeMatch(client, match, actorId, lockOrganizer = false) {
     || await hasMatchOrganizerPermission(client, match, actorId, lockOrganizer);
 }
 
+async function canViewMatchAudit(client, match, actorId) {
+  if (!actorId) return false;
+  const authorized = await client.query(
+    `SELECT 1 WHERE $2 = (SELECT created_by FROM matches WHERE id = $1)
+     UNION SELECT 1 FROM match_participants WHERE match_id=$1 AND user_id=$2
+     UNION SELECT 1 FROM league_memberships WHERE league_id=$3 AND user_id=$2 AND status='active' AND role IN ('owner','administrator')`,
+    [match.id, actorId, match.league_id]
+  );
+  return Boolean(authorized.rows[0]);
+}
+
 async function requireMatchFinalizer(client, match, actorId) {
   if (!await canFinalizeMatch(client, match, actorId, true)) {
     throw new LeagueStoreError(403, "Only a match participant or authorised competition organiser can finalize this result.");
@@ -656,7 +667,7 @@ function toMatch(row) {
   };
 }
 
-async function matchWithDetails(client, matchId) {
+async function matchWithDetails(client, matchId, viewerId = null) {
   const matchResult = await client.query(
     `SELECT sb.*, m.round_number AS round_number, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
        at.name AS away_team_name, te.name AS tournament_name,
@@ -689,6 +700,9 @@ async function matchWithDetails(client, matchId) {
   );
   if (!matchResult.rows[0]) return null;
   const match = toMatch(matchResult.rows[0]);
+  const canViewUpcomingSelections = match.status === "in_progress" && viewerId
+    ? await canOperateMatch(client, matchResult.rows[0], viewerId, ["in_progress"])
+    : false;
   const frameResult = await client.query(
     `SELECT f.match_id, f.frame_number, sf.frame_type, f.status, f.outcome_type,
        f.winner_side, f.forfeiting_side, f.completed_by, f.completed_at,
@@ -724,17 +738,27 @@ async function matchWithDetails(client, matchId) {
      WHERE d.match_id = $1 ORDER BY d.created_at`,
     [matchId]
   );
-  const frames = frameResult.rows.map((frame) => ({
-    number: Number(frame.frame_number),
-    type: frame.frame_type,
-    status: frame.status,
-    outcome: frame.outcome_type,
-    winnerSide: frame.winner_side === null ? null : Number(frame.winner_side),
-    forfeitingSide: frame.forfeiting_side === null ? null : Number(frame.forfeiting_side),
-    completedAt: frame.completed_at,
-    players: frame.players,
-    event: frame.frame_events?.[0] ?? null
-  }));
+  const currentFrameNumber = match.status === "in_progress"
+    ? Number(frameResult.rows.find((frame) => frame.status !== "completed")?.frame_number)
+    : null;
+  const frames = frameResult.rows.map((frame) => {
+    const number = Number(frame.frame_number);
+    const playersVisible = frame.status === "completed"
+      || (match.status === "in_progress" && number === currentFrameNumber)
+      || canViewUpcomingSelections;
+    return {
+      number,
+      type: frame.frame_type,
+      status: frame.status,
+      outcome: frame.outcome_type,
+      winnerSide: frame.winner_side === null ? null : Number(frame.winner_side),
+      forfeitingSide: frame.forfeiting_side === null ? null : Number(frame.forfeiting_side),
+      completedAt: frame.completed_at,
+      playersVisible,
+      players: playersVisible ? frame.players : [],
+      event: playersVisible ? frame.frame_events?.[0] ?? null : null
+    };
+  });
   return {
     match,
     frames,
@@ -942,7 +966,18 @@ export function createMatchStore(database) {
           );
           if (!permitted.rows[0]) throw new LeagueStoreError(403, "Only the match creator, a recorded participant or its appointed Money Match Admin can view this private match.");
         }
-        const details = await matchWithDetails(client, match.id);
+        const details = await matchWithDetails(client, match.id, viewerId);
+        const canOperate = await canOperateMatch(client, match, viewerId);
+        const canConfirm = ["awaiting_confirmation", "disputed"].includes(match.status);
+        const confirmableSides = [];
+        if (viewerId && canConfirm) {
+          for (const side of [1, 2]) {
+            const latest = details.confirmations.find((confirmation) => confirmation.side === side);
+            if (latest?.action !== "confirmed" && await canConfirmForSide(client, match, viewerId, side)) {
+              confirmableSides.push(side);
+            }
+          }
+        }
         const retractableSides = [];
         if (viewerId && ["awaiting_confirmation", "disputed"].includes(match.status)) {
           for (const confirmation of details.confirmations) {
@@ -957,7 +992,13 @@ export function createMatchStore(database) {
         return {
           ...details,
           permissions: {
+            canOperate,
+            canStart: match.status === "scheduled" && canOperate,
+            canScore: match.status === "in_progress" && canOperate,
+            canRaiseDispute: canConfirm && await canOperateMatch(client, match, viewerId, ["awaiting_confirmation", "disputed"]),
+            confirmableSides,
             canFinalize: await canFinalizeMatch(client, match, viewerId),
+            canViewAudit: await canViewMatchAudit(client, match, viewerId),
             retractableSides
           }
         };
@@ -1225,7 +1266,7 @@ export function createMatchStore(database) {
         const snapshot = await client.query("SELECT id FROM match_format_snapshots WHERE match_id = $1", [match.id]);
         if (!snapshot.rows[0]) throw new LeagueStoreError(409, "This fixture has no match-format snapshot.");
         await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, current.rows[0].id, current.rows[0].version, current.rows[0].name, actorId);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1265,7 +1306,7 @@ export function createMatchStore(database) {
         const snapshot = await client.query("SELECT id FROM match_format_snapshots WHERE match_id = $1", [match.id]);
         if (!snapshot.rows[0]) throw new LeagueStoreError(409, "This fixture has no match-format snapshot.");
         await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, templateId, version, name, actorId);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1283,7 +1324,7 @@ export function createMatchStore(database) {
         }
         await assertFixtureSeasonEditable(client, match);
         await client.query("UPDATE matches SET scheduled_at = $2, venue = $3, updated_at = now() WHERE id = $1", [match.id, scheduledAt, venue]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1295,7 +1336,7 @@ export function createMatchStore(database) {
         }
         await assertFixtureSeasonEditable(client, match);
         await client.query("UPDATE matches SET status = 'cancelled', updated_at = now() WHERE id = $1", [match.id]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1494,7 +1535,7 @@ export function createMatchStore(database) {
             [matchId, playerA, playerB, wager.toFixed(2), cleanAccountId(terms.adminUserId, "Match Admin account ID"), snapshot.rows[0].id, actorId]
           );
         }
-        return matchWithDetails(client, matchId);
+        return matchWithDetails(client, matchId, actorId);
       });
     },
 
@@ -1512,7 +1553,7 @@ export function createMatchStore(database) {
         }
         await client.query("SELECT set_config('breakdish.audit_action', 'match_started', true)");
         await client.query("UPDATE matches SET status = 'in_progress', updated_at = now() WHERE id = $1", [match.id]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1641,7 +1682,7 @@ export function createMatchStore(database) {
             );
           }
         }
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1700,7 +1741,7 @@ export function createMatchStore(database) {
         } else {
           await client.query("DELETE FROM match_frame_events WHERE match_id = $1 AND frame_number = $2", [match.id, frameNumber]);
         }
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1731,7 +1772,7 @@ export function createMatchStore(database) {
             [match.id, frameNumber, cleanText(details.userId, "dish player account ID"), eventType, actorId]
           );
         }
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1741,7 +1782,7 @@ export function createMatchStore(database) {
         const sideNumber = await confirmationSideForActor(client, match, actorId, side);
         await client.query("SELECT set_config('breakdish.audit_action', 'confirmation_confirmed', true)");
         await client.query("INSERT INTO match_confirmations(match_id, side, action, confirmed_by) VALUES($1,$2,'confirmed',$3)", [match.id, sideNumber, actorId]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1764,7 +1805,7 @@ export function createMatchStore(database) {
         }
         await client.query("SELECT set_config('breakdish.audit_action', 'confirmation_retracted', true)");
         await client.query("INSERT INTO match_confirmations(match_id, side, action, confirmed_by) VALUES($1,$2,'retracted',$3)", [match.id, sideNumber, actorId]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1774,9 +1815,10 @@ export function createMatchStore(database) {
       const frameNumber = details.frameNumber == null || details.frameNumber === "" ? null : Number(details.frameNumber);
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
+        await requireMatchOperator(client, match, actorId, ["awaiting_confirmation", "disputed"]);
         await client.query("SELECT set_config('breakdish.audit_action', 'dispute_raised', true)");
         await client.query("INSERT INTO match_disputes(match_id, frame_number, raised_by, reason) VALUES($1,$2,$3,$4)", [match.id, frameNumber, actorId, reason]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1790,7 +1832,7 @@ export function createMatchStore(database) {
         await client.query("SELECT set_config('breakdish.audit_action', 'dispute_resolved', true)");
         const resolved = await client.query("INSERT INTO match_dispute_resolutions(dispute_id, resolved_by, resolution) SELECT id,$2,$3 FROM match_disputes WHERE id=$1 AND match_id=$4 RETURNING id", [cleanUuid(disputeId, "dispute ID"), actorId, text, match.id]);
         if (!resolved.rows[0]) throw new LeagueStoreError(404, "This dispute could not be found.");
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1801,7 +1843,7 @@ export function createMatchStore(database) {
         await requireMatchFinalizer(client, match, actorId);
         await client.query("SELECT set_config('breakdish.audit_action', 'match_finalized', true)");
         await client.query("UPDATE matches SET status = 'completed', updated_at = now() WHERE id = $1", [match.id]);
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
@@ -1819,23 +1861,36 @@ export function createMatchStore(database) {
           "INSERT INTO money_match_acknowledgements(match_id, acknowledgement_type, acknowledged_by) VALUES($1,$2,$3)",
           [match.id, acknowledgementType, actorId]
         );
-        return matchWithDetails(client, match.id);
+        return matchWithDetails(client, match.id, actorId);
       });
     },
 
     async getAudit(matchId, actorId) {
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"));
-        const authorized = await client.query(
-          `SELECT 1 WHERE $2 = (SELECT created_by FROM matches WHERE id = $1)
-           UNION SELECT 1 FROM match_participants WHERE match_id=$1 AND user_id=$2
-           UNION SELECT 1 FROM league_memberships WHERE league_id=$3 AND user_id=$2 AND status='active' AND role IN ('owner','administrator')`,
-          [match.id, actorId, match.league_id]
-        );
-        if (!authorized.rows[0]) throw new LeagueStoreError(403, "Only a match participant or competition manager can view its audit history.");
+        if (!await canViewMatchAudit(client, match, actorId)) {
+          throw new LeagueStoreError(403, "Only a match participant or competition manager can view its audit history.");
+        }
+        const canViewUpcomingSelections = await canOperateMatch(client, match, actorId, ["in_progress"]);
         const result = await client.query(
-          `SELECT id, frame_number, actor_user_id, action_type, previous_value, new_value, occurred_at
-           FROM match_audit_events WHERE match_id=$1 ORDER BY occurred_at, id`, [match.id]
+          `SELECT a.id, a.frame_number, a.actor_user_id, a.action_type,
+              CASE WHEN a.action_type = 'player_selection_changed' AND NOT $2::boolean AND COALESCE(NOT (
+               f.status = 'completed' OR (m.status = 'in_progress' AND f.frame_number = (
+                 SELECT min(current_frame.frame_number) FROM match_frames current_frame
+                 WHERE current_frame.match_id = m.id AND current_frame.status <> 'completed'
+               ))
+             ), true) THEN NULL ELSE a.previous_value END AS previous_value,
+              CASE WHEN a.action_type = 'player_selection_changed' AND NOT $2::boolean AND COALESCE(NOT (
+               f.status = 'completed' OR (m.status = 'in_progress' AND f.frame_number = (
+                 SELECT min(current_frame.frame_number) FROM match_frames current_frame
+                 WHERE current_frame.match_id = m.id AND current_frame.status <> 'completed'
+               ))
+             ), true) THEN NULL ELSE a.new_value END AS new_value,
+             a.occurred_at
+           FROM match_audit_events a
+           JOIN matches m ON m.id = a.match_id
+           LEFT JOIN match_frames f ON f.match_id = a.match_id AND f.frame_number = a.frame_number
+            WHERE a.match_id=$1 ORDER BY a.occurred_at, a.id`, [match.id, canViewUpcomingSelections]
         );
         return result.rows;
       });

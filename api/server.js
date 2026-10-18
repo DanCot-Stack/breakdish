@@ -762,6 +762,11 @@ function createApp({
     }
   });
 
+  app.use("/api/matches", (_req, res, next) => {
+    res.set("Cache-Control", "no-store, max-age=0");
+    next();
+  });
+
   app.get("/api/matches", async (req, res, next) => {
     try {
       const session = await matchSession(req);

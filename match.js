@@ -94,6 +94,18 @@ if (page) {
     return match.awayTeam || match.awaySideName || "Away";
   }
 
+  function displayMatchStatus(value) {
+    const labels = {
+      scheduled: "Scheduled",
+      in_progress: "Live",
+      awaiting_confirmation: "Awaiting confirmation",
+      disputed: "Disputed",
+      completed: "Completed",
+      cancelled: "Cancelled"
+    };
+    return labels[value] || String(value || "Unknown").replaceAll("_", " ");
+  }
+
   function renderMatchList(matches) {
     list.replaceChildren();
     list.classList.toggle("is-previous-matches", previousMatches);
@@ -192,13 +204,13 @@ if (page) {
     return { wrapper, select };
   }
 
-  async function buildFrameCard(frame, match, isCurrent = false) {
+  async function buildFrameCard(frame, match, permissions = {}, isCurrent = false) {
     const card = textElement("article", `score-frame-card${frame.status === "completed" ? " is-complete" : ""}${isCurrent ? " is-current" : ""}`);
     const heading = textElement("div", "score-frame-heading");
     heading.append(
       textElement("span", "score-frame-number", `FRAME ${frame.number}`),
       textElement("span", "match-category-tag", frame.type === "singles" ? "Singles" : "Doubles"),
-      textElement("span", `match-state-tag is-${frame.status}`, frame.status.replaceAll("_", " "))
+      textElement("span", `match-state-tag is-${frame.status}`, displayMatchStatus(frame.status))
     );
     if (isCurrent) heading.append(textElement("span", "match-state-tag is-in_progress", "Current frame"));
     card.append(heading);
@@ -211,57 +223,62 @@ if (page) {
       if (selected.some((player) => player.isBye)) return "Bye";
       return selected.map((player) => player.name).filter(Boolean).join(" / ");
     });
-    if (selectedBySide.some(Boolean)) {
+    if (frame.playersVisible === true && selectedBySide.some(Boolean)) {
       card.append(textElement("p", "score-frame-current-players",
         `${sideName(match, 1)}: ${selectedBySide[0] || "Players not selected"} · ${sideName(match, 2)}: ${selectedBySide[1] || "Players not selected"}`));
+    } else if (frame.playersVisible !== true) {
+      card.append(textElement("p", "match-read-only-note", "Player selections for this upcoming frame are not published yet."));
+    } else if (frame.playersVisible === true && !selectedBySide.some(Boolean)) {
+      card.append(textElement("p", "score-frame-current-players", "Players have not been selected for this frame yet."));
     }
     if (frame.event?.type) {
       const eventLabel = frame.event.type === "counter_dish" ? "Counter Dish" : "Dish";
       const eventPlayer = (frame.players || []).find((player) => player.userId === frame.event.userId)?.name;
       card.append(textElement("p", "score-frame-event", `${eventLabel}${eventPlayer ? ` · ${eventPlayer}` : ""}`));
     }
-    const grid = textElement("div", "score-frame-sides");
-    const canEditResult = signedIn && match.status === "in_progress";
-    const editable = canEditResult && frame.status !== "completed";
+    const canManagePlayers = permissions.canScore === true
+      && match.status === "in_progress" && frame.status !== "completed";
+    const canScore = permissions.canScore === true;
+    const canEditFrameResult = canScore && (isCurrent || frame.status === "completed");
     const slots = frame.type === "singles" ? 1 : 2;
     const selects = new Map();
     let playerLoadError = "";
-    for (const side of [1, 2]) {
-      const label = sideName(match, side);
-      const fieldset = document.createElement("fieldset");
-      fieldset.className = "score-frame-side";
-      fieldset.append(textElement("legend", "", label));
-      let eligible = [];
-      if (signedIn) {
+    if (canManagePlayers) {
+      const grid = textElement("div", "score-frame-sides");
+      for (const side of [1, 2]) {
+        const label = sideName(match, side);
+        const fieldset = document.createElement("fieldset");
+        fieldset.className = "score-frame-side";
+        fieldset.append(textElement("legend", "", label));
+        let eligible = [];
         try { eligible = await loadEligiblePlayers(match.id, side); }
         catch (error) { playerLoadError ||= error.message; }
-      }
-      const current = (frame.players || []).filter((player) => Number(player.side) === side).sort((a, b) => Number(a.slot) - Number(b.slot));
-      const available = new Map(eligible.map((player) => [player.userId, { value: player.userId, label: player.displayName }]));
-      current.forEach((player) => {
-        if (player.userId && !available.has(player.userId)) {
-          available.set(player.userId, { value: player.userId, label: `${player.name} (historical selection)`, disabled: true });
+        const current = (frame.players || []).filter((player) => Number(player.side) === side).sort((a, b) => Number(a.slot) - Number(b.slot));
+        const available = new Map(eligible.map((player) => [player.userId, { value: player.userId, label: player.displayName }]));
+        current.forEach((player) => {
+          if (player.userId && !available.has(player.userId)) {
+            available.set(player.userId, { value: player.userId, label: `${player.name} (historical selection)`, disabled: true });
+          }
+        });
+        const options = [...available.values(), { value: "__bye__", label: "Bye" }];
+        for (let slot = 1; slot <= slots; slot++) {
+          const selected = current.find((player) => Number(player.slot) === slot);
+          const value = selected?.isBye ? "__bye__" : selected?.userId || "";
+          const field = makeSelect(slots === 1 ? `${label} player` : `${label} player ${slot}`, options, value);
+          if (slots === 2 && slot === 2 && current.some((player) => player.isBye)) {
+            field.select.value = "__bye__";
+            field.select.disabled = true;
+          }
+          selects.set(`${side}:${slot}`, field.select);
+          fieldset.append(field.wrapper);
         }
-      });
-      const options = [...available.values(), { value: "__bye__", label: "Bye" }];
-      for (let slot = 1; slot <= slots; slot++) {
-        const selected = current.find((player) => Number(player.slot) === slot);
-        const value = selected?.isBye ? "__bye__" : selected?.userId || "";
-        const field = makeSelect(slots === 1 ? `${label} player` : `${label} player ${slot}`, options, value);
-        field.select.disabled = !editable;
-        if (slots === 2 && slot === 2 && current.some((player) => player.isBye)) {
-          field.select.value = "__bye__";
-          field.select.disabled = true;
-        }
-        selects.set(`${side}:${slot}`, field.select);
-        fieldset.append(field.wrapper);
+        grid.append(fieldset);
       }
-      grid.append(fieldset);
+      card.append(grid);
     }
-    card.append(grid);
-    if (playerLoadError && editable) card.append(textElement("p", "match-inline-status is-error", playerLoadError));
+    if (playerLoadError && canManagePlayers) card.append(textElement("p", "match-inline-status is-error", playerLoadError));
 
-    if (editable) {
+    if (canManagePlayers) {
       const savePlayers = textElement("button", "button button-quiet", "Save players");
       savePlayers.type = "button";
       savePlayers.addEventListener("click", () => mutate(async () => {
@@ -283,7 +300,7 @@ if (page) {
       card.append(savePlayers);
     }
 
-    if (canEditResult) {
+    if (canEditFrameResult) {
       const resultForm = textElement("div", "score-frame-result-form");
       const winnerField = makeSelect("Frame winner", [
         { value: "1", label: sideName(match, 1) }, { value: "2", label: sideName(match, 2) }
@@ -294,7 +311,11 @@ if (page) {
       const eventPlayer = makeSelect("Winning player", [], frame.event?.userId || "");
       const refreshWinnerOptions = () => {
         const selectedSide = Number(winnerField.select.value);
-        const players = Array.from({ length: slots }, (_, index) => selects.get(`${selectedSide}:${index + 1}`)?.value).filter((value) => value && value !== "__bye__");
+        const players = Array.from({ length: slots }, (_, index) => {
+          const selected = selects.get(`${selectedSide}:${index + 1}`)?.value;
+          if (selected) return selected;
+          return (frame.players || []).find((player) => Number(player.side) === selectedSide && Number(player.slot) === index + 1)?.userId || "";
+        }).filter((value) => value && value !== "__bye__");
         const currentValue = eventPlayer.select.value;
         const displayNames = new Map((frame.players || []).map((player) => [player.userId, player.name]));
         eventPlayer.select.replaceChildren();
@@ -310,12 +331,12 @@ if (page) {
       };
       refreshWinnerOptions();
       winnerField.select.addEventListener("change", refreshWinnerOptions);
-      for (const field of [winnerField, eventField, eventPlayer]) field.select.disabled = !canEditResult;
       resultForm.append(winnerField.wrapper, eventField.wrapper, eventPlayer.wrapper);
       const saveResult = textElement("button", "button button-gold", frame.status === "completed" ? "Update frame result" : "Record frame result");
       saveResult.type = "button";
       saveResult.addEventListener("click", () => mutate(async () => {
-        const hasBye = Array.from(selects.values()).some((select) => select.value === "__bye__");
+        const hasBye = (frame.players || []).some((player) => player.isBye)
+          || Array.from(selects.values()).some((select) => select.value === "__bye__");
         if (hasBye) {
           await request(`/api/matches/${encodeURIComponent(match.id)}/frames/${frame.number}/result`, {
             method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ outcome: "bye" })
@@ -343,21 +364,26 @@ if (page) {
     title.innerHTML = isFinal ? "FINAL<br><em>RESULT.</em>" : "MATCH<br><em>SCOREBOARD.</em>";
     sectionTitle.innerHTML = isFinal ? "COMPLETED<br><span>MATCH.</span>" : "LIVE<br><span>SCOREBOARD.</span>";
     sectionKicker.textContent = isFinal ? "FINAL RESULT" : labels[match.type] || "MATCH";
-    intro.textContent = `${matchLabel(match)} · ${match.status.replaceAll("_", " ")}`;
+    intro.textContent = `${matchLabel(match)} · ${displayMatchStatus(match.status)}`;
     list.hidden = true;
     detail.hidden = false;
     detail.replaceChildren();
     detail.append(buildCardHeader(match));
-    const stateText = match.status === "in_progress" ? "LIVE · Match in progress." : `Match state: ${match.status.replaceAll("_", " ")}.`;
+    const stateText = match.status === "in_progress" ? "LIVE · Match in progress."
+      : match.status === "scheduled" ? "SCHEDULED · This match has not started yet."
+        : `Match state: ${displayMatchStatus(match.status)}.`;
     const state = textElement("p", `match-state-banner is-${match.status}`, `${stateText} ${match.framesCompleted} of ${match.framesTotal} frames complete.`);
     detail.append(state);
 
-    if (!signedIn && !isFinal) {
-      const access = textElement("p", "match-access-note", "Sign in to update a scoreboard, select players or confirm a result.");
+    const permissions = result.permissions || {};
+    if (permissions.canOperate !== true) {
+      const access = textElement("p", "match-access-note", "Read-only match view. Scoreboard controls are limited to registered players in this match.");
       const login = textElement("a", "button button-quiet", "Log in");
       login.href = `login.html?next=${encodeURIComponent(`match.html?id=${match.id}`)}`;
-      detail.append(access, login);
-    } else if (match.status === "scheduled") {
+      detail.append(access);
+      if (!signedIn) detail.append(login);
+    }
+    if (permissions.canStart === true && match.status === "scheduled") {
       const start = textElement("button", "button button-gold", "Start Match");
       start.type = "button";
       start.addEventListener("click", () => {
@@ -374,7 +400,7 @@ if (page) {
     const currentFrameNumber = match.status === "in_progress"
       ? (result.frames || []).find((frame) => frame.status !== "completed")?.number
       : null;
-    for (const frame of result.frames || []) frames.append(await buildFrameCard(frame, match, frame.number === currentFrameNumber));
+    for (const frame of result.frames || []) frames.append(await buildFrameCard(frame, match, permissions, frame.number === currentFrameNumber));
     detail.append(frames);
 
     const confirmationSection = textElement("section", "match-confirmation-panel");
@@ -383,40 +409,40 @@ if (page) {
     const confirmed = [1, 2].filter((side) => latest.get(side)?.action === "confirmed");
     const retractableSides = Array.isArray(result.permissions?.retractableSides) ? result.permissions.retractableSides.map(Number) : [];
     confirmationSection.append(textElement("p", "", `${sideName(match, 1)}: ${latest.get(1)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"} · ${sideName(match, 2)}: ${latest.get(2)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"}`));
-    if (signedIn && ["awaiting_confirmation", "disputed"].includes(match.status)) {
+    const confirmableSides = Array.isArray(permissions.confirmableSides) ? permissions.confirmableSides.map(Number) : [];
+    if (confirmableSides.length) {
       let confirmationSideSelect = null;
-      if (match.type === "team_league") {
-        const sideField = makeSelect("Team side to confirm", [{ value: "1", label: sideName(match, 1) }, { value: "2", label: sideName(match, 2) }], "1");
+      if (match.type === "team_league" && confirmableSides.length > 1) {
+        const sideField = makeSelect("Team side to confirm", confirmableSides.map((side) => ({ value: String(side), label: sideName(match, side) })), String(confirmableSides[0]));
         confirmationSideSelect = sideField.select;
-        const confirm = textElement("button", "button button-gold", "Confirm result for selected side");
-        confirm.type = "button";
-        confirm.addEventListener("click", () => mutate(async () => {
-          await request(`/api/matches/${encodeURIComponent(match.id)}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ side: Number(sideField.select.value) }) });
-        }, "Confirmation recorded."));
-        confirmationSection.append(sideField.wrapper, confirm);
-      } else {
-        const confirm = textElement("button", "button button-gold", "Confirm my side's result");
-        confirm.type = "button";
-        confirm.addEventListener("click", () => mutate(async () => {
-          await request(`/api/matches/${encodeURIComponent(match.id)}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-        }, "Confirmation recorded."));
-        confirmationSection.append(confirm);
+        confirmationSection.append(sideField.wrapper);
       }
-      if (confirmed.length && retractableSides.length) {
-        const retract = textElement("button", "button button-quiet", "Retract this side's confirmation");
-        retract.type = "button";
-        const updateRetractionVisibility = () => {
-          const selectedSide = match.type === "team_league" ? Number(confirmationSideSelect?.value) : retractableSides[0];
-          retract.hidden = !retractableSides.includes(selectedSide);
-        };
-        confirmationSideSelect?.addEventListener("change", updateRetractionVisibility);
-        updateRetractionVisibility();
-        retract.addEventListener("click", () => mutate(async () => {
-          const side = match.type === "team_league" ? Number(confirmationSideSelect?.value) : undefined;
-          await request(`/api/matches/${encodeURIComponent(match.id)}/confirm/retract`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(side ? { side } : {}) });
-        }, "Confirmation retracted."));
-        confirmationSection.append(retract);
+      const confirm = textElement("button", "button button-gold", match.type === "team_league" ? "Confirm result for selected side" : "Confirm my side's result");
+      confirm.type = "button";
+      confirm.addEventListener("click", () => mutate(async () => {
+        const side = match.type === "team_league" ? Number(confirmationSideSelect?.value || confirmableSides[0]) : undefined;
+        if (match.type === "team_league" && !confirmableSides.includes(side)) throw new Error("You are not authorised to confirm that side.");
+        await request(`/api/matches/${encodeURIComponent(match.id)}/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(side ? { side } : {}) });
+      }, "Confirmation recorded."));
+      confirmationSection.append(confirm);
+    }
+    if (retractableSides.length) {
+      let retractionSideSelect = null;
+      if (match.type === "team_league" && retractableSides.length > 1) {
+        const sideField = makeSelect("Team side to retract", retractableSides.map((side) => ({ value: String(side), label: sideName(match, side) })), String(retractableSides[0]));
+        retractionSideSelect = sideField.select;
+        confirmationSection.append(sideField.wrapper);
       }
+      const retract = textElement("button", "button button-quiet", "Retract this side's confirmation");
+      retract.type = "button";
+      retract.addEventListener("click", () => mutate(async () => {
+        const side = match.type === "team_league" ? Number(retractionSideSelect?.value || retractableSides[0]) : undefined;
+        if (match.type === "team_league" && !retractableSides.includes(side)) throw new Error("You are not authorised to retract that side's confirmation.");
+        await request(`/api/matches/${encodeURIComponent(match.id)}/confirm/retract`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(side ? { side } : {}) });
+      }, "Confirmation retracted."));
+      confirmationSection.append(retract);
+    }
+    if (permissions.canRaiseDispute === true) {
       const disputeForm = document.createElement("form");
       disputeForm.className = "match-dispute-form";
       const reasonField = textElement("label", "match-field");
@@ -435,7 +461,7 @@ if (page) {
       confirmationSection.append(disputeForm);
     }
     if (match.status === "completed") confirmationSection.append(textElement("p", "match-final-note", "This result is final. Confirmations and score changes remain in the audit history."));
-    if (signedIn && result.permissions?.canFinalize === true && confirmed.length === 2 && match.status === "awaiting_confirmation") {
+    if (permissions.canFinalize === true && confirmed.length === 2 && match.status === "awaiting_confirmation") {
       const finalize = textElement("button", "button button-gold", "Finalize result"); finalize.type = "button";
       finalize.addEventListener("click", () => mutate(async () => {
         await request(`/api/matches/${encodeURIComponent(match.id)}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
@@ -444,7 +470,7 @@ if (page) {
     }
     detail.append(confirmationSection);
 
-    if (signedIn) {
+    if (permissions.canViewAudit === true) {
       const audit = textElement("details", "match-audit-panel");
       audit.append(textElement("summary", "", "Match activity history"));
       const auditContent = textElement("ol", "match-audit-list", "Loading activity…");

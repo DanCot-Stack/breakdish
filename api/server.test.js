@@ -91,13 +91,32 @@ test("match API keeps public reads available and requires an authenticated user 
   }
 });
 
-test("Match Centre shows finalization only when the server grants the viewer permission", async () => {
+test("Match Centre renders controls only from server-granted match permissions", async () => {
   const matchScript = await readFile(new URL("../match.js", import.meta.url), "utf8");
   const matchStoreScript = await readFile(new URL("./match-store.js", import.meta.url), "utf8");
-  assert.match(matchScript, /signedIn\s*&&\s*result\.permissions\?\.canFinalize\s*===\s*true\s*&&\s*confirmed\.length\s*===\s*2/,
+  assert.match(matchScript, /permissions\.canFinalize\s*===\s*true\s*&&\s*confirmed\.length\s*===\s*2/,
     "The finalization control requires both server authorization and two confirmed sides.");
-  assert.match(matchScript, /confirmed\.length\s*&&\s*retractableSides\.length/,
-    "Retraction controls are shown only when the API says at least one confirmed side is retractable by this viewer.");
+  assert.match(matchScript, /const canManagePlayers\s*=\s*permissions\.canScore\s*===\s*true\s*&&\s*match\.status\s*===\s*"in_progress"\s*&&\s*frame\.status\s*!==\s*"completed"/,
+    "Authorized match scorers can manage any unfinished frame after the match starts.");
+  assert.match(matchScript, /const canEditFrameResult\s*=\s*canScore\s*&&\s*\(isCurrent\s*\|\|\s*frame\.status\s*===\s*"completed"\)/,
+    "Upcoming frame result forms are withheld until the frame is current; authorized completed-frame corrections remain available while live.");
+  assert.match(matchScript, /if\s*\(canEditFrameResult\)\s*\{[\s\S]*?score-frame-result-form/,
+    "Frame result and Dish controls are rendered only when the server grants scoring permission.");
+  assert.match(matchScript, /permissions\.canStart\s*===\s*true/,
+    "Start Match is rendered only when the API grants start permission.");
+  assert.match(matchScript, /permissions\.canRaiseDispute\s*===\s*true/,
+    "Dispute entry is rendered only when the API grants match-participant permission.");
+  assert.match(matchScript, /permissions\.canViewAudit\s*===\s*true/,
+    "Audit history is rendered only when the API grants access.");
+  assert.match(matchScript, /Player selections for this upcoming frame are not published yet/);
+  assert.match(matchScript, /frame\.playersVisible\s*===\s*true/,
+    "The public UI renders player names only when the API marks a frame selection visible.");
+  assert.doesNotMatch(matchScript, /signedIn\s*&&\s*match\.status\s*===\s*"in_progress"/,
+    "A signed-in session alone never grants scoreboard controls.");
+  assert.match(matchScript, /SCHEDULED · This match has not started yet/,
+    "Scheduled fixtures are clearly described as not started.");
+  assert.match(matchScript, /if\s*\(retractableSides\.length\)/,
+    "Retraction controls are rendered only when the API grants a retractable side.");
   assert.match(matchScript, /Retract this side's confirmation/,
     "The interface describes confirmation as a side-level action.");
   const operatorStart = matchStoreScript.indexOf("async function canOperateMatch");

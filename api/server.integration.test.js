@@ -1672,6 +1672,11 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     const matchUnderTest = await createTeamMatch();
     const untouchedFutureMatch = await createTeamMatch();
+    response = await fetchFromSite(`/api/leagues/${approval.league.id}/members/${sixthProfile.userId}/role`, {
+      method: "PATCH", headers: { cookie: firstUserCookie, "content-type": "application/json" },
+      body: JSON.stringify({ role: "administrator" })
+    });
+    assert.equal(response.status, 200, "A league manager can assign an audit-view-only organiser for the scoreboard privacy test.");
     response = await matchPostJson(`/api/matches/${untouchedFutureMatch.id}/start`, "", {});
     assert.equal(response.status, 401, "Anonymous visitors cannot start a scheduled match.");
     const nonCompetingMatch = await matchPostJson("/api/matches", firstUserCookie, {
@@ -1701,9 +1706,25 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 400, "A team cannot be scheduled to play itself.");
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
     assert.equal(response.status, 200, await response.clone().text());
+    assert.match(response.headers.get("cache-control") || "", /no-store/i,
+      "Public and viewer-scoped match details are not cached.");
     let matchDetail = await response.json();
     assert.equal(matchDetail.match.type, "team_league");
     assert.equal(matchDetail.frames.length, 5);
+    assert.equal(matchDetail.match.status, "scheduled");
+    assert.equal(matchDetail.permissions.canOperate, false, "Anonymous scheduled-match viewers receive no operator permission.");
+    assert.equal(matchDetail.permissions.canStart, false);
+    assert.equal(matchDetail.permissions.canScore, false);
+    assert.ok(matchDetail.frames.every((frame) => frame.playersVisible === false && frame.players.length === 0),
+      "Scheduled match details expose no unpublished frame selections.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).permissions.canStart, true,
+      "A registered player in a competing team may operate and start their scheduled fixture.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: fifthUserCookie } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).permissions.canOperate, false,
+      "An unrelated signed-in user receives a spectator-only scheduled match view.");
     assert.deepEqual(matchDetail.frames.map((frame) => frame.type), formatV1Frames.map((frame) => frame.type));
     const storedSnapshot = await database.query(
       `SELECT s.template_version, count(sf.frame_number)::integer AS frame_count
@@ -1804,6 +1825,8 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 401, "Eligible-player reads require a session.");
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/eligible-players?side=1`, { headers: { cookie: firstUserCookie } });
     assert.equal(response.status, 200);
+    assert.match(response.headers.get("cache-control") || "", /no-store/i,
+      "Match-specific eligible-player lists are not cached.");
     const eligibleHomePlayers = (await response.json()).players;
     assert.deepEqual(eligibleHomePlayers.map((player) => player.userId).sort(), [firstUserId, secondProfile.userId].sort(),
       "Team scoreboard choices come only from active registrations to the correct team.");
@@ -1819,6 +1842,20 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200, "A registered player from either competing team can start the scoreboard.");
     const startedDetail = await response.json();
     assert.ok(Number.isFinite(Date.parse(startedDetail.match.startedAt)), "The server stores the canonical match start timestamp.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).permissions.canScore, true,
+      "The authorized competing player receives the server scoring capability on the detail response.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: fifthUserCookie } });
+    assert.equal(response.status, 200);
+    let spectatorMatchDetail = await response.json();
+    assert.equal(spectatorMatchDetail.permissions.canOperate, false);
+    assert.equal(spectatorMatchDetail.permissions.canScore, false,
+      "An unrelated signed-in user remains unable to operate an in-progress match.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, "", { outcome: "played", winnerSide: 1 });
+    assert.equal(response.status, 401, "Anonymous spectators cannot submit a score directly to the API.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, fifthUserCookie, { outcome: "played", winnerSide: 1 });
+    assert.equal(response.status, 403, "An unrelated signed-in spectator cannot submit a score directly to the API.");
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, fifthUserCookie, { outcome: "played", winnerSide: 1 });
     assert.equal(response.status, 403, "A Platform Admin outside the competing sides cannot record a frame score.");
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, firstUserCookie, {});
@@ -1860,6 +1897,8 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const setFrameSide = async (matchId, frame, side, selection) => {
       const result = await matchPutJson(`/api/matches/${matchId}/frames/${frame}/players`, firstUserCookie, { side, ...selection });
       assert.equal(result.status, 200, await result.clone().text());
+      assert.match(result.headers.get("cache-control") || "", /no-store/i,
+        "Mutation responses containing viewer-scoped selection data are not cached.");
       return result.json();
     };
     const setFrameSideAs = async (matchId, frame, side, selection, cookie) => {
@@ -1872,10 +1911,67 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       assert.equal(result.status, 200, await result.clone().text());
       return result.json();
     };
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/2/players`, "", { side: 1, bye: true, players: [] });
+    assert.equal(response.status, 401, "Anonymous spectators cannot submit future-frame player selections.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/2/players`, fifthUserCookie, { side: 1, bye: true, players: [] });
+    assert.equal(response.status, 403, "An unrelated signed-in spectator cannot submit future-frame player selections.");
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/players`, firstUserCookie, { side: 1, players: [fifthProfile.userId] });
     assert.equal(response.status, 409, "A scorer cannot select a registered player from Team C for Team A's frame side.");
     await setFrameSide(matchUnderTest.id, 1, 1, { players: [firstUserId] });
     await setFrameSideAs(matchUnderTest.id, 1, 2, { players: [thirdProfile.userId] }, thirdUserCookie);
+    const futureSelection = await setFrameSide(matchUnderTest.id, 2, 1, { bye: true, players: [] });
+    assert.equal(futureSelection.frames[1].playersVisible, true,
+      "A match-authorized player's mutation response confirms their saved future-frame selection.");
+    assert.ok(futureSelection.frames[1].players.some((player) => player.isBye),
+      "Authorized players can see the Bye saved for an upcoming frame.");
+    const updatedFutureSelection = await setFrameSide(matchUnderTest.id, 2, 2, { players: [fourthProfile.userId] });
+    assert.ok(updatedFutureSelection.frames[1].players.some((player) => player.userId === fourthProfile.userId),
+      "Authorized players can prepare, save and verify selections for an upcoming frame.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/audit`, { headers: { cookie: firstUserCookie } });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("cache-control") || "", /no-store/i,
+      "Private match audit history is not cached.");
+    const privateAudit = await response.json();
+    const upcomingSelectionEvents = privateAudit.events.filter((event) => event.action_type === "player_selection_changed" && event.frame_number === 2);
+    assert.ok(upcomingSelectionEvents.length, "Future player selection changes remain auditable.");
+    assert.ok(upcomingSelectionEvents.some((event) => JSON.stringify(event.new_value).includes(fourthProfile.userId)),
+      "A match-authorized participant can review their future selections in the audit history.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/audit`, { headers: { cookie: sixthUserCookie } });
+    assert.equal(response.status, 200, "A league organiser outside the match retains its audit-view permission.");
+    assert.match(response.headers.get("cache-control") || "", /no-store/i,
+      "Organiser audit responses are not cached.");
+    const organizerAudit = await response.json();
+    const organizerUpcomingEvents = organizerAudit.events.filter((event) => event.action_type === "player_selection_changed" && event.frame_number === 2);
+    assert.ok(organizerUpcomingEvents.length);
+    assert.ok(organizerUpcomingEvents.every((event) => event.previous_value === null && event.new_value === null),
+      "An organiser without match-scoring permission cannot view confidential future selections in the audit API.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    spectatorMatchDetail = await response.json();
+    assert.equal(spectatorMatchDetail.frames[0].playersVisible, true,
+      "The active frame's player selections are public to spectators.");
+    assert.equal(spectatorMatchDetail.frames[1].playersVisible, false);
+    assert.deepEqual(spectatorMatchDetail.frames[1].players, [],
+      "Anonymous detail responses omit upcoming player IDs and names even after they are selected.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: fifthUserCookie } });
+    spectatorMatchDetail = await response.json();
+    assert.deepEqual(spectatorMatchDetail.frames[1].players, [],
+      "Unrelated authenticated viewers receive the same redacted upcoming-frame response.");
+    response = await fetchFromSite("/api/matches/live");
+    livePayload = await response.json();
+    liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
+    assert.equal(liveFixture.currentFrame.number, 1,
+      "The public Live Matches feed continues to expose only the active frame.");
+    assert.doesNotMatch(JSON.stringify(liveFixture.currentFrame), new RegExp(fourthProfile.userId),
+      "The public Live Matches response does not leak an unpublished future-frame selection.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: sixthUserCookie } });
+    const organizerMatchDetail = await response.json();
+    assert.equal(organizerMatchDetail.permissions.canScore, false,
+      "League organiser authority does not grant match-scoring permission.");
+    assert.equal(organizerMatchDetail.permissions.canOperate, false,
+      "The audit-view-only organiser is not a registered player on either side.");
+    assert.equal(organizerMatchDetail.frames[1].playersVisible, false,
+      "Organisers without match-scoring permission do not see confidential upcoming selections.");
+    assert.deepEqual(organizerMatchDetail.frames[1].players, []);
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/players`, thirdUserCookie, { side: 2, players: [firstUserId] });
     assert.equal(response.status, 409, "A scorer cannot move a competing player onto the wrong side.");
     response = await fetchFromSite("/api/matches/live");
@@ -1889,8 +1985,18 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
     assert.deepEqual([liveFixture.homeScore, liveFixture.awayScore], [1, 0], "The live score comes from completed frame results.");
     assert.equal(liveFixture.currentFrame.number, 2, "Completing a frame advances the live current-frame display.");
-    await setFrameSide(matchUnderTest.id, 2, 1, { bye: true, players: [] });
-    await setFrameSide(matchUnderTest.id, 2, 2, { players: [fourthProfile.userId] });
+    assert.equal(liveFixture.currentFrame.playersVisible, undefined,
+      "The live-list current-frame contract remains its existing compact public shape.");
+    assert.ok(futureSelection.frames[1].players.some((player) => player.isBye),
+      "An earlier authorized mutation response remains an immutable snapshot of its saved upcoming Bye.");
+    assert.equal(futureSelection.frames[1].players.some((player) => player.userId === fourthProfile.userId), false,
+      "Later opponent selections do not appear retroactively in that earlier response snapshot.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    const advancedDetail = await response.json();
+    assert.equal(advancedDetail.frames[1].playersVisible, true,
+      "Selections become visible when their frame advances to current.");
+    assert.deepEqual(advancedDetail.frames[1].players.map((player) => player.name).filter(Boolean).sort(), [fourthProfile.displayName].sort(),
+      "The newly current frame identifies its selected participant accurately.");
     await recordFrame(matchUnderTest.id, 2, { outcome: "bye" });
     await setFrameSide(matchUnderTest.id, 3, 1, { players: [firstUserId, secondProfile.userId] });
     await setFrameSide(matchUnderTest.id, 3, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
@@ -1917,7 +2023,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: thirdUserCookie } });
     assert.equal((await response.json()).permissions.canFinalize, true, "A registered player on a competing side can finalize.");
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: secondUserCookie } });
-    assert.equal((await response.json()).permissions.canFinalize, true, "An active league administrator can finalize as an explicitly authorised organiser.");
+    const organizerPermissions = (await response.json()).permissions;
+    assert.equal(organizerPermissions.canFinalize, true, "An active league administrator can finalize as an explicitly authorised organiser.");
+    assert.equal(organizerPermissions.canScore, false, "Organizer finalization permission does not grant scoring rights.");
+    assert.equal(organizerPermissions.canOperate, false, "An organizer outside the match remains in read-only scoreboard mode.");
     response = await fetchFromSite("/api/matches/live");
     assert.ok(!(await response.json()).matches.some((item) => item.id === matchUnderTest.id),
       "A match leaves the Live Matches feed as soon as it moves to awaiting confirmation.");
@@ -1967,6 +2076,13 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       "Concurrent participant/organiser finalization permits one transition and rejects the stale request.");
     matchDetail = await concurrentFinalizations.find((item) => item.status === 200).json();
     assert.equal(matchDetail.match.status, "completed");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    const completedPublicDetail = await response.json();
+    assert.equal(completedPublicDetail.permissions.canScore, false, "A completed match is read-only even for a competing player.");
+    assert.ok(completedPublicDetail.frames.every((frame) => frame.playersVisible === true),
+      "Completed matches retain public frame participants for historical review.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, thirdUserCookie, { outcome: "played", winnerSide: 2 });
+    assert.equal(response.status, 403, "A regular competing player cannot mutate a completed result through the scorer endpoint.");
     response = await fetchFromSite("/api/matches/live");
     assert.ok(!(await response.json()).matches.some((item) => item.id === matchUnderTest.id),
       "Completed matches do not remain in the Live Matches feed.");
@@ -2240,6 +2356,16 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.deepEqual(liveSinglesMatch.currentFrame.players.map((player) => player.name), [profile.displayName, "Second Player Updated"]);
     response = await matchPutJson(`/api/matches/${singlesMatch.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1 });
     assert.equal(response.status, 200, await response.clone().text());
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes`, "", { reason: "Anonymous dispute attempt" });
+    assert.equal(response.status, 401, "Anonymous viewers cannot raise a match dispute through the API.");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes`, thirdUserCookie, { reason: "Unrelated organiser dispute attempt" });
+    assert.equal(response.status, 403, "An organiser who is not a competing player cannot raise a match dispute.");
+    response = await fetchFromSite(`/api/matches/${singlesMatch.id}`, { headers: { cookie: secondUserCookie } });
+    assert.equal((await response.json()).permissions.canScore, false,
+      "League-organiser status does not grant Singles League scoring permission.");
+    response = await fetchFromSite(`/api/matches/${singlesMatch.id}`, { headers: { cookie: thirdUserCookie } });
+    assert.equal((await response.json()).permissions.canRaiseDispute, false,
+      "An unrelated organiser is not granted dispute controls by their role.");
     response = await matchPostJson(`/api/matches/${singlesMatch.id}/disputes`, secondUserCookie, { reason: "Local integration dispute test" });
     assert.equal(response.status, 201, await response.clone().text());
     const disputedMatch = await response.json();
