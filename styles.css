@@ -3537,6 +3537,21 @@ td:first-child {
   line-height: 1.25;
 }
 
+.match-test-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  margin-top: 10px;
+  padding: 6px 10px;
+  border: 1px solid rgba(213, 177, 107, .72);
+  background: rgba(92, 20, 37, .42);
+  color: #ffe2a1;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  line-height: 1.3;
+}
+
 .match-state-tag {
   border-color: rgba(242, 234, 219, .2);
   color: var(--cream);

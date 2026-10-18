@@ -786,7 +786,7 @@ function createApp({
       const session = await matchSession(req);
       const matches = await (await matchStore()).listMatches(
         { status: "in_progress" }, session?.user.id || null,
-        { includeCurrentFrame: true, unlimited: true }
+        { includeCurrentFrame: true, unlimited: true, excludeTestOnly: true }
       );
       res.set("Cache-Control", "no-store, max-age=0");
       return res.json({ matches, serverTime: new Date().toISOString() });
@@ -799,7 +799,37 @@ function createApp({
     try {
       const session = await matchSession(req);
       if (!session) return res.status(401).json({ error: "Sign in to create a match." });
-      const match = await (await matchStore()).createMatch(session.user.id, asRecord(req.body));
+      const details = asRecord(req.body);
+      if (Object.hasOwn(details, "testOnly") || Object.hasOwn(details, "testRequestKey")) {
+        return res.status(400).json({ error: "Test-only status can only be assigned through the protected test-practice endpoint." });
+      }
+      const match = await (await matchStore()).createMatch(session.user.id, details);
+      return res.status(201).json(match);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post("/api/platform/test-practice-matches", matchMutationLimiter, async (req, res, next) => {
+    try {
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in as the BREAK DISH Super Admin to create a test match." });
+      const details = asRecord(req.body);
+      if (details.type != null && details.type !== "practice") {
+        return res.status(400).json({ error: "This endpoint creates Practice Matches only." });
+      }
+      if (!isUuid(req.get("Idempotency-Key"))) {
+        return res.status(400).json({ error: "A unique UUID Idempotency-Key is required for this test match." });
+      }
+      if (Object.hasOwn(details, "testOnly") || Object.hasOwn(details, "testRequestKey")) {
+        return res.status(400).json({ error: "Test-only status is assigned by this protected endpoint." });
+      }
+      await (await getPlatformRoleStore()).requireSuperAdmin(session.user.id);
+      const match = await (await matchStore()).createMatch(
+        session.user.id,
+        { ...details, type: "practice" },
+        { testOnly: true, idempotencyKey: req.get("Idempotency-Key") }
+      );
       return res.status(201).json(match);
     } catch (error) {
       return next(error);

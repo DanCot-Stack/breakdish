@@ -11,6 +11,7 @@ import * as doublesLeagueSidesMigration from "./migrations/008_doubles_league_ma
 import * as fixtureRoundNumbersMigration from "./migrations/009_fixture_round_numbers.js";
 import * as platformRolesMigration from "./migrations/010_platform_roles.js";
 import * as backupSuperAdminMigration from "./migrations/011_backup_super_admin.js";
+import * as testOnlyPracticeMatchesMigration from "./migrations/012_test_only_practice_matches.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -309,4 +310,35 @@ test("migration 011 preserves the founder and enforces one auditable recovery Su
   const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
   assert.match(downSql, /Cannot roll back migration 011 after a recovery Super Admin assignment has been recorded/);
   assert.match(downSql, /CREATE UNIQUE INDEX platform_roles_single_super_admin/);
+});
+
+test("migration 012 protects immutable Super Admin-only test Practice Matches and excludes them from statistics", () => {
+  const upCalls = [];
+  testOnlyPracticeMatchesMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+  assert.ok(upCalls.some(({ operation, args }) => operation === "addColumn" && args[0] === "matches"
+    && args[1].test_only?.default === false && args[1].test_only?.notNull === true),
+  "Existing matches default to normal, non-test history.");
+  assert.ok(upCalls.some(({ operation, args }) => operation === "addConstraint"
+    && args[0] === "matches" && args[1] === "matches_test_only_practice_only"
+    && args[2].check.includes("match_type = 'practice'")));
+  assert.ok(upCalls.some(({ operation, args }) => operation === "createIndex"
+    && args[0] === "matches" && args[2].unique && args[2].where === "test_only"),
+  "Test request keys are unique to prevent concurrent or repeated duplicate test creation.");
+  const upSql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(upSql, /role = 'super_admin'/);
+  assert.match(upSql, /matches_test_only_immutable/);
+  assert.match(upSql, /m\.test_only = false/);
+  assert.match(upSql, /JOIN matches m ON m\.id = mp\.match_id AND m\.test_only = false/);
+  assert.match(upSql, /CREATE VIEW match_scoreboard AS[\s\S]*m\.test_only/);
+
+  const downCalls = [];
+  testOnlyPracticeMatchesMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back migration 012 while test-only match records exist/,
+    "Rollback must retain test match records and their audit history.");
+  assert.match(downSql, /CREATE VIEW match_scoreboard AS/);
 });

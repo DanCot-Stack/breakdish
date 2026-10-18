@@ -124,6 +124,7 @@ if (page) {
         textElement("span", "match-category-tag", labels[match.type] || "Match"),
         textElement("span", `match-state-tag is-${match.status}`, previousMatches ? "Final" : match.status.replaceAll("_", " "))
       );
+      if (match.testOnly === true) header.append(textElement("strong", "match-test-label", "TEST MATCH — EXCLUDED FROM STATISTICS"));
       const name = textElement("h3", "", matchLabel(match));
       const competition = previousMatches && (match.leagueName || match.tournamentName)
         ? textElement("p", "match-list-meta", [match.leagueName || match.tournamentName, match.divisionName].filter(Boolean).join(" · "))
@@ -159,6 +160,9 @@ if (page) {
       textElement("h2", "", matchLabel(match)),
       textElement("p", "match-list-meta", `${formatDate(match.scheduledAt)}${match.venue ? ` · ${match.venue}` : ""}`)
     );
+    if (match.testOnly === true) {
+      identity.append(textElement("strong", "match-test-label", "TEST MATCH — EXCLUDED FROM STATISTICS"));
+    }
     if (match.status === "in_progress") identity.append(textElement("span", "live-indicator", "LIVE"));
     if (match.startedAt) {
       const timer = textElement("time", "live-match-timer match-scoreboard-timer");

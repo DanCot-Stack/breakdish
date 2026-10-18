@@ -634,6 +634,7 @@ function toMatch(row) {
     type: row.match_type,
     status: row.status,
     isOfficial: row.is_official,
+    testOnly: row.test_only === true,
     leagueId: row.league_id,
     seasonId: row.season_id,
     divisionId: row.division_id,
@@ -863,6 +864,7 @@ export function createMatchStore(database) {
           if (!MATCH_STATUSES.has(filters.status)) invalid("Choose a supported match status.");
           values.push(filters.status); clauses.push(`sb.status = $${values.length}`);
         }
+        if (options.excludeTestOnly === true) clauses.push("m.test_only = false");
         if (options.historicResults === true) {
           clauses.push(`sb.status = 'completed'
             AND sb.is_official = true
@@ -1340,9 +1342,16 @@ export function createMatchStore(database) {
       });
     },
 
-    async createMatch(actorId, details) {
+    async createMatch(actorId, details, options = {}) {
       const type = details.type;
       if (!MATCH_TYPES.has(type)) invalid("Choose a supported match category.");
+      if (Object.hasOwn(details, "testOnly") || Object.hasOwn(details, "testRequestKey")) {
+        invalid("Test-only matches must be created through the Super Admin test-practice endpoint.");
+      }
+      const testOnly = options.testOnly === true;
+      if (testOnly && type !== "practice") invalid("Only a Practice Match can be marked test-only.");
+      const testRequestKey = testOnly ? cleanUuid(options.idempotencyKey, "idempotency key") : null;
+      if (!testOnly && options.idempotencyKey != null) invalid("An idempotency key is reserved for Super Admin test-only Practice Matches.");
       const scheduledAt = details.scheduledAt === undefined || details.scheduledAt === null || details.scheduledAt === ""
         ? null : new Date(details.scheduledAt);
       if (scheduledAt && Number.isNaN(scheduledAt.getTime())) invalid("Enter a valid fixture date and time.");
@@ -1352,12 +1361,22 @@ export function createMatchStore(database) {
       const venue = typeof details.venue === "string" ? details.venue.trim() || null : null;
 
       return withTransaction(database, actorId, async (client) => {
+        if (testOnly) {
+          const superAdmin = await client.query(
+            "SELECT 1 FROM platform_roles WHERE user_id = $1 AND role = 'super_admin'",
+            [actorId]
+          );
+          if (!superAdmin.rows[0]) throw new LeagueStoreError(403, "Only a verified BREAK DISH Super Admin can create a test-only Practice Match.");
+        }
         let leagueId = details.leagueId ? cleanUuid(details.leagueId, "league ID") : null;
         let seasonId = details.seasonId ? cleanUuid(details.seasonId, "season ID") : null;
         let divisionId = details.divisionId ? cleanUuid(details.divisionId, "division ID") : null;
         let homeTeamId = details.homeTeamId ? cleanUuid(details.homeTeamId, "home team ID") : null;
         let awayTeamId = details.awayTeamId ? cleanUuid(details.awayTeamId, "away team ID") : null;
         let tournamentEventId = details.tournamentEventId ? cleanUuid(details.tournamentEventId, "tournament event ID") : null;
+        if (testOnly && (leagueId || seasonId || divisionId || homeTeamId || awayTeamId || tournamentEventId)) {
+          invalid("Test-only Practice Matches must be standalone and cannot link to a competition or team.");
+        }
         let template = null;
         let frameList;
         let doublesEntries = null;
@@ -1466,9 +1485,9 @@ export function createMatchStore(database) {
 
         const insert = await client.query(
           `INSERT INTO matches(match_type, league_id, season_id, division_id, home_team_id, away_team_id,
-             tournament_event_id, scheduled_at, venue, created_by)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-          [type, leagueId, seasonId, divisionId, homeTeamId, awayTeamId, tournamentEventId, scheduledAt, venue, actorId]
+             tournament_event_id, scheduled_at, venue, created_by, test_only, test_request_key)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+          [type, leagueId, seasonId, divisionId, homeTeamId, awayTeamId, tournamentEventId, scheduledAt, venue, actorId, testOnly, testRequestKey]
         );
         const matchId = insert.rows[0].id;
         if (type === "doubles_league") {

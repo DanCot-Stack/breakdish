@@ -53,7 +53,7 @@ test("match API keeps public reads available and requires an authenticated user 
     const livePayload = await response.json();
     assert.deepEqual(livePayload.matches, [liveMatch]);
     assert.ok(Number.isFinite(Date.parse(livePayload.serverTime)), "Live responses include a server clock for consistent elapsed timers.");
-    assert.deepEqual(calls.at(-1), ["list", { status: "in_progress" }, null, { includeCurrentFrame: true, unlimited: true }]);
+    assert.deepEqual(calls.at(-1), ["list", { status: "in_progress" }, null, { includeCurrentFrame: true, unlimited: true, excludeTestOnly: true }]);
 
     response = await request("/api/matches/live", { headers: { "x-test-session": "player-1" } });
     assert.equal(response.status, 200);
@@ -91,9 +91,88 @@ test("match API keeps public reads available and requires an authenticated user 
   }
 });
 
+test("test-only Practice Match creation is Super Admin-only and cannot be requested through the ordinary match endpoint", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  const { createApp } = await import("./server.js");
+  const calls = [];
+  const store = {
+    async createMatch(actorId, details, options) {
+      calls.push([actorId, details, options]);
+      return { match: { id: "test-match", type: details.type, testOnly: options.testOnly } };
+    }
+  };
+  const auth = { api: { async getSession({ headers }) {
+    const id = headers.get("x-test-session");
+    return id ? { user: { id } } : null;
+  } } };
+  const roleStore = { async requireSuperAdmin(userId) {
+    if (userId !== "super-admin") throw new PlatformRoleError(403, "This action requires the BREAK DISH Super Admin.");
+  } };
+  const app = createApp({
+    getAuthInstance: async () => auth,
+    getMatchStore: async () => store,
+    getPlatformRoleStore: async () => roleStore
+  });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const request = (path, options = {}) => fetch(`${base}${path}`, {
+    ...options,
+    headers: { origin: "http://localhost:5500", "content-type": "application/json", ...(options.headers || {}) }
+  });
+  const key = "123e4567-e89b-42d3-a456-426614174099";
+  const body = JSON.stringify({ participants: [{ userId: "player-a", side: 1 }, { userId: "player-b", side: 2 }], frames: [{ type: "singles" }] });
+  try {
+    let response = await request("/api/platform/test-practice-matches", { method: "POST", body });
+    assert.equal(response.status, 401);
+    response = await request("/api/platform/test-practice-matches", {
+      method: "POST", headers: { "x-test-session": "ordinary-player", "Idempotency-Key": key }, body
+    });
+    assert.equal(response.status, 403);
+    response = await request("/api/platform/test-practice-matches", {
+      method: "POST", headers: { "x-test-session": "platform-admin", "Idempotency-Key": key }, body
+    });
+    assert.equal(response.status, 403, "Platform Admin does not satisfy the Super Admin creation requirement.");
+    response = await request("/api/platform/test-practice-matches", {
+      method: "POST", headers: { "x-test-session": "super-admin" }, body
+    });
+    assert.equal(response.status, 400, "The protected endpoint requires a unique idempotency key.");
+    response = await request("/api/platform/test-practice-matches", {
+      method: "POST", headers: { "x-test-session": "super-admin", "Idempotency-Key": key },
+      body: JSON.stringify({ type: "money_match" })
+    });
+    assert.equal(response.status, 400, "The protected endpoint cannot be redirected to another match category.");
+    response = await request("/api/platform/test-practice-matches", {
+      method: "POST", headers: { "x-test-session": "super-admin", "Idempotency-Key": key },
+      body: JSON.stringify({ testOnly: false })
+    });
+    assert.equal(response.status, 400, "Clients cannot set the protected marker themselves.");
+    response = await request("/api/matches", {
+      method: "POST", headers: { "x-test-session": "super-admin" },
+      body: JSON.stringify({ type: "practice", testOnly: true })
+    });
+    assert.equal(response.status, 400, "The ordinary match endpoint does not expose a test-only switch.");
+    assert.equal(calls.length, 0, "Rejected requests never reach match creation.");
+
+    response = await request("/api/platform/test-practice-matches", {
+      method: "POST", headers: { "x-test-session": "super-admin", "Idempotency-Key": key }, body
+    });
+    assert.equal(response.status, 201);
+    assert.deepEqual(calls[0], ["super-admin", {
+      participants: [{ userId: "player-a", side: 1 }, { userId: "player-b", side: 2 }],
+      frames: [{ type: "singles" }], type: "practice"
+    }, { testOnly: true, idempotencyKey: key }]);
+    assert.equal((await response.json()).match.testOnly, true);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("Match Centre renders controls only from server-granted match permissions", async () => {
   const matchScript = await readFile(new URL("../match.js", import.meta.url), "utf8");
   const matchStoreScript = await readFile(new URL("./match-store.js", import.meta.url), "utf8");
+  const stylesheet = await readFile(new URL("../styles.css", import.meta.url), "utf8");
   assert.match(matchScript, /permissions\.canFinalize\s*===\s*true\s*&&\s*confirmed\.length\s*===\s*2/,
     "The finalization control requires both server authorization and two confirmed sides.");
   assert.match(matchScript, /const canManagePlayers\s*=\s*permissions\.canScore\s*===\s*true\s*&&\s*match\.status\s*===\s*"in_progress"\s*&&\s*frame\.status\s*!==\s*"completed"/,
@@ -115,6 +194,10 @@ test("Match Centre renders controls only from server-granted match permissions",
     "A signed-in session alone never grants scoreboard controls.");
   assert.match(matchScript, /SCHEDULED · This match has not started yet/,
     "Scheduled fixtures are clearly described as not started.");
+  assert.match(matchScript, /TEST MATCH — EXCLUDED FROM STATISTICS/,
+    "Authorized viewers receive a prominent test-only exclusion label.");
+  assert.match(stylesheet, /\.match-test-label\s*\{[^}]*background:[^}]*color:/s,
+    "The test-only label has explicit contrast styling in the site palette.");
   assert.match(matchScript, /if\s*\(retractableSides\.length\)/,
     "Retraction controls are rendered only when the API grants a retractable side.");
   assert.match(matchScript, /Retract this side's confirmation/,
