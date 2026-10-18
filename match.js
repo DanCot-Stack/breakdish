@@ -381,10 +381,13 @@ if (page) {
     confirmationSection.append(textElement("h3", "", "Result confirmation"));
     const latest = latestConfirmations(result.confirmations);
     const confirmed = [1, 2].filter((side) => latest.get(side)?.action === "confirmed");
+    const retractableSides = Array.isArray(result.permissions?.retractableSides) ? result.permissions.retractableSides.map(Number) : [];
     confirmationSection.append(textElement("p", "", `${sideName(match, 1)}: ${latest.get(1)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"} · ${sideName(match, 2)}: ${latest.get(2)?.action === "confirmed" ? "confirmed" : "awaiting confirmation"}`));
     if (signedIn && ["awaiting_confirmation", "disputed"].includes(match.status)) {
+      let confirmationSideSelect = null;
       if (match.type === "team_league") {
         const sideField = makeSelect("Team side to confirm", [{ value: "1", label: sideName(match, 1) }, { value: "2", label: sideName(match, 2) }], "1");
+        confirmationSideSelect = sideField.select;
         const confirm = textElement("button", "button button-gold", "Confirm result for selected side");
         confirm.type = "button";
         confirm.addEventListener("click", () => mutate(async () => {
@@ -399,11 +402,17 @@ if (page) {
         }, "Confirmation recorded."));
         confirmationSection.append(confirm);
       }
-      if (confirmed.length) {
-        const retract = textElement("button", "button button-quiet", "Retract my confirmation");
+      if (confirmed.length && retractableSides.length) {
+        const retract = textElement("button", "button button-quiet", "Retract this side's confirmation");
         retract.type = "button";
+        const updateRetractionVisibility = () => {
+          const selectedSide = match.type === "team_league" ? Number(confirmationSideSelect?.value) : retractableSides[0];
+          retract.hidden = !retractableSides.includes(selectedSide);
+        };
+        confirmationSideSelect?.addEventListener("change", updateRetractionVisibility);
+        updateRetractionVisibility();
         retract.addEventListener("click", () => mutate(async () => {
-          const side = match.type === "team_league" ? Number(confirmationSection.querySelector("select")?.value) : undefined;
+          const side = match.type === "team_league" ? Number(confirmationSideSelect?.value) : undefined;
           await request(`/api/matches/${encodeURIComponent(match.id)}/confirm/retract`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(side ? { side } : {}) });
         }, "Confirmation retracted."));
         confirmationSection.append(retract);
@@ -426,7 +435,7 @@ if (page) {
       confirmationSection.append(disputeForm);
     }
     if (match.status === "completed") confirmationSection.append(textElement("p", "match-final-note", "This result is final. Confirmations and score changes remain in the audit history."));
-    if (confirmed.length === 2 && match.status === "awaiting_confirmation") {
+    if (signedIn && result.permissions?.canFinalize === true && confirmed.length === 2 && match.status === "awaiting_confirmation") {
       const finalize = textElement("button", "button button-gold", "Finalize result"); finalize.type = "button";
       finalize.addEventListener("click", () => mutate(async () => {
         await request(`/api/matches/${encodeURIComponent(match.id)}/finalize`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });

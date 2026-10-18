@@ -91,6 +91,25 @@ test("match API keeps public reads available and requires an authenticated user 
   }
 });
 
+test("Match Centre shows finalization only when the server grants the viewer permission", async () => {
+  const matchScript = await readFile(new URL("../match.js", import.meta.url), "utf8");
+  const matchStoreScript = await readFile(new URL("./match-store.js", import.meta.url), "utf8");
+  assert.match(matchScript, /signedIn\s*&&\s*result\.permissions\?\.canFinalize\s*===\s*true\s*&&\s*confirmed\.length\s*===\s*2/,
+    "The finalization control requires both server authorization and two confirmed sides.");
+  assert.match(matchScript, /confirmed\.length\s*&&\s*retractableSides\.length/,
+    "Retraction controls are shown only when the API says at least one confirmed side is retractable by this viewer.");
+  assert.match(matchScript, /Retract this side's confirmation/,
+    "The interface describes confirmation as a side-level action.");
+  const operatorStart = matchStoreScript.indexOf("async function canOperateMatch");
+  const organizerStart = matchStoreScript.indexOf("async function hasMatchOrganizerPermission", operatorStart);
+  assert.ok(operatorStart >= 0 && organizerStart > operatorStart, "Match operator authorization remains a distinct policy.");
+  const operatorPolicy = matchStoreScript.slice(operatorStart, organizerStart);
+  assert.match(operatorPolicy, /team_registrations/);
+  assert.match(operatorPolicy, /match_participants/);
+  assert.doesNotMatch(operatorPolicy, /platform_roles|super_admin|platform_admin|referee/i,
+    "Platform and referee roles do not grant live scoring permission.");
+});
+
 test("historic results API provides the public league to season to final-results routes", async () => {
   process.env.ALLOWED_ORIGINS = "http://localhost:5500";
   const { createApp } = await import("./server.js");

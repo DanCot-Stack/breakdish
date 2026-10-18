@@ -119,6 +119,123 @@ async function canOperateMatch(client, match, actorId, allowedStatuses = ["sched
   return Boolean(result.rows[0]);
 }
 
+async function hasMatchOrganizerPermission(client, match, actorId, lock = false) {
+  if (!actorId) return false;
+  if (match.league_id) {
+    const result = await client.query(
+      `SELECT 1 FROM league_memberships
+       WHERE league_id = $1 AND user_id = $2 AND status = 'active' AND role IN ('owner', 'administrator')
+       ${lock ? "FOR SHARE" : ""}`,
+      [match.league_id, actorId]
+    );
+    return Boolean(result.rows[0]);
+  }
+  if (match.tournament_event_id) {
+    const result = await client.query(
+      `SELECT 1 FROM tournament_events WHERE id = $1 AND created_by = $2 ${lock ? "FOR SHARE" : ""}`,
+      [match.tournament_event_id, actorId]
+    );
+    return Boolean(result.rows[0]);
+  }
+  if (match.match_type === "money_match") {
+    const result = await client.query(
+      `SELECT 1 FROM money_match_terms WHERE match_id = $1 AND appointed_admin_id = $2 ${lock ? "FOR SHARE" : ""}`,
+      [match.id, actorId]
+    );
+    return Boolean(result.rows[0]);
+  }
+  return match.created_by === actorId;
+}
+
+async function canFinalizeMatch(client, match, actorId, lockOrganizer = false) {
+  if (!actorId || match.status !== "awaiting_confirmation") return false;
+  return await canOperateMatch(client, match, actorId, ["awaiting_confirmation"])
+    || await hasMatchOrganizerPermission(client, match, actorId, lockOrganizer);
+}
+
+async function requireMatchFinalizer(client, match, actorId) {
+  if (!await canFinalizeMatch(client, match, actorId, true)) {
+    throw new LeagueStoreError(403, "Only a match participant or authorised competition organiser can finalize this result.");
+  }
+}
+
+async function canConfirmForSide(client, match, actorId, side) {
+  if (!actorId || ![1, 2].includes(Number(side))) return false;
+  const sideNumber = Number(side);
+  if (match.match_type === "team_league") {
+    const teamId = sideNumber === 1 ? match.home_team_id : match.away_team_id;
+    const result = await client.query(
+      `SELECT EXISTS (
+         SELECT 1 FROM team_memberships
+         WHERE team_id = $1 AND user_id = $2 AND role = 'captain' AND status = 'active'
+       ) OR EXISTS (
+         SELECT 1 FROM league_memberships
+         WHERE league_id = $3 AND user_id = $2 AND role IN ('owner', 'administrator') AND status = 'active'
+       ) AS authorised`,
+      [teamId, actorId, match.league_id]
+    );
+    return result.rows[0]?.authorised === true;
+  }
+  const result = await client.query(
+    "SELECT 1 FROM match_participants WHERE match_id = $1 AND user_id = $2 AND side = $3",
+    [match.id, actorId, sideNumber]
+  );
+  return Boolean(result.rows[0]);
+}
+
+async function confirmationSideForActor(client, match, actorId, requestedSide, { strictRequestedSide = false } = {}) {
+  if (!actorId) throw new LeagueStoreError(403, "Only an authorised match-side representative may change that confirmation.");
+  let sideNumber = Number(requestedSide);
+  if (match.match_type === "team_league") {
+    const roles = await client.query(
+      `SELECT tm.team_id FROM team_memberships tm
+       WHERE tm.user_id = $1 AND tm.status = 'active' AND tm.role = 'captain'
+         AND tm.team_id = ANY($2::uuid[])
+       UNION SELECT NULL::uuid WHERE EXISTS (
+         SELECT 1 FROM league_memberships lm WHERE lm.league_id = $3 AND lm.user_id = $1
+           AND lm.status = 'active' AND lm.role IN ('owner','administrator')
+       )`, [actorId, [match.home_team_id, match.away_team_id], match.league_id]
+    );
+    const captainSides = roles.rows
+      .map((row) => row.team_id === match.home_team_id ? 1 : row.team_id === match.away_team_id ? 2 : null)
+      .filter(Boolean);
+    const isLeagueManager = roles.rows.some((row) => row.team_id === null);
+    if (captainSides.length === 1) {
+      if (strictRequestedSide && requestedSide != null && sideNumber !== captainSides[0]) {
+        throw new LeagueStoreError(403, "A team captain may change confirmation only for the team they captain.");
+      }
+      sideNumber = captainSides[0];
+    } else if (![1, 2].includes(sideNumber) || (!isLeagueManager && captainSides.length === 0)) {
+      throw new LeagueStoreError(403, "Only a team captain or league administrator may change a side's confirmation.");
+    }
+  } else {
+    const participant = await client.query(
+      "SELECT side FROM match_participants WHERE match_id = $1 AND user_id = $2",
+      [match.id, actorId]
+    );
+    if (!participant.rows[0]) {
+      throw new LeagueStoreError(403, "Only a recorded match participant may change a side's confirmation.");
+    }
+    const participantSide = Number(participant.rows[0].side);
+    if (strictRequestedSide && requestedSide != null && sideNumber !== participantSide) {
+      throw new LeagueStoreError(403, "A player may change confirmation only for their recorded side.");
+    }
+    sideNumber = participantSide;
+  }
+  if (![1, 2].includes(sideNumber) || !await canConfirmForSide(client, match, actorId, sideNumber)) {
+    throw new LeagueStoreError(403, "Only an authorised match-side representative may change that confirmation.");
+  }
+  return sideNumber;
+}
+
+async function hasConfirmedForOtherSide(client, matchId, actorId, side) {
+  const result = await client.query(
+    "SELECT 1 FROM match_confirmations WHERE match_id = $1 AND confirmed_by = $2 AND side <> $3 LIMIT 1",
+    [matchId, actorId, side]
+  );
+  return Boolean(result.rows[0]);
+}
+
 async function requireMatchOperator(client, match, actorId, allowedStatuses) {
   if (!await canOperateMatch(client, match, actorId, allowedStatuses)) {
     throw new LeagueStoreError(403, "Only a registered player on one of this match's competing sides can operate its scoreboard.");
@@ -708,6 +825,8 @@ export function createMatchStore(database) {
           values.push(viewerId);
           clauses.push(`(sb.match_type NOT IN ('practice', 'money_match') OR m.created_by = $${values.length} OR EXISTS (
             SELECT 1 FROM match_participants mp WHERE mp.match_id = sb.match_id AND mp.user_id = $${values.length}
+          ) OR EXISTS (
+            SELECT 1 FROM money_match_terms mt WHERE mt.match_id = sb.match_id AND mt.appointed_admin_id = $${values.length}
           ))`);
         } else {
           clauses.push("sb.match_type NOT IN ('practice', 'money_match')");
@@ -816,12 +935,32 @@ export function createMatchStore(database) {
           const permitted = await client.query(
             `SELECT 1 FROM matches m WHERE m.id = $1 AND (m.created_by = $2 OR EXISTS (
                SELECT 1 FROM match_participants mp WHERE mp.match_id = m.id AND mp.user_id = $2
+             ) OR EXISTS (
+               SELECT 1 FROM money_match_terms mt WHERE mt.match_id = m.id AND mt.appointed_admin_id = $2
              ))`,
             [match.id, viewerId]
           );
-          if (!permitted.rows[0]) throw new LeagueStoreError(403, "Only a match participant can view this private match.");
+          if (!permitted.rows[0]) throw new LeagueStoreError(403, "Only the match creator, a recorded participant or its appointed Money Match Admin can view this private match.");
         }
-        return matchWithDetails(client, match.id);
+        const details = await matchWithDetails(client, match.id);
+        const retractableSides = [];
+        if (viewerId && ["awaiting_confirmation", "disputed"].includes(match.status)) {
+          for (const confirmation of details.confirmations) {
+            if (confirmation.action !== "confirmed") continue;
+            const side = confirmation.side;
+            if (await canConfirmForSide(client, match, viewerId, side)
+              && !await hasConfirmedForOtherSide(client, match.id, viewerId, side)) {
+              retractableSides.push(side);
+            }
+          }
+        }
+        return {
+          ...details,
+          permissions: {
+            canFinalize: await canFinalizeMatch(client, match, viewerId),
+            retractableSides
+          }
+        };
       });
     },
 
@@ -1599,27 +1738,7 @@ export function createMatchStore(database) {
     async confirmSide(matchId, actorId, side = null) {
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
-        let sideNumber = Number(side);
-        if (match.match_type === "team_league") {
-          const roles = await client.query(
-            `SELECT tm.team_id FROM team_memberships tm
-             WHERE tm.user_id = $1 AND tm.status = 'active' AND tm.role = 'captain'
-               AND tm.team_id = ANY($2::uuid[])
-             UNION SELECT NULL::uuid WHERE EXISTS (
-               SELECT 1 FROM league_memberships lm WHERE lm.league_id=$3 AND lm.user_id=$1
-                 AND lm.status='active' AND lm.role IN ('owner','administrator')
-             )`, [actorId, [match.home_team_id, match.away_team_id], match.league_id]
-          );
-          const captainSide = roles.rows.map((row) => row.team_id === match.home_team_id ? 1 : row.team_id === match.away_team_id ? 2 : null).filter(Boolean);
-          if (captainSide.length === 1) sideNumber = captainSide[0];
-          if (![1, 2].includes(sideNumber) || (captainSide.length === 1 && sideNumber !== captainSide[0])) {
-            throw new LeagueStoreError(403, "Confirm for the team you captain, or select one side as a league administrator.");
-          }
-        } else {
-          const participant = await client.query("SELECT side FROM match_participants WHERE match_id=$1 AND user_id=$2", [match.id, actorId]);
-          if (!participant.rows[0]) throw new LeagueStoreError(403, "Only a recorded match participant can confirm this result.");
-          sideNumber = Number(participant.rows[0].side);
-        }
+        const sideNumber = await confirmationSideForActor(client, match, actorId, side);
         await client.query("SELECT set_config('breakdish.audit_action', 'confirmation_confirmed', true)");
         await client.query("INSERT INTO match_confirmations(match_id, side, action, confirmed_by) VALUES($1,$2,'confirmed',$3)", [match.id, sideNumber, actorId]);
         return matchWithDetails(client, match.id);
@@ -1629,10 +1748,19 @@ export function createMatchStore(database) {
     async retractConfirmation(matchId, actorId, side) {
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
-        let sideNumber = Number(side);
-        if (![1, 2].includes(sideNumber)) {
-          const participant = await client.query("SELECT side FROM match_participants WHERE match_id=$1 AND user_id=$2", [match.id, actorId]);
-          sideNumber = Number(participant.rows[0]?.side);
+        if (!["awaiting_confirmation", "disputed"].includes(match.status)) {
+          throw new LeagueStoreError(409, "A confirmation can only be retracted while awaiting confirmation or under dispute.");
+        }
+        const sideNumber = await confirmationSideForActor(client, match, actorId, side, { strictRequestedSide: true });
+        if (await hasConfirmedForOtherSide(client, match.id, actorId, sideNumber)) {
+          throw new LeagueStoreError(409, "One person cannot act for both sides of a match.");
+        }
+        const latest = await client.query(
+          "SELECT action FROM match_confirmations WHERE match_id = $1 AND side = $2 ORDER BY occurred_at DESC, id DESC LIMIT 1",
+          [match.id, sideNumber]
+        );
+        if (latest.rows[0]?.action !== "confirmed") {
+          throw new LeagueStoreError(409, "There is no current confirmation from this side to retract.");
         }
         await client.query("SELECT set_config('breakdish.audit_action', 'confirmation_retracted', true)");
         await client.query("INSERT INTO match_confirmations(match_id, side, action, confirmed_by) VALUES($1,$2,'retracted',$3)", [match.id, sideNumber, actorId]);
@@ -1670,6 +1798,7 @@ export function createMatchStore(database) {
       return withTransaction(database, actorId, async (client) => {
         const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
         if (match.status !== "awaiting_confirmation") throw new LeagueStoreError(409, "All frames must be complete and the match must be awaiting confirmation.");
+        await requireMatchFinalizer(client, match, actorId);
         await client.query("SELECT set_config('breakdish.audit_action', 'match_finalized', true)");
         await client.query("UPDATE matches SET status = 'completed', updated_at = now() WHERE id = $1", [match.id]);
         return matchWithDetails(client, match.id);

@@ -1279,7 +1279,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       signingPostJson(`/api/teams/${concurrentTeamTwo.id === winningTeam.id ? concurrentTeamThree.id : concurrentTeamTwo.id}/transfers`, firstUserCookie, { userId: fifthProfile.userId }),
       signingPostJson(`/api/teams/${concurrentTeamThree.id === winningTeam.id ? concurrentTeamTwo.id : concurrentTeamThree.id}/transfers`, firstUserCookie, { userId: fifthProfile.userId })
     ]);
-    assert.ok(racingTransfers.every((item) => item.status === 201), "Concurrent authorised transfers are serialized as sequential, non-overlapping history.");
+    const racingTransferResults = await Promise.all(racingTransfers.map(async (item) => ({ status: item.status, body: await item.clone().text() })));
+    assert.ok(racingTransfers.every((item) => item.status === 201),
+      `Concurrent authorised transfers are serialized as sequential, non-overlapping history: ${JSON.stringify(racingTransferResults)}`);
     const activeRegistration = await database.query(
       "SELECT team_id FROM team_registrations WHERE league_id=$1 AND season_id=$2 AND user_id=$3 AND ended_at IS NULL",
       [approval.league.id, signingSeason.id, fifthProfile.userId]
@@ -1353,6 +1355,13 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const otherLeaguePlayerCookie = cookieFrom(response);
     response = await signingPostJson(`/api/leagues/${open.league.id}/join`, otherLeaguePlayerCookie, {});
     assert.ok([200, 201].includes(response.status), await response.clone().text());
+    const otherLeaguePlayerSession = await fetchFromSite("/api/me", { headers: { cookie: otherLeaguePlayerCookie } });
+    const otherLeaguePlayerId = (await otherLeaguePlayerSession.json()).user.id;
+    response = await fetchFromSite(`/api/leagues/${open.league.id}/members/${otherLeaguePlayerId}/role`, {
+      method: "PATCH", headers: { cookie: firstUserCookie, "content-type": "application/json" },
+      body: JSON.stringify({ role: "administrator" })
+    });
+    assert.equal(response.status, 200, "The other account has administrator authority only in its own league.");
 
     const formatV1Frames = ["singles", "singles", "doubles", "singles", "doubles"].map((type) => ({ type }));
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
@@ -1680,8 +1689,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200, "The existing manager permission remains available for fixture administration.");
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, otherLeaguePlayerCookie, {});
     assert.equal(response.status, 403, "An authenticated player from another league cannot operate this fixture.");
+    await platformRoles.grantPlatformAdmin(superAdminUserId, fifthProfile.userId, "Match permission isolation test");
+    assert.equal(await platformRoles.hasPlatformRole(fifthProfile.userId, "platform_admin"), true);
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, fifthUserCookie, {});
-    assert.equal(response.status, 403, "A registered Team C player in this league cannot operate Team A v Team B.");
+    assert.equal(response.status, 403, "Platform Admin status does not let a registered Team C player operate Team A v Team B.");
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "team_league", leagueId: approval.league.id, seasonId: matchSeason.id,
       homeTeamId: homeMatchTeam.id, awayTeamId: homeMatchTeam.id,
@@ -1808,6 +1819,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200, "A registered player from either competing team can start the scoreboard.");
     const startedDetail = await response.json();
     assert.ok(Number.isFinite(Date.parse(startedDetail.match.startedAt)), "The server stores the canonical match start timestamp.");
+    response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, fifthUserCookie, { outcome: "played", winnerSide: 1 });
+    assert.equal(response.status, 403, "A Platform Admin outside the competing sides cannot record a frame score.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 409, "A match with incomplete frames cannot be finalized.");
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/start`, firstUserCookie, {});
     assert.equal(response.status, 409, "A repeated Start Match request is safely rejected after the first transition.");
     response = await fetchFromSite("/api/matches/live");
@@ -1887,6 +1902,22 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     await setFrameSide(matchUnderTest.id, 5, 2, { players: [thirdProfile.userId, fourthProfile.userId] });
     matchDetail = await recordFrame(matchUnderTest.id, 5, { outcome: "played", winnerSide: 2 });
     assert.equal(matchDetail.match.status, "awaiting_confirmation", "Completing all snapshot frames moves the match to confirmation, not directly to final.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).permissions.canFinalize, false, "Anonymous match viewers cannot finalize results.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: fifthUserCookie } });
+    assert.equal(response.status, 200);
+    const unrelatedMatchPermissions = (await response.json()).permissions;
+    assert.equal(unrelatedMatchPermissions.canFinalize, false, "Platform Admin status does not let an unrelated player finalize.");
+    assert.deepEqual(unrelatedMatchPermissions.retractableSides, [], "An unrelated Platform Admin cannot retract a side confirmation.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: otherLeaguePlayerCookie } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).permissions.canFinalize, false,
+      "An administrator of a different league cannot finalize this competition's match.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: thirdUserCookie } });
+    assert.equal((await response.json()).permissions.canFinalize, true, "A registered player on a competing side can finalize.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`, { headers: { cookie: secondUserCookie } });
+    assert.equal((await response.json()).permissions.canFinalize, true, "An active league administrator can finalize as an explicitly authorised organiser.");
     response = await fetchFromSite("/api/matches/live");
     assert.ok(!(await response.json()).matches.some((item) => item.id === matchUnderTest.id),
       "A match leaves the Live Matches feed as soon as it moves to awaiting confirmation.");
@@ -1918,9 +1949,23 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 200, await response.clone().text());
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/confirm`, secondUserCookie, { side: 2 });
     assert.equal(response.status, 200, await response.clone().text());
-    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, thirdUserCookie, {});
-    assert.equal(response.status, 200, "Both distinct sides' confirmations allow finalization.");
-    matchDetail = await response.json();
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/finalize`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+    });
+    assert.equal(response.status, 401, "Anonymous users cannot finalize even a fully confirmed result.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, fifthUserCookie, {});
+    assert.equal(response.status, 403, "An unrelated Platform Admin cannot finalize a fully confirmed result.");
+    response = await matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, otherLeaguePlayerCookie, {});
+    assert.equal(response.status, 403, "An administrator of a different league cannot finalize this result.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
+    assert.equal((await response.json()).match.status, "awaiting_confirmation", "Rejected finalization attempts leave the result awaiting confirmation.");
+    const concurrentFinalizations = await Promise.all([
+      matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, secondUserCookie, {}),
+      matchPostJson(`/api/matches/${matchUnderTest.id}/finalize`, thirdUserCookie, {})
+    ]);
+    assert.deepEqual(concurrentFinalizations.map((item) => item.status).sort(), [200, 409],
+      "Concurrent participant/organiser finalization permits one transition and rejects the stale request.");
+    matchDetail = await concurrentFinalizations.find((item) => item.status === 200).json();
     assert.equal(matchDetail.match.status, "completed");
     response = await fetchFromSite("/api/matches/live");
     assert.ok(!(await response.json()).matches.some((item) => item.id === matchUnderTest.id),
@@ -1931,6 +1976,15 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     for (const action of ["match_started", "player_selection_changed", "frame_result_entered", "bye_entered", "confirmation_confirmed", "match_finalized"]) {
       assert.ok(auditActions.includes(action), `Missing immutable audit action ${action}.`);
     }
+    const finalizationCount = await database.query(
+      "SELECT count(*)::integer AS count FROM match_audit_events WHERE match_id=$1 AND action_type='match_finalized'",
+      [matchUnderTest.id]
+    );
+    assert.equal(finalizationCount.rows[0].count, 1, "Concurrent requests produce exactly one finalization audit event.");
+    const platformAdminCleanup = await platformRoles.revokePlatformAdmin(
+      superAdminUserId, fifthProfile.userId, "Match permission isolation test cleanup"
+    );
+    assert.equal(platformAdminCleanup.revoked, true);
     response = await matchPatchJson(`/api/matches/${matchUnderTest.id}/schedule`, firstUserCookie, {
       scheduledAt: new Date(Date.now() + 60 * 86400000).toISOString(), venue: "Completed change rejected"
     });
@@ -1945,10 +1999,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(Number(officialTeamStats.rows[0].matches_played), 1);
     assert.equal(Number(officialTeamStats.rows[0].matches_lost), 1, "The official match winner is derived from the frame winners.");
 
-    response = await matchPostJson("/api/tournaments", firstUserCookie, { name: `Local Flyer ${crypto.randomUUID()}`, venue: "Test room" });
+    response = await matchPostJson("/api/tournaments", fifthUserCookie, { name: `Local Flyer ${crypto.randomUUID()}`, venue: "Test room" });
     assert.equal(response.status, 201, await response.clone().text());
     const tournamentEvent = (await response.json()).event;
-    response = await matchPostJson("/api/matches", firstUserCookie, {
+    response = await matchPostJson("/api/matches", fifthUserCookie, {
       type: "tournament_flyer", tournamentEventId: tournamentEvent.id,
       frames: [{ type: "doubles" }],
       participants: [
@@ -1970,6 +2024,22 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const fullDoublesBye = (await response.json()).frames[0];
     assert.equal(fullDoublesBye.outcome, "bye");
     assert.equal(fullDoublesBye.winnerSide, 2, "A full Doubles Bye awards the frame to the valid opposing pair.");
+    await matchPostJson(`/api/matches/${flyerMatch.id}/confirm`, firstUserCookie, { side: 1 })
+      .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${flyerMatch.id}/confirm`, thirdUserCookie, { side: 2 })
+      .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPostJson("/api/tournaments", otherLeaguePlayerCookie, { name: `Unrelated Flyer ${crypto.randomUUID()}` });
+    assert.equal(response.status, 201, await response.clone().text());
+    const unrelatedTournament = (await response.json()).event;
+    response = await fetchFromSite(`/api/matches/${flyerMatch.id}`, { headers: { cookie: fifthUserCookie } });
+    assert.equal((await response.json()).permissions.canFinalize, true,
+      "The tournament event creator can finalize a match even when not a recorded player.");
+    response = await fetchFromSite(`/api/matches/${flyerMatch.id}`, { headers: { cookie: otherLeaguePlayerCookie } });
+    assert.equal((await response.json()).permissions.canFinalize, false,
+      "An organiser of a different tournament event cannot finalize this match.");
+    response = await matchPostJson(`/api/matches/${flyerMatch.id}/finalize`, fifthUserCookie, {});
+    assert.equal(response.status, 200, "The exact tournament organiser may finalize after both sides confirm.");
+    assert.notEqual(tournamentEvent.id, unrelatedTournament.id);
 
     response = await fetchFromSite(`/api/leagues/${approval.league.id}/seasons/${matchSeason.id}/doubles-entries`);
     assert.equal(response.status, 401, "Anonymous users cannot enumerate registered Doubles League pairs.");
@@ -2184,12 +2254,41 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal((await response.json()).match.status, "awaiting_confirmation");
     await matchPostJson(`/api/matches/${singlesMatch.id}/confirm`, firstUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     await matchPostJson(`/api/matches/${singlesMatch.id}/confirm`, secondUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await fetchFromSite(`/api/matches/${singlesMatch.id}`, { headers: { cookie: firstUserCookie } });
+    assert.deepEqual((await response.json()).permissions.retractableSides, [1],
+      "A Singles participant can retract only their own currently confirmed side.");
+    response = await fetchFromSite(`/api/matches/${singlesMatch.id}/confirm/retract`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ side: 1 })
+    });
+    assert.equal(response.status, 401, "Anonymous users cannot retract a side confirmation.");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/confirm/retract`, firstUserCookie, { side: 2 });
+    assert.equal(response.status, 403, "A participant cannot manipulate the side parameter to retract the opponent's confirmation.");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/confirm/retract`, thirdUserCookie, { side: 1 });
+    assert.equal(response.status, 403, "A nonparticipant cannot retract a side confirmation.");
+    const concurrentRetractions = await Promise.all([
+      matchPostJson(`/api/matches/${singlesMatch.id}/confirm/retract`, firstUserCookie, {}),
+      matchPostJson(`/api/matches/${singlesMatch.id}/confirm/retract`, firstUserCookie, {})
+    ]);
+    assert.deepEqual(concurrentRetractions.map((item) => item.status).sort(), [200, 409],
+      "Concurrent requests can retract a side confirmation only once.");
+    const successfulRetraction = await concurrentRetractions.find((item) => item.status === 200).json();
+    assert.equal(successfulRetraction.confirmations.find((item) => item.side === 1)?.action, "retracted",
+      "A valid retraction changes only the latest side state and leaves the event recorded.");
+    response = await matchPostJson(`/api/matches/${singlesMatch.id}/confirm`, firstUserCookie, {});
+    assert.equal(response.status, 200, "A side may confirm again after a retraction.");
     response = await matchPostJson(`/api/matches/${singlesMatch.id}/finalize`, firstUserCookie, {});
     assert.equal(response.status, 200, await response.clone().text());
     const disputeAudit = await fetchFromSite(`/api/matches/${singlesMatch.id}/audit`, { headers: { cookie: firstUserCookie } });
     const disputeActions = (await disputeAudit.json()).events.map((event) => event.action_type);
     assert.ok(disputeActions.includes("dispute_raised"));
     assert.ok(disputeActions.includes("dispute_resolved"));
+    assert.ok(disputeActions.includes("confirmation_retracted"), "A side retraction is recorded in the immutable match audit.");
+    const retractionAudit = await database.query(
+      "SELECT actor_user_id, action_type FROM match_audit_events WHERE match_id=$1 AND action_type='confirmation_retracted'",
+      [singlesMatch.id]
+    );
+    assert.ok(retractionAudit.rows.some((event) => event.actor_user_id === firstUserId),
+      "The audit event identifies the authenticated player who retracted their side's confirmation.");
 
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "money_match", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
@@ -2213,6 +2312,32 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 403, "The appointed Money Match Admin cannot score solely because of that role.");
     response = await matchPostJson(`/api/matches/${moneyMatch.id}/start`, firstUserCookie, {});
     assert.equal(response.status, 200, "A competing Money Match player can start after the required acknowledgements.");
+    await matchPutJson(`/api/matches/${moneyMatch.id}/frames/1/players`, firstUserCookie, { side: 1, players: [firstUserId] })
+      .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPutJson(`/api/matches/${moneyMatch.id}/frames/1/players`, secondUserCookie, { side: 2, players: [secondProfile.userId] })
+      .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPutJson(`/api/matches/${moneyMatch.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1 });
+    assert.equal(response.status, 200, await response.clone().text());
+    for (const [type, sessionCookie] of [
+      ["player_a_result", firstUserCookie], ["player_b_result", secondUserCookie], ["admin_final_confirmation", thirdUserCookie]
+    ]) {
+      response = await matchPostJson(`/api/matches/${moneyMatch.id}/money-acknowledgements`, sessionCookie, { type });
+      assert.equal(response.status, 200, await response.clone().text());
+    }
+    await matchPostJson(`/api/matches/${moneyMatch.id}/confirm`, firstUserCookie, { side: 1 })
+      .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${moneyMatch.id}/confirm`, secondUserCookie, { side: 2 })
+      .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await fetchFromSite(`/api/matches/${moneyMatch.id}`, { headers: { cookie: thirdUserCookie } });
+    assert.equal(response.status, 200, "The appointed Money Match administrator can view that private match.");
+    assert.equal((await response.json()).permissions.canFinalize, true,
+      "The appointed administrator can finalize only through this Money Match's explicit assignment.");
+    response = await fetchFromSite(`/api/matches/${moneyMatch.id}`, { headers: { cookie: fourthUserCookie } });
+    assert.equal(response.status, 403, "A user without a participant or appointment role cannot view a private Money Match.");
+    response = await matchPostJson(`/api/matches/${moneyMatch.id}/finalize`, fourthUserCookie, {});
+    assert.equal(response.status, 403, "A direct finalize request from a user without a match-specific role is rejected.");
+    response = await matchPostJson(`/api/matches/${moneyMatch.id}/finalize`, thirdUserCookie, {});
+    assert.equal(response.status, 200, "The appointed Money Match administrator can finalize after all confirmations.");
 
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "practice", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
@@ -2257,11 +2382,17 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.ok(participantMatchIds.includes(practiceMatch.id), "A recorded Practice Match participant can list it.");
     assert.ok(participantMatchIds.includes(moneyMatch.id), "A recorded Money Match participant can list it.");
 
-    const unrelatedMatchResponse = await fetchFromSite("/api/matches", { headers: { cookie: thirdUserCookie } });
+    const appointedAdminMatchResponse = await fetchFromSite("/api/matches", { headers: { cookie: thirdUserCookie } });
+    assert.equal(appointedAdminMatchResponse.status, 200, await appointedAdminMatchResponse.clone().text());
+    const appointedAdminMatchIds = (await appointedAdminMatchResponse.json()).matches.map((item) => item.id);
+    assert.ok(appointedAdminMatchIds.includes(moneyMatch.id), "The appointed Money Match Admin can find the one private match assigned to them.");
+    assert.equal(appointedAdminMatchIds.includes(practiceMatch.id), false, "Money Match appointment does not expose private Practice Matches.");
+
+    const unrelatedMatchResponse = await fetchFromSite("/api/matches", { headers: { cookie: fourthUserCookie } });
     assert.equal(unrelatedMatchResponse.status, 200, await unrelatedMatchResponse.clone().text());
     const unrelatedMatchIds = (await unrelatedMatchResponse.json()).matches.map((item) => item.id);
     assert.equal([practiceMatch.id, moneyMatch.id].some((id) => unrelatedMatchIds.includes(id)), false,
-      "A signed-in nonparticipant cannot list another user's private matches.");
+      "A signed-in user without a match-specific appointment cannot list another user's private matches.");
 
     const entryClient = await database.connect();
     try {
