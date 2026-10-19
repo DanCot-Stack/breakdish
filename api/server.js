@@ -93,7 +93,7 @@ function createApp({
       res.set("Access-Control-Allow-Credentials", "true");
       res.vary("Origin");
       res.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Idempotency-Key");
     }
 
     if (req.method === "OPTIONS") return res.sendStatus(204);

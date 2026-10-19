@@ -16,7 +16,7 @@ test("login page sends the checked state of Remember me as a boolean", async () 
 });
 
 test("match API keeps public reads available and requires an authenticated user for scoreboard mutations", async () => {
-  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500,https://break-dish.com";
   const { createApp } = await import("./server.js");
   const calls = [];
   const match = { id: "123e4567-e89b-42d3-a456-426614174000", type: "team_league", status: "scheduled" };
@@ -85,6 +85,48 @@ test("match API keeps public reads available and requires an authenticated user 
     });
     assert.equal(response.status, 200);
     assert.equal(calls.at(-1)[2], "player-1");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("CORS preflight permits Idempotency-Key only for configured origins and retains credential support", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500,https://break-dish.com";
+  const { createApp } = await import("./server.js");
+  const app = createApp();
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const response = await fetch(`${base}/api/platform/test-practice-matches`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://break-dish.com",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type,idempotency-key"
+      }
+    });
+    assert.equal(response.status, 204);
+    assert.equal(response.headers.get("access-control-allow-origin"), "https://break-dish.com");
+    assert.equal(response.headers.get("access-control-allow-credentials"), "true");
+    assert.ok(response.headers.get("access-control-allow-methods").split(",").map((value) => value.trim()).includes("POST"));
+    const allowedHeaders = response.headers.get("access-control-allow-headers").split(",").map((value) => value.trim().toLowerCase());
+    assert.ok(allowedHeaders.includes("content-type"));
+    assert.ok(allowedHeaders.includes("idempotency-key"));
+
+    const rejected = await fetch(`${base}/api/platform/test-practice-matches`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://not-break-dish.com",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type,idempotency-key"
+      }
+    });
+    assert.equal(rejected.status, 403);
+    assert.equal(rejected.headers.get("access-control-allow-origin"), null);
+    assert.equal(rejected.headers.get("access-control-allow-credentials"), null);
+    assert.equal(rejected.headers.get("access-control-allow-headers"), null);
   } finally {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));

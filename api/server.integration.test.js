@@ -47,7 +47,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
   process.env.DATABASE_URL = testDatabaseUrl;
   process.env.BETTER_AUTH_URL = "http://localhost:3001";
   process.env.BETTER_AUTH_SECRET = "local-test-secret-that-is-never-used-outside-this-test-run";
-  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500,https://break-dish.com";
   process.env.NODE_ENV = "test";
   process.env.PORT = "0";
   delete process.env.RESEND_API_KEY;
@@ -79,6 +79,34 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
   let migrationApiTestRoleCreated = false;
 
   try {
+    let corsPreflight = await fetch(`${endpoint}/api/platform/test-practice-matches`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://break-dish.com",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type,idempotency-key"
+      }
+    });
+    assert.equal(corsPreflight.status, 204);
+    assert.equal(corsPreflight.headers.get("access-control-allow-origin"), "https://break-dish.com");
+    assert.equal(corsPreflight.headers.get("access-control-allow-credentials"), "true");
+    assert.ok(corsPreflight.headers.get("access-control-allow-methods").split(",").map((value) => value.trim()).includes("POST"));
+    const corsHeaders = corsPreflight.headers.get("access-control-allow-headers").split(",").map((value) => value.trim().toLowerCase());
+    assert.ok(corsHeaders.includes("content-type"));
+    assert.ok(corsHeaders.includes("idempotency-key"));
+    corsPreflight = await fetch(`${endpoint}/api/platform/test-practice-matches`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://not-break-dish.com",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type,idempotency-key"
+      }
+    });
+    assert.equal(corsPreflight.status, 403);
+    assert.equal(corsPreflight.headers.get("access-control-allow-origin"), null);
+    assert.equal(corsPreflight.headers.get("access-control-allow-credentials"), null);
+    assert.equal(corsPreflight.headers.get("access-control-allow-headers"), null);
+
     const initialPlatformRoles = await database.query("SELECT count(*)::integer AS count FROM platform_roles");
     assert.equal(initialPlatformRoles.rows[0].count, 0, "A fresh database begins with no Super Admin or Platform Admin.");
     assert.equal(await platformRoles.isSuperAdmin("not-yet-registered"), false);
