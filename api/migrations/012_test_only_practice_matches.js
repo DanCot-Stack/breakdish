@@ -46,12 +46,10 @@ export const up = (pgm) => {
       BEFORE INSERT OR UPDATE OF test_only, test_request_key ON matches
       FOR EACH ROW EXECUTE FUNCTION breakdish_test_practice_match_guard();
 
-    DROP VIEW practice_player_statistics;
-    DROP VIEW official_competitive_player_statistics;
-    DROP VIEW match_player_statistics;
-    DROP VIEW match_scoreboard;
-
-    CREATE VIEW match_scoreboard AS
+    -- Replace views in place so their existing owners and ACLs survive. The
+    -- new scoreboard column is appended after every existing column, as
+    -- required by CREATE OR REPLACE VIEW.
+    CREATE OR REPLACE VIEW match_scoreboard AS
     SELECT m.id AS match_id, m.match_type, m.status, m.league_id, m.season_id, m.division_id,
       m.home_team_id, m.away_team_id, m.tournament_event_id, m.is_official,
       m.scheduled_at, m.venue,
@@ -66,7 +64,7 @@ export const up = (pgm) => {
     FROM matches m LEFT JOIN match_frames f ON f.match_id = m.id
     GROUP BY m.id;
 
-    CREATE VIEW match_player_statistics AS
+    CREATE OR REPLACE VIEW match_player_statistics AS
     WITH frame_totals AS (
       SELECT fp.match_id, fp.user_id,
         count(*) FILTER (WHERE fp.user_id IS NOT NULL AND f.status = 'completed')::integer AS frames_played,
@@ -102,7 +100,7 @@ export const up = (pgm) => {
         nullif(count(*) FILTER (WHERE match_completed AND frames_played > 0), 0), 2) AS win_percentage
     FROM player_rows GROUP BY user_id, match_type, is_official;
 
-    CREATE VIEW practice_player_statistics AS
+    CREATE OR REPLACE VIEW practice_player_statistics AS
     SELECT user_id, sum(matches_played)::bigint AS matches_played, sum(matches_won)::bigint AS matches_won,
       sum(matches_lost)::bigint AS matches_lost, sum(frames_played)::bigint AS frames_played,
       sum(frames_won)::bigint AS frames_won, sum(frames_lost)::bigint AS frames_lost,
@@ -110,7 +108,7 @@ export const up = (pgm) => {
       round(100.0 * sum(matches_won) / nullif(sum(matches_played), 0), 2) AS practice_win_percentage
     FROM match_player_statistics WHERE match_type = 'practice' GROUP BY user_id;
 
-    CREATE VIEW official_competitive_player_statistics AS
+    CREATE OR REPLACE VIEW official_competitive_player_statistics AS
     SELECT user_id, sum(matches_played)::bigint AS matches_played, sum(matches_won)::bigint AS matches_won,
       sum(matches_lost)::bigint AS matches_lost, sum(frames_played)::bigint AS frames_played,
       sum(frames_won)::bigint AS frames_won, sum(frames_lost)::bigint AS frames_lost,

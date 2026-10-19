@@ -331,7 +331,18 @@ test("migration 012 protects immutable Super Admin-only test Practice Matches an
   assert.match(upSql, /matches_test_only_immutable/);
   assert.match(upSql, /m\.test_only = false/);
   assert.match(upSql, /JOIN matches m ON m\.id = mp\.match_id AND m\.test_only = false/);
-  assert.match(upSql, /CREATE VIEW match_scoreboard AS[\s\S]*m\.test_only/);
+  assert.doesNotMatch(upSql, /\bDROP\s+VIEW\b/i,
+    "Migration 012 must not drop views, because that would discard existing ownership and grants.");
+  for (const view of [
+    "match_scoreboard",
+    "match_player_statistics",
+    "practice_player_statistics",
+    "official_competitive_player_statistics"
+  ]) {
+    assert.match(upSql, new RegExp(`CREATE OR REPLACE VIEW ${view} AS`),
+      `${view} must be replaced in place so the API role's SELECT permissions survive.`);
+  }
+  assert.match(upSql, /CREATE OR REPLACE VIEW match_scoreboard AS[\s\S]*m\.test_only/);
 
   const downCalls = [];
   testOnlyPracticeMatchesMigration.down(new Proxy({}, {

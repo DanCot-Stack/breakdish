@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { runner } from "node-pg-migrate";
 import { createPlatformRoleStore, PlatformRoleError } from "./platform-role-store.js";
+import { verifyViewPermissions } from "./db-view-permissions-verifier.mjs";
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL?.trim();
 
@@ -16,6 +17,22 @@ async function runLatestApplicationMigration(direction, count = 1) {
     migrationsTable: "breakdish_app_migrations",
     createSchema: false
   });
+}
+
+async function captureViewPermissionVerification(phase, apiRole) {
+  const originalLog = console.log;
+  const originalExitCode = process.exitCode;
+  let output = "";
+  process.env.API_DATABASE_ROLE = apiRole;
+  console.log = (value) => { output = String(value); };
+  try {
+    await verifyViewPermissions(phase);
+  } finally {
+    console.log = originalLog;
+    process.exitCode = originalExitCode;
+  }
+  assert.ok(output, `The ${phase} permission verifier must produce a result.`);
+  return JSON.parse(output);
 }
 
 test("Better Auth, league management and the Match Engine use PostgreSQL", {
@@ -57,6 +74,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     .map((cookie) => cookie.split(";", 1)[0])
     .join("; ");
   let roleTestSignupOrdinal = 0;
+  const originalApiDatabaseRole = process.env.API_DATABASE_ROLE;
+  let migrationApiTestRole = null;
+  let migrationApiTestRoleCreated = false;
 
   try {
     const initialPlatformRoles = await database.query("SELECT count(*)::integer AS count FROM platform_roles");
@@ -278,7 +298,89 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.deepEqual(founderEventAfterLegacySchema.rows, [{ action: "bootstrap", actor_user_id: null }],
       "The migration-010 bootstrap audit event remains untouched across the upgrade path.");
     await runLatestApplicationMigration("up");
+
+    const migration012Views = [
+      "match_scoreboard",
+      "match_player_statistics",
+      "practice_player_statistics",
+      "official_competitive_player_statistics"
+    ];
+    migrationApiTestRole = `breakdish_api_view_${crypto.randomUUID().replaceAll("-", "")}`;
+    await database.query(`CREATE ROLE "${migrationApiTestRole}" NOLOGIN`);
+    migrationApiTestRoleCreated = true;
+    await database.query(`GRANT "${migrationApiTestRole}" TO CURRENT_USER`);
+    await database.query(
+      `GRANT SELECT ON ${migration012Views.map((view) => `public.${view}`).join(", ")} TO "${migrationApiTestRole}"`
+    );
+    const viewOwnersBefore012 = await database.query(
+      `SELECT c.relname AS view_name, pg_get_userbyid(c.relowner) AS owner_name
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname='public' AND c.relkind='v' AND c.relname = ANY($1::text[])
+       ORDER BY c.relname`,
+      [migration012Views]
+    );
+    assert.equal(viewOwnersBefore012.rows.length, migration012Views.length,
+      "All four views must exist before migration 012 replaces them.");
+    const pre012Permissions = await captureViewPermissionVerification("pre", migrationApiTestRole);
+    assert.equal(pre012Permissions.success, true, "The pre-migration verifier accepts the 001–011 schema and API grants.");
+    assert.equal(pre012Permissions.migrationRoleIsApiRole, false,
+      "The integration test uses separate migration and API database roles.");
+
     await runLatestApplicationMigration("up");
+    const viewOwnersAfter012 = await database.query(
+      `SELECT c.relname AS view_name, pg_get_userbyid(c.relowner) AS owner_name
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname='public' AND c.relkind='v' AND c.relname = ANY($1::text[])
+       ORDER BY c.relname`,
+      [migration012Views]
+    );
+    assert.deepEqual(viewOwnersAfter012.rows, viewOwnersBefore012.rows,
+      "CREATE OR REPLACE VIEW must preserve each existing view owner.");
+    const apiRoleGrantsAfter012 = await database.query(
+      `SELECT c.relname AS view_name, has_table_privilege($1, c.oid, 'SELECT') AS can_select
+       FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+       WHERE n.nspname='public' AND c.relkind='v' AND c.relname = ANY($2::text[])
+       ORDER BY c.relname`,
+      [migrationApiTestRole, migration012Views]
+    );
+    assert.ok(apiRoleGrantsAfter012.rows.every((row) => row.can_select),
+      "Existing API-role SELECT grants must survive migration 012 for all four views.");
+    assert.equal(migrationApiTestRole === (await database.query("SELECT current_user AS role")).rows[0].role, false);
+
+    const apiReader = await database.connect();
+    try {
+      await apiReader.query(`SET ROLE "${migrationApiTestRole}"`);
+      for (const view of migration012Views) {
+        await apiReader.query(`SELECT count(*) FROM public.${view}`);
+      }
+    } finally {
+      await apiReader.query("RESET ROLE");
+      apiReader.release();
+    }
+
+    await database.query(`REVOKE SELECT ON public.official_competitive_player_statistics FROM "${migrationApiTestRole}"`);
+    const missingGrantVerification = await captureViewPermissionVerification("post", migrationApiTestRole);
+    assert.equal(missingGrantVerification.success, false,
+      "The post-migration verifier must fail when an API view grant is missing.");
+    assert.equal(missingGrantVerification.viewPermissions.find((item) =>
+      item.view === "official_competitive_player_statistics").apiRoleCanSelect, false);
+    const deniedApiReader = await database.connect();
+    try {
+      await deniedApiReader.query(`SET ROLE "${migrationApiTestRole}"`);
+      await assert.rejects(
+        deniedApiReader.query("SELECT count(*) FROM public.official_competitive_player_statistics"),
+        (error) => error.code === "42501",
+        "The API role must not read a view after its required grant is removed."
+      );
+    } finally {
+      await deniedApiReader.query("RESET ROLE");
+      deniedApiReader.release();
+      await database.query(`GRANT SELECT ON public.official_competitive_player_statistics TO "${migrationApiTestRole}"`);
+    }
+    const post012Permissions = await captureViewPermissionVerification("post", migrationApiTestRole);
+    assert.equal(post012Permissions.success, true, "All required grants pass post-migration verification when restored.");
+    assert.equal(post012Permissions.migrationRoleIsApiRole, false);
+
     const founderAfterUpgrade = await database.query(
       "SELECT user_id, assignment_type FROM platform_roles WHERE role = 'super_admin'"
     );
@@ -2819,7 +2921,17 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     });
     assert.equal(response.status, 200);
   } finally {
-    await shutDown();
-    await closeAuthDatabase();
+    try {
+      if (migrationApiTestRoleCreated) {
+        await database.query(`DROP OWNED BY "${migrationApiTestRole}"`);
+        await database.query(`REVOKE "${migrationApiTestRole}" FROM CURRENT_USER`);
+        await database.query(`DROP ROLE "${migrationApiTestRole}"`);
+      }
+    } finally {
+      if (originalApiDatabaseRole === undefined) delete process.env.API_DATABASE_ROLE;
+      else process.env.API_DATABASE_ROLE = originalApiDatabaseRole;
+      await shutDown();
+      await closeAuthDatabase();
+    }
   }
 });
