@@ -48,7 +48,16 @@ function mapDatabaseError(error) {
     return new LeagueStoreError(409, "This match cannot move to that state yet.");
   }
   if (error.code === "23505") return new LeagueStoreError(409, "That match or player selection already exists.");
-  if (error.code === "23503") return new LeagueStoreError(404, "A referenced player, team, season or match could not be found.");
+  if (error.code === "23503") {
+    const constraint = typeof error.constraint === "string"
+      && /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(error.constraint)
+      ? error.constraint : null;
+    console.error("BREAK DISH match foreign-key failure", {
+      sqlstate: "23503",
+      constraint
+    });
+    return new LeagueStoreError(404, "A referenced player, team, season or match could not be found.");
+  }
   if (error.code === "23514") return new LeagueStoreError(409, error.message || "That change conflicts with the match rules.");
   return error;
 }
