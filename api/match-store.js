@@ -1722,8 +1722,11 @@ export function createMatchStore(database) {
         if (match.status !== "in_progress" && !amendment) throw new LeagueStoreError(409, "Start the match before entering a frame result.");
         if (!amendment) await requireMatchOperator(client, match, actorId);
         const existing = await client.query(
-          `SELECT f.*, sf.frame_type FROM match_frames f
+          `SELECT f.*, sf.frame_type, fe.event_type AS saved_event_type,
+             fe.user_id AS saved_event_user_id
+           FROM match_frames f
            JOIN match_format_snapshot_frames sf ON sf.snapshot_id = f.snapshot_id AND sf.frame_number = f.frame_number
+           LEFT JOIN match_frame_events fe ON fe.match_id = f.match_id AND fe.frame_number = f.frame_number
            WHERE f.match_id = $1 AND f.frame_number = $2 FOR UPDATE OF f`, [match.id, frameNumber]
         );
         if (!existing.rows[0]) throw new LeagueStoreError(404, "This frame could not be found.");
@@ -1747,6 +1750,16 @@ export function createMatchStore(database) {
           invalid("Choose the frame winner.");
         }
         if (match.status === "completed" && !amendment) throw new LeagueStoreError(403, "An administrator amendment is required to change a final result.");
+        const eventType = outcome === "played" && ["dish", "counter_dish"].includes(details.dishEvent) ? details.dishEvent : null;
+        const eventUserId = eventType && typeof details.dishPlayerId === "string" ? details.dishPlayerId : null;
+        const previous = existing.rows[0];
+        const sameResult = previous.status === "completed"
+          && previous.outcome_type === outcome
+          && Number(previous.winner_side) === winnerSide
+          && Number(previous.forfeiting_side || 0) === Number(forfeitingSide || 0)
+          && (previous.saved_event_type ?? null) === eventType
+          && (!eventType || previous.saved_event_user_id === eventUserId);
+        if (sameResult) return matchWithDetails(client, match.id, actorId);
         const action = amendment ? "admin_amendment" : existing.rows[0].status === "completed" ? "frame_result_changed" : outcome === "bye" ? "bye_entered" : "frame_result_entered";
         await client.query("SELECT set_config('breakdish.audit_action', $1, true)", [action]);
         await client.query(
@@ -1755,9 +1768,8 @@ export function createMatchStore(database) {
            WHERE match_id = $1 AND frame_number = $2`,
           [match.id, frameNumber, outcome, winnerSide, forfeitingSide, actorId]
         );
-        const eventType = outcome === "played" && ["dish", "counter_dish"].includes(details.dishEvent) ? details.dishEvent : null;
         if (eventType) {
-          const userId = typeof details.dishPlayerId === "string" ? details.dishPlayerId : "";
+          const userId = eventUserId || "";
           await client.query("SELECT set_config('breakdish.audit_action', 'frame_decoration_changed', true)");
           await client.query(
             `INSERT INTO match_frame_events(match_id, frame_number, user_id, event_type, recorded_by)
@@ -1769,6 +1781,43 @@ export function createMatchStore(database) {
         } else {
           await client.query("DELETE FROM match_frame_events WHERE match_id = $1 AND frame_number = $2", [match.id, frameNumber]);
         }
+        return matchWithDetails(client, match.id, actorId);
+      });
+    },
+
+    async retractFrameResult(matchId, frameNumber, actorId) {
+      return withTransaction(database, actorId, async (client) => {
+        const match = await requireMatch(client, cleanUuid(matchId, "match ID"), true);
+        if (match.status !== "in_progress") {
+          throw new LeagueStoreError(409, "A frame result can be retracted only while the match is in progress.");
+        }
+        const activeDispute = await client.query(
+          `SELECT 1 FROM match_disputes d WHERE d.match_id = $1
+           AND NOT EXISTS (SELECT 1 FROM match_dispute_resolutions r WHERE r.dispute_id = d.id) LIMIT 1`,
+          [match.id]
+        );
+        if (activeDispute.rows[0]) {
+          throw new LeagueStoreError(409, "Resolve the active dispute before changing the scoreboard.");
+        }
+        await requireMatchOperator(client, match, actorId, ["in_progress"]);
+        const existing = await client.query(
+          "SELECT status, outcome_type FROM match_frames WHERE match_id = $1 AND frame_number = $2 FOR UPDATE",
+          [match.id, frameNumber]
+        );
+        if (!existing.rows[0]) throw new LeagueStoreError(404, "This frame could not be found.");
+        if (existing.rows[0].status !== "completed" || existing.rows[0].outcome_type !== "played") {
+          throw new LeagueStoreError(409, "Only a completed played frame can be retracted with the scoreboard control.");
+        }
+        await client.query("SELECT set_config('breakdish.audit_action', 'frame_result_changed', true)");
+        await client.query(
+          `UPDATE match_frames
+           SET status = 'scheduled', outcome_type = NULL, winner_side = NULL,
+             forfeiting_side = NULL, completed_by = NULL, completed_at = NULL, updated_at = now()
+           WHERE match_id = $1 AND frame_number = $2`,
+          [match.id, frameNumber]
+        );
+        await client.query("SELECT set_config('breakdish.audit_action', 'frame_decoration_changed', true)");
+        await client.query("DELETE FROM match_frame_events WHERE match_id = $1 AND frame_number = $2", [match.id, frameNumber]);
         return matchWithDetails(client, match.id, actorId);
       });
     },

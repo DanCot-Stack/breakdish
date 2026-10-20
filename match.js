@@ -142,59 +142,112 @@ if (page) {
     setStatus(`${matches.length} ${matches.length === 1 ? "match" : "matches"} listed.`, "success");
   }
 
-  function currentSidePlayers(frame, side) {
-    return (frame.players || []).filter((player) => Number(player.side) === side && player.userId);
-  }
-
   function latestConfirmations(confirmations) {
     const latest = new Map();
     for (const confirmation of confirmations || []) latest.set(Number(confirmation.side), confirmation);
     return latest;
   }
 
-  function buildCardHeader(match) {
+  function actionButton(label, className, ariaLabel, onClick, disabled = false) {
+    const control = textElement("button", className, label);
+    control.type = "button";
+    control.setAttribute("aria-label", ariaLabel);
+    control.disabled = disabled;
+    control.addEventListener("click", onClick);
+    return control;
+  }
+
+  function isAutomaticSinglesMatch(match, frame) {
+    return frame.type === "singles"
+      && ["singles_league", "tournament_flyer", "practice", "money_match"].includes(match.type);
+  }
+
+  function currentFramePlayers(frame, side) {
+    return (frame.players || []).filter((player) => Number(player.side) === side)
+      .sort((left, right) => Number(left.slot) - Number(right.slot));
+  }
+
+  function buildCardHeader(match, frames, permissions = {}, onScoreSide, onRetractSide) {
     const header = textElement("header", "match-scoreboard-header");
     const identity = textElement("div", "match-scoreboard-identity");
-    identity.append(
+    const labelsRow = textElement("div", "match-scoreboard-labels");
+    let timer = null;
+    const context = [
+      match.leagueName,
+      match.divisionName,
+      match.roundNumber ? "Round " + match.roundNumber : "",
+      formatDate(match.scheduledAt),
+      match.venue
+    ].filter(Boolean).join(" · ");
+    identity.append(textElement("h1", "match-scoreboard-title", "Match Centre scoreboard"));
+    labelsRow.append(
       textElement("span", "match-category-tag", labels[match.type] || "Match"),
-      textElement("h2", "", matchLabel(match)),
-      textElement("p", "match-list-meta", `${formatDate(match.scheduledAt)}${match.venue ? ` · ${match.venue}` : ""}`)
+      textElement("span", "match-state-tag is-" + match.status, displayMatchStatus(match.status))
     );
+    identity.append(labelsRow);
+    if (context) identity.append(textElement("p", "match-list-meta", context));
     if (match.testOnly === true) {
       identity.append(textElement("strong", "match-test-label", "TEST MATCH — EXCLUDED FROM STATISTICS"));
     }
-    if (match.status === "in_progress") identity.append(textElement("span", "live-indicator", "LIVE"));
     if (match.startedAt) {
-      const timer = textElement("time", "live-match-timer match-scoreboard-timer");
+      timer = textElement("time", "live-match-timer match-scoreboard-timer");
       timer.dataset.matchTimer = "";
-      identity.append(timer);
+      timer.setAttribute("aria-label", "Elapsed match time");
     }
+
     const score = textElement("div", "match-score-summary");
-    score.setAttribute("aria-label", `Score ${match.homeScore} to ${match.awayScore}`);
-    score.append(
-      textElement("span", "match-score-team", sideName(match, 1)),
-      textElement("strong", "match-score-number", `${match.homeScore} – ${match.awayScore}`),
-      textElement("span", "match-score-team", sideName(match, 2)),
-      textElement("small", "", `${match.framesCompleted} played · ${match.framesRemaining} remaining`)
-    );
-    header.append(identity, score);
+    score.setAttribute("aria-label", "Frame score: " + sideName(match, 1) + " " + match.homeScore + " to " + sideName(match, 2) + " " + match.awayScore);
+    for (const side of [1, 2]) {
+      const team = textElement("section", "match-score-side is-side-" + side);
+      team.setAttribute("aria-label", sideName(match, side) + " frame score");
+      team.append(
+        textElement("span", "match-score-team", sideName(match, side)),
+        textElement("strong", "match-score-number", String(side === 1 ? match.homeScore : match.awayScore))
+      );
+      if (permissions.canScore === true && match.status === "in_progress") {
+        const controls = textElement("div", "match-score-actions");
+        controls.append(actionButton("+", "match-score-control is-add",
+          "Record a frame win for " + sideName(match, side), () => onScoreSide?.(side)));
+        const correctable = [...(frames || [])].reverse().find((frame) =>
+          frame.status === "completed" && frame.outcome === "played" && Number(frame.winnerSide) === side);
+        controls.append(actionButton("−", "match-score-control is-correct",
+          "Retract the latest played frame awarded to " + sideName(match, side),
+          () => onRetractSide?.(side, correctable), !correctable));
+        team.append(controls);
+      }
+      score.append(team);
+    }
+    score.append(textElement("small", "match-score-progress",
+      match.framesCompleted + " of " + match.framesTotal + " frames played · " + match.framesRemaining + " remaining"));
+    header.append(identity);
+    if (timer) header.append(timer);
+    header.append(score);
     return header;
   }
 
+  let eligiblePlayerCache = new Map();
   async function loadEligiblePlayers(matchId, side) {
     if (!signedIn) return [];
-    const result = await request(`/api/matches/${encodeURIComponent(matchId)}/eligible-players?side=${side}`);
-    return Array.isArray(result.players) ? result.players : [];
+    const key = matchId + ":" + side;
+    if (!eligiblePlayerCache.has(key)) {
+      eligiblePlayerCache.set(key, request("/api/matches/" + encodeURIComponent(matchId) + "/eligible-players?side=" + side)
+        .then((result) => Array.isArray(result.players) ? result.players : [])
+        .catch((error) => {
+          eligiblePlayerCache.delete(key);
+          throw error;
+        }));
+    }
+    return eligiblePlayerCache.get(key);
   }
 
-  function makeSelect(label, options, value = "") {
+  function makeSelect(label, options, value = "", placeholderText = "Choose player") {
     const wrapper = textElement("label", "match-field");
     wrapper.append(textElement("span", "", label));
     const select = document.createElement("select");
     select.setAttribute("aria-label", label);
     const placeholder = document.createElement("option");
     placeholder.value = "";
-    placeholder.textContent = "Choose player";
+    placeholder.textContent = placeholderText;
     select.append(placeholder);
     options.forEach((option) => {
       const item = document.createElement("option");
@@ -208,29 +261,52 @@ if (page) {
     return { wrapper, select };
   }
 
+  function setFramePlayers(match, frame, side, players, bye = false) {
+    return request("/api/matches/" + encodeURIComponent(match.id) + "/frames/" + frame.number + "/players", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ side, players, bye })
+    });
+  }
+
+  function frameSelectionMatches(frame, side, values, slots) {
+    const saved = currentFramePlayers(frame, side);
+    if (saved.some((player) => player.isBye)) {
+      return values.length === slots && values.every((value) => value === "__bye__");
+    }
+    const savedValues = Array.from({ length: slots }, (_, index) =>
+      saved.find((player) => Number(player.slot) === index + 1)?.userId || "");
+    return values.length === slots && values.every((value, index) => value === savedValues[index]);
+  }
+
   async function buildFrameCard(frame, match, permissions = {}, isCurrent = false) {
-    const card = textElement("article", `score-frame-card${frame.status === "completed" ? " is-complete" : ""}${isCurrent ? " is-current" : ""}`);
+    const card = textElement("article", "score-frame-card" + (frame.status === "completed" ? " is-complete" : "") + (isCurrent ? " is-current" : ""));
     const heading = textElement("div", "score-frame-heading");
     heading.append(
-      textElement("span", "score-frame-number", `FRAME ${frame.number}`),
+      textElement("span", "score-frame-number", "FRAME " + frame.number),
       textElement("span", "match-category-tag", frame.type === "singles" ? "Singles" : "Doubles"),
-      textElement("span", `match-state-tag is-${frame.status}`, displayMatchStatus(frame.status))
+      textElement("span", "match-state-tag is-" + frame.status, displayMatchStatus(frame.status))
     );
     if (isCurrent) heading.append(textElement("span", "match-state-tag is-in_progress", "Current frame"));
     card.append(heading);
+
     if (frame.status === "completed") {
       const winning = sideName(match, frame.winnerSide);
-      card.append(textElement("p", "score-frame-result", `${winning} won${frame.outcome === "bye" ? " by Bye" : frame.outcome === "forfeit" ? " by forfeit" : ""}.`));
+      card.append(textElement("p", "score-frame-result",
+        winning + " won" + (frame.outcome === "bye" ? " by Bye" : frame.outcome === "forfeit" ? " by forfeit" : "") + "."));
     }
     const selectedBySide = [1, 2].map((side) => {
-      const selected = (frame.players || []).filter((player) => Number(player.side) === side);
+      const selected = currentFramePlayers(frame, side);
       if (selected.some((player) => player.isBye)) return "Bye";
       return selected.map((player) => player.name).filter(Boolean).join(" / ");
     });
-    if (frame.playersVisible === true && selectedBySide.some(Boolean)) {
+    if (isAutomaticSinglesMatch(match, frame) && frame.status !== "completed") {
+      card.append(textElement("p", "score-frame-current-players is-singles-pair",
+        sideName(match, 1) + " · " + sideName(match, 2)));
+    } else if (frame.playersVisible === true && selectedBySide.some(Boolean)) {
       card.append(textElement("p", "score-frame-current-players",
-        `${sideName(match, 1)}: ${selectedBySide[0] || "Players not selected"} · ${sideName(match, 2)}: ${selectedBySide[1] || "Players not selected"}`));
-    } else if (frame.playersVisible !== true) {
+        sideName(match, 1) + ": " + (selectedBySide[0] || "Players not selected") + " · " + sideName(match, 2) + ": " + (selectedBySide[1] || "Players not selected")));
+    } else if (frame.playersVisible !== true && frame.status !== "completed") {
       card.append(textElement("p", "match-read-only-note", "Player selections for this upcoming frame are not published yet."));
     } else if (frame.playersVisible === true && !selectedBySide.some(Boolean)) {
       card.append(textElement("p", "score-frame-current-players", "Players have not been selected for this frame yet."));
@@ -238,131 +314,202 @@ if (page) {
     if (frame.event?.type) {
       const eventLabel = frame.event.type === "counter_dish" ? "Counter Dish" : "Dish";
       const eventPlayer = (frame.players || []).find((player) => player.userId === frame.event.userId)?.name;
-      card.append(textElement("p", "score-frame-event", `${eventLabel}${eventPlayer ? ` · ${eventPlayer}` : ""}`));
+      card.append(textElement("p", "score-frame-event", eventLabel + (eventPlayer ? " · " + eventPlayer : "")));
     }
+
     const canManagePlayers = permissions.canScore === true
       && match.status === "in_progress" && frame.status !== "completed";
     const canScore = permissions.canScore === true;
-    const canEditFrameResult = canScore && (isCurrent || frame.status === "completed");
+    const isAutoSingles = isAutomaticSinglesMatch(match, frame);
     const slots = frame.type === "singles" ? 1 : 2;
     const selects = new Map();
+    const eligibleBySide = new Map();
     let playerLoadError = "";
-    if (canManagePlayers) {
+
+    if (canManagePlayers && !isAutoSingles) {
       const grid = textElement("div", "score-frame-sides");
       for (const side of [1, 2]) {
         const label = sideName(match, side);
         const fieldset = document.createElement("fieldset");
-        fieldset.className = "score-frame-side";
+        fieldset.className = "score-frame-side is-side-" + side;
         fieldset.append(textElement("legend", "", label));
         let eligible = [];
-        try { eligible = await loadEligiblePlayers(match.id, side); }
-        catch (error) { playerLoadError ||= error.message; }
-        const current = (frame.players || []).filter((player) => Number(player.side) === side).sort((a, b) => Number(a.slot) - Number(b.slot));
+        try {
+          eligible = await loadEligiblePlayers(match.id, side);
+          eligibleBySide.set(side, eligible);
+        } catch (error) { playerLoadError ||= error.message; }
+        const current = currentFramePlayers(frame, side);
         const available = new Map(eligible.map((player) => [player.userId, { value: player.userId, label: player.displayName }]));
         current.forEach((player) => {
           if (player.userId && !available.has(player.userId)) {
-            available.set(player.userId, { value: player.userId, label: `${player.name} (historical selection)`, disabled: true });
+            available.set(player.userId, { value: player.userId, label: player.name + " (historical selection)", disabled: true });
           }
         });
         const options = [...available.values(), { value: "__bye__", label: "Bye" }];
         for (let slot = 1; slot <= slots; slot++) {
           const selected = current.find((player) => Number(player.slot) === slot);
           const value = selected?.isBye ? "__bye__" : selected?.userId || "";
-          const field = makeSelect(slots === 1 ? `${label} player` : `${label} player ${slot}`, options, value);
+          const field = makeSelect(slots === 1 ? label + " player" : label + " player " + slot, options, value);
           if (slots === 2 && slot === 2 && current.some((player) => player.isBye)) {
             field.select.value = "__bye__";
             field.select.disabled = true;
           }
-          selects.set(`${side}:${slot}`, field.select);
+          selects.set(side + ":" + slot, field.select);
           fieldset.append(field.wrapper);
         }
         grid.append(fieldset);
       }
       card.append(grid);
     }
+
     if (playerLoadError && canManagePlayers) card.append(textElement("p", "match-inline-status is-error", playerLoadError));
 
-    if (canManagePlayers) {
+    if (canManagePlayers && !isAutoSingles) {
       const savePlayers = textElement("button", "button button-quiet", "Save players");
       savePlayers.type = "button";
       savePlayers.addEventListener("click", () => mutate(async () => {
         const sideData = [];
         for (const side of [1, 2]) {
-          const values = Array.from({ length: slots }, (_, index) => selects.get(`${side}:${index + 1}`).value);
+          const values = Array.from({ length: slots }, (_, index) => selects.get(side + ":" + (index + 1)).value);
           const bye = values.includes("__bye__");
           if (bye && values.some((value) => value && value !== "__bye__")) throw new Error("Choose a full side of players or a full side Bye.");
           if (bye && slots === 2 && values.some((value) => value !== "__bye__" && value !== "")) throw new Error("A Doubles Bye fills both player slots.");
           sideData.push({ side, bye, players: values.filter((value) => value && value !== "__bye__") });
         }
         for (const selection of sideData) {
-          await request(`/api/matches/${encodeURIComponent(match.id)}/frames/${frame.number}/players`, {
-            method: "PUT", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ side: selection.side, bye: selection.bye, players: selection.players })
-          });
+          await setFramePlayers(match, frame, selection.side, selection.players, selection.bye);
         }
       }, "Player selections saved."));
       card.append(savePlayers);
     }
 
-    if (canEditFrameResult) {
-      const resultForm = textElement("div", "score-frame-result-form");
-      const winnerField = makeSelect("Frame winner", [
-        { value: "1", label: sideName(match, 1) }, { value: "2", label: sideName(match, 2) }
-      ], frame.winnerSide ? String(frame.winnerSide) : "");
-      const eventField = makeSelect("Frame event", [
-        { value: "none", label: "No Dish" }, { value: "dish", label: "Dish" }, { value: "counter_dish", label: "Counter Dish" }
-      ], frame.event?.type || "none");
-      const eventPlayer = makeSelect("Winning player", [], frame.event?.userId || "");
-      const refreshWinnerOptions = () => {
-        const selectedSide = Number(winnerField.select.value);
-        const players = Array.from({ length: slots }, (_, index) => {
-          const selected = selects.get(`${selectedSide}:${index + 1}`)?.value;
-          if (selected) return selected;
-          return (frame.players || []).find((player) => Number(player.side) === selectedSide && Number(player.slot) === index + 1)?.userId || "";
-        }).filter((value) => value && value !== "__bye__");
-        const currentValue = eventPlayer.select.value;
-        const displayNames = new Map((frame.players || []).map((player) => [player.userId, player.name]));
-        eventPlayer.select.replaceChildren();
-        const placeholder = document.createElement("option");
-        placeholder.value = ""; placeholder.textContent = "Choose winning player"; eventPlayer.select.append(placeholder);
-        players.forEach((userId) => {
-          const option = document.createElement("option");
-          option.value = userId;
-          option.textContent = displayNames.get(userId) || userId;
-          eventPlayer.select.append(option);
-        });
-        if (players.includes(currentValue)) eventPlayer.select.value = currentValue;
-      };
-      refreshWinnerOptions();
-      winnerField.select.addEventListener("change", refreshWinnerOptions);
-      resultForm.append(winnerField.wrapper, eventField.wrapper, eventPlayer.wrapper);
-      const saveResult = textElement("button", "button button-gold", frame.status === "completed" ? "Update frame result" : "Record frame result");
-      saveResult.type = "button";
-      saveResult.addEventListener("click", () => mutate(async () => {
-        const hasBye = (frame.players || []).some((player) => player.isBye)
-          || Array.from(selects.values()).some((select) => select.value === "__bye__");
-        if (hasBye) {
-          await request(`/api/matches/${encodeURIComponent(match.id)}/frames/${frame.number}/result`, {
-            method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ outcome: "bye" })
-          });
-        } else {
-          if (!winnerField.select.value) throw new Error("Choose the frame winner.");
-          const eventType = eventField.select.value === "none" ? null : eventField.select.value;
-          if (eventType && !eventPlayer.select.value) throw new Error("Choose the winning player for this Dish or Counter Dish.");
-          await request(`/api/matches/${encodeURIComponent(match.id)}/frames/${frame.number}/result`, {
-            method: "PUT", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ outcome: "played", winnerSide: Number(winnerField.select.value), dishEvent: eventType, dishPlayerId: eventPlayer.select.value || null })
-          });
-        }
-      }, "Frame result saved."));
-      resultForm.append(saveResult);
-      card.append(resultForm);
+    if (canManagePlayers && isAutoSingles) {
+      try {
+        for (const side of [1, 2]) eligibleBySide.set(side, await loadEligiblePlayers(match.id, side));
+      } catch (error) { playerLoadError ||= error.message; }
     }
-    return card;
-  }
 
+    let eventField = null;
+    let eventPlayer = null;
+    if (canManagePlayers) {
+      const scoringDetails = textElement("div", "score-frame-event-controls");
+      eventField = makeSelect("Frame achievement", [
+        { value: "none", label: "No Dish" },
+        { value: "dish", label: "Dish" },
+        { value: "counter_dish", label: "Counter Dish" }
+      ], frame.event?.type || "none", "Choose achievement");
+      const eventOptions = [1, 2].flatMap((side) =>
+        (eligibleBySide.get(side) || []).map((player) => ({ value: player.userId, label: sideName(match, side) + " · " + player.displayName })));
+      eventPlayer = makeSelect("Player credited", eventOptions, frame.event?.userId || "", "Choose player");
+      eventPlayer.select.disabled = eventField.select.value === "none" || eventOptions.length === 0;
+      eventField.select.addEventListener("change", () => {
+        eventPlayer.select.disabled = eventField.select.value === "none" || eventOptions.length === 0;
+        if (eventField.select.value === "none") eventPlayer.select.value = "";
+      });
+      scoringDetails.append(eventField.wrapper, eventPlayer.wrapper,
+        textElement("p", "match-read-only-note", "Dish and Counter Dish are recorded with the frame result and attributed to one of its selected players."));
+      card.append(scoringDetails);
+    }
+
+    let scoreFrameForSide = null;
+    if (canScore && isCurrent) {
+      scoreFrameForSide = (side) => mutate(async () => {
+        if (![1, 2].includes(side)) throw new Error("Choose a valid scoring side.");
+        let byeSide = null;
+        if (isAutoSingles) {
+          for (const targetSide of [1, 2]) {
+            const eligible = eligibleBySide.get(targetSide) || await loadEligiblePlayers(match.id, targetSide);
+            if (eligible.length !== 1) throw new Error("The registered Singles participants could not be confirmed.");
+            const selected = currentFramePlayers(frame, targetSide);
+            if (selected.length !== 1 || selected[0].userId !== eligible[0].userId) {
+              await setFramePlayers(match, frame, targetSide, [eligible[0].userId]);
+            }
+          }
+        } else {
+          for (const targetSide of [1, 2]) {
+            const values = Array.from({ length: slots }, (_, index) => selects.get(targetSide + ":" + (index + 1))?.value || "");
+            const bye = values.includes("__bye__");
+            if (bye) {
+              if (!values.every((value) => value === "__bye__")) throw new Error("A Bye fills every player slot on its side.");
+              if (!frameSelectionMatches(frame, targetSide, values, slots)) throw new Error("Save player selections before recording this frame.");
+              byeSide = targetSide;
+              continue;
+            }
+            if (values.some((value) => !value)) throw new Error("Select and save the players for both sides before recording this frame.");
+            if (!frameSelectionMatches(frame, targetSide, values, slots)) throw new Error("Save player selections before recording this frame.");
+          }
+        }
+
+        const existingByeSide = [1, 2].find((targetSide) => currentFramePlayers(frame, targetSide).some((player) => player.isBye));
+        const recordedByeSide = byeSide || existingByeSide || null;
+        if (recordedByeSide && side === recordedByeSide) throw new Error("A Bye cannot receive the frame win.");
+        if (eventField?.select.value !== "none") {
+          const eventPlayerId = eventPlayer?.select.value;
+          const eligibleWinner = isAutoSingles
+            ? (eligibleBySide.get(side) || []).some((player) => player.userId === eventPlayerId)
+            : currentFramePlayers(frame, side).some((player) => player.userId === eventPlayerId);
+          if (!eventPlayerId || !eligibleWinner) throw new Error("Choose a player from the winning side for the Dish or Counter Dish.");
+        }
+
+        const outcome = recordedByeSide ? "bye" : "played";
+        await request("/api/matches/" + encodeURIComponent(match.id) + "/frames/" + frame.number + "/result", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            outcome,
+            winnerSide: outcome === "played" ? side : undefined,
+            dishEvent: outcome === "played" && eventField?.select.value !== "none" ? eventField.select.value : null,
+            dishPlayerId: outcome === "played" && eventField?.select.value !== "none" ? eventPlayer?.select.value : null
+          })
+        });
+      }, "Frame result saved.");
+    }
+
+    if (frame.status === "completed" && frame.outcome === "played" && canScore && match.status === "in_progress") {
+      const correction = textElement("details", "score-frame-correction");
+      correction.append(textElement("summary", "", "Correct this frame"));
+      const actions = textElement("div", "score-frame-correction-actions");
+      for (const side of [1, 2]) {
+        actions.append(actionButton("Award to " + sideName(match, side), "button button-quiet",
+          "Correct frame " + frame.number + " winner to " + sideName(match, side), () => {
+            if (!window.confirm("Correct frame " + frame.number + " to " + sideName(match, side) + "? This audited correction will clear any Dish or Counter Dish recorded on that frame.")) return;
+            mutate(async () => {
+              await request("/api/matches/" + encodeURIComponent(match.id) + "/frames/" + frame.number + "/result", {
+                method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ outcome: "played", winnerSide: side, dishEvent: null, dishPlayerId: null })
+              });
+            }, "Frame correction recorded in match history.");
+          }));
+      }
+      if (frame.playersVisible === true) {
+        const eventCorrection = textElement("div", "score-frame-event-correction");
+        const eventType = makeSelect("Dish record", [
+          { value: "none", label: "No Dish" }, { value: "dish", label: "Dish" }, { value: "counter_dish", label: "Counter Dish" }
+        ], frame.event?.type || "none", "Choose record");
+        const eventUsers = (frame.players || []).filter((player) => player.userId)
+          .map((player) => ({ value: player.userId, label: sideName(match, Number(player.side)) + " · " + player.name }));
+        const eventUser = makeSelect("Player credited", eventUsers, frame.event?.userId || "", "Choose player");
+        const saveEvent = textElement("button", "button button-quiet", "Save Dish correction");
+        saveEvent.type = "button";
+        saveEvent.addEventListener("click", () => mutate(async () => {
+          const type = eventType.select.value === "none" ? null : eventType.select.value;
+          if (type && !eventUser.select.value) throw new Error("Choose the player credited for this Dish or Counter Dish.");
+          await request("/api/matches/" + encodeURIComponent(match.id) + "/frames/" + frame.number + "/event", {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ type, userId: type ? eventUser.select.value : null })
+          });
+        }, "Dish correction saved in match history."));
+        eventCorrection.append(eventType.wrapper, eventUser.wrapper, saveEvent);
+        actions.append(eventCorrection);
+      }
+      correction.append(actions);
+      card.append(correction);
+    }
+    return { element: card, scoreFrameForSide };
+  }
   async function renderMatch(result) {
     matchData = result;
+    eligiblePlayerCache = new Map();
     const match = result.match;
     const isFinal = match.status === "completed";
     title.innerHTML = isFinal ? "FINAL<br><em>RESULT.</em>" : "MATCH<br><em>SCOREBOARD.</em>";
@@ -371,15 +518,26 @@ if (page) {
     intro.textContent = `${matchLabel(match)} · ${displayMatchStatus(match.status)}`;
     list.hidden = true;
     detail.hidden = false;
+    page.classList.add("has-match-detail");
     detail.replaceChildren();
-    detail.append(buildCardHeader(match));
-    const stateText = match.status === "in_progress" ? "LIVE · Match in progress."
-      : match.status === "scheduled" ? "SCHEDULED · This match has not started yet."
-        : `Match state: ${displayMatchStatus(match.status)}.`;
-    const state = textElement("p", `match-state-banner is-${match.status}`, `${stateText} ${match.framesCompleted} of ${match.framesTotal} frames complete.`);
-    detail.append(state);
 
+    const framesList = result.frames || [];
     const permissions = result.permissions || {};
+    const currentFrame = match.status === "in_progress"
+      ? framesList.find((frame) => frame.status !== "completed") || null
+      : null;
+    const currentView = currentFrame
+      ? await buildFrameCard(currentFrame, match, permissions, true)
+      : null;
+    const onRetractSide = (side, frame) => {
+      if (!frame) return;
+      if (!window.confirm(`Retract the latest played frame awarded to ${sideName(match, side)} (frame ${frame.number})? This audited action removes that frame result, preserves its player selection and clears any Dish or Counter Dish recorded on it.`)) return;
+      mutate(async () => {
+        await request(`/api/matches/${encodeURIComponent(match.id)}/frames/${frame.number}/result`, { method: "DELETE" });
+      }, "Frame result retracted and recorded in match history.");
+    };
+    detail.append(buildCardHeader(match, framesList, permissions, currentView?.scoreFrameForSide, onRetractSide));
+
     if (permissions.canOperate !== true) {
       const access = textElement("p", "match-access-note", "Read-only match view. Scoreboard controls are limited to registered players in this match.");
       const login = textElement("a", "button button-quiet", "Log in");
@@ -400,12 +558,54 @@ if (page) {
       detail.append(start);
     }
 
-    const frames = textElement("div", "score-frame-list");
-    const currentFrameNumber = match.status === "in_progress"
-      ? (result.frames || []).find((frame) => frame.status !== "completed")?.number
-      : null;
-    for (const frame of result.frames || []) frames.append(await buildFrameCard(frame, match, permissions, frame.number === currentFrameNumber));
-    detail.append(frames);
+    if (currentView) {
+      const active = textElement("section", "score-frame-active");
+      active.setAttribute("aria-label", `Current frame ${currentFrame.number}`);
+      active.append(currentView.element);
+      detail.append(active);
+    }
+    const completedFrames = framesList.filter((frame) => frame.status === "completed");
+    if (completedFrames.length) {
+      const history = textElement("details", "score-frame-group is-history");
+      history.append(textElement("summary", "", `Completed frames · ${completedFrames.length}`));
+      const cards = textElement("div", "score-frame-list");
+      for (const frame of completedFrames) {
+        const view = await buildFrameCard(frame, match, permissions, false);
+        view.element.classList.add("score-frame-history-detail");
+        const row = textElement("details", "score-frame-history-row");
+        const summary = document.createElement("summary");
+        const winner = [1, 2].includes(Number(frame.winnerSide))
+          ? sideName(match, Number(frame.winnerSide))
+          : frame.outcome === "draw" ? "Draw" : "Result pending";
+        const eventLabel = frame.event?.type === "counter_dish" ? "Counter Dish"
+          : frame.event?.type === "dish" ? "Dish" : "No Dish recorded";
+        const eventPlayer = frame.event?.userId
+          ? (frame.players || []).find((player) => player.userId === frame.event.userId)?.name
+          : "";
+        summary.append(
+          textElement("span", "score-frame-history-number", `Frame ${frame.number}`),
+          textElement("span", "score-frame-history-winner", ["Draw", "Result pending"].includes(winner) ? winner : `${winner} won`),
+          textElement("span", "score-frame-history-event", eventPlayer ? `${eventLabel} · ${eventPlayer}` : eventLabel)
+        );
+        row.append(summary, view.element);
+        cards.append(row);
+      }
+      history.append(cards);
+      detail.append(history);
+    }
+    const upcomingFrames = framesList.filter((frame) => frame.status !== "completed" && frame.number !== currentFrame?.number);
+    if (upcomingFrames.length) {
+      const upcoming = textElement("details", "score-frame-group is-upcoming");
+      upcoming.append(textElement("summary", "", `Upcoming frames · ${upcomingFrames.length}`));
+      const cards = textElement("div", "score-frame-list");
+      for (const frame of upcomingFrames) {
+        const view = await buildFrameCard(frame, match, permissions, false);
+        cards.append(view.element);
+      }
+      upcoming.append(cards);
+      detail.append(upcoming);
+    }
+    if (!framesList.length) detail.append(textElement("p", "match-read-only-note", "Frame details are not available for this match."));
 
     const confirmationSection = textElement("section", "match-confirmation-panel");
     confirmationSection.append(textElement("h3", "", "Result confirmation"));

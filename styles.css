@@ -3857,6 +3857,351 @@ td:first-child {
   }
 }
 
+/* Match-detail scoreboard pass: compact layout scoped to the Match Centre only. */
+.match-main.has-match-detail .match-hero,
+.match-main.has-match-detail .match-centre-content > .section-heading {
+  display: none;
+}
+
+.match-main.has-match-detail .match-centre-content {
+  padding-top: clamp(18px, 3vw, 34px);
+}
+
+.match-main.has-match-detail .match-detail {
+  margin-top: 0;
+}
+
+.match-main.has-match-detail .match-scoreboard-header {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  text-align: center;
+}
+
+.match-main.has-match-detail .match-scoreboard-identity {
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+}
+
+.match-main.has-match-detail .match-scoreboard-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.match-main.has-match-detail .match-scoreboard-labels {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.match-main.has-match-detail .match-scoreboard-identity .match-list-meta {
+  margin: 0;
+  font-size: 14px;
+}
+
+.match-main.has-match-detail .match-scoreboard-timer {
+  justify-self: center;
+  justify-content: center;
+  margin: 0;
+  font-size: clamp(20px, 3vw, 28px);
+  font-variant-numeric: tabular-nums;
+}
+
+.match-main.has-match-detail .match-score-summary {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 8px 0 0;
+  border: 0;
+}
+
+.match-main.has-match-detail .match-score-side {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 190px;
+  padding: 15px 18px;
+  border: 1px solid rgba(242, 234, 219, .2);
+  background: rgba(8, 7, 9, .35);
+}
+
+.match-main.has-match-detail .match-score-side.is-side-1 {
+  border-color: rgba(157, 185, 206, .62);
+  box-shadow: inset 0 3px 0 rgba(157, 185, 206, .72);
+}
+
+.match-main.has-match-detail .match-score-side.is-side-2 {
+  border-color: rgba(232, 190, 105, .62);
+  box-shadow: inset 0 3px 0 rgba(232, 190, 105, .72);
+}
+
+.match-main.has-match-detail .match-score-team {
+  max-width: 100%;
+  font-size: clamp(15px, 2vw, 19px);
+}
+
+.match-main.has-match-detail .match-score-number {
+  font-size: clamp(46px, 6vw, 66px);
+  font-variant-numeric: tabular-nums;
+}
+
+.match-main.has-match-detail .match-score-actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+.match-main.has-match-detail .match-score-control {
+  display: inline-grid;
+  place-items: center;
+  width: 50px;
+  min-width: 50px;
+  min-height: 50px;
+  padding: 0;
+  border: 2px solid rgba(255, 255, 255, .65);
+  border-radius: 6px;
+  color: #fff;
+  font-size: 30px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+  transition: filter .15s ease, transform .15s ease, box-shadow .15s ease;
+}
+
+.match-main.has-match-detail .match-score-control.is-add {
+  background: #087b3b;
+}
+
+.match-main.has-match-detail .match-score-control.is-correct {
+  background: #9b2835;
+}
+
+.match-main.has-match-detail .match-score-control:hover:not(:disabled) {
+  filter: brightness(1.16);
+  transform: translateY(-1px);
+}
+
+.match-main.has-match-detail .match-score-control:focus-visible {
+  outline: 3px solid var(--cream);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 5px rgba(157, 185, 206, .38);
+}
+
+.match-main.has-match-detail .match-score-control:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.match-main.has-match-detail .match-score-control:disabled {
+  border-color: rgba(242, 234, 219, .16);
+  background: #302b30;
+  color: #aaa1a6;
+  cursor: not-allowed;
+  opacity: .62;
+}
+
+.match-main.has-match-detail .match-score-progress {
+  grid-column: 1 / -1;
+  justify-self: center;
+  padding-top: 3px;
+  color: #d6cbd0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.match-main.has-match-detail .score-frame-active {
+  min-width: 0;
+}
+
+.match-main.has-match-detail .score-frame-card.is-current {
+  border-width: 2px;
+  box-shadow: inset 4px 0 0 rgba(157, 185, 206, .76);
+}
+
+.match-main.has-match-detail .score-frame-card.is-current .score-frame-heading {
+  gap: 8px 12px;
+}
+
+.match-main.has-match-detail .score-frame-current-players.is-singles-pair {
+  margin: 9px 0 0;
+  font-size: 17px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.match-main.has-match-detail .score-frame-card.is-complete {
+  padding: 13px 16px;
+}
+
+.match-main.has-match-detail .score-frame-group {
+  min-width: 0;
+  padding: 13px 16px;
+  border: 1px solid rgba(213, 177, 107, .24);
+  background: rgba(20, 17, 21, .65);
+}
+
+.match-main.has-match-detail .score-frame-group > summary,
+.match-main.has-match-detail .score-frame-correction > summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--gold-light);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.match-main.has-match-detail .score-frame-group > summary:focus-visible,
+.match-main.has-match-detail .score-frame-correction > summary:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+
+.match-main.has-match-detail .score-frame-group .score-frame-list {
+  gap: 0;
+  margin-top: 10px;
+}
+
+.match-main.has-match-detail .score-frame-history-row {
+  min-width: 0;
+  border-bottom: 1px solid rgba(213, 177, 107, .18);
+}
+
+.match-main.has-match-detail .score-frame-history-row:last-child {
+  border-bottom: 0;
+}
+
+.match-main.has-match-detail .score-frame-history-row > summary {
+  display: grid;
+  grid-template-columns: minmax(90px, .55fr) minmax(130px, 1fr) minmax(150px, 1fr);
+  align-items: center;
+  gap: 8px 18px;
+  min-height: 52px;
+  padding: 8px 4px;
+  color: var(--cream);
+  cursor: pointer;
+}
+
+.match-main.has-match-detail .score-frame-history-row > summary:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.match-main.has-match-detail .score-frame-history-number {
+  color: var(--gold-light);
+  font-weight: 800;
+}
+
+.match-main.has-match-detail .score-frame-history-winner {
+  font-weight: 700;
+}
+
+.match-main.has-match-detail .score-frame-history-event {
+  color: #d8e8f5;
+  font-size: 14px;
+}
+
+.match-main.has-match-detail .score-frame-history-detail {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border-color: rgba(157, 185, 206, .25);
+  background: rgba(8, 7, 9, .35);
+}
+
+.match-main.has-match-detail .score-frame-correction-actions,
+.match-main.has-match-detail .score-frame-event-correction,
+.match-main.has-match-detail .score-frame-event-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.match-main.has-match-detail .score-frame-event-controls {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.match-main.has-match-detail .score-frame-event-controls > .match-read-only-note {
+  grid-column: 1 / -1;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #d6cbd0;
+}
+
+.match-main.has-match-detail .score-frame-correction-actions .button,
+.match-main.has-match-detail .score-frame-event-correction .button {
+  min-height: 46px;
+}
+
+.match-main.has-match-detail .match-score-side .match-score-actions button,
+.match-main.has-match-detail .score-frame-correction-actions button {
+  touch-action: manipulation;
+}
+
+@media (max-width: 760px) {
+  .match-main.has-match-detail .match-score-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .match-main.has-match-detail .score-frame-event-controls,
+  .match-main.has-match-detail .score-frame-correction-actions,
+  .match-main.has-match-detail .score-frame-event-correction {
+    grid-template-columns: 1fr;
+  }
+
+  .match-main.has-match-detail .score-frame-history-row > summary {
+    grid-template-columns: minmax(80px, .5fr) minmax(0, 1fr);
+  }
+
+  .match-main.has-match-detail .score-frame-history-event {
+    grid-column: 2;
+  }
+}
+
+@media (max-width: 520px) {
+  .match-main.has-match-detail .match-centre-content {
+    padding-top: 16px;
+  }
+
+  .match-main.has-match-detail .match-scoreboard-header,
+  .match-main.has-match-detail .score-frame-card,
+  .match-main.has-match-detail .score-frame-group {
+    padding: 13px;
+  }
+
+  .match-main.has-match-detail .match-score-side {
+    min-height: 160px;
+    gap: 6px;
+    padding: 10px 7px;
+  }
+
+  .match-main.has-match-detail .match-score-control {
+    width: 48px;
+    min-width: 48px;
+    min-height: 48px;
+  }
+
+  .match-main.has-match-detail .score-frame-history-row > summary {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+    padding: 10px 4px;
+  }
+
+  .match-main.has-match-detail .score-frame-history-event {
+    grid-column: auto;
+  }
+}
+
 /* Responsive corrections: keep wide-site navigation on desktop and use the existing
    menu as a viewport-bounded, scrollable navigation panel on smaller screens. */
 main,

@@ -2113,7 +2113,83 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
     assert.deepEqual(liveFixture.currentFrame.players.map((player) => player.name), [profile.displayName, thirdProfile.displayName],
       "Live frame player selections are reflected from the server.");
-    await recordFrame(matchUnderTest.id, 1, { outcome: "played", winnerSide: 1, dishEvent: "dish", dishPlayerId: firstUserId });
+    const firstFrameResult = { outcome: "played", winnerSide: 1, dishEvent: "dish", dishPlayerId: firstUserId };
+    const initialFrameAuditCount = await database.query(
+      "SELECT count(*)::integer AS count FROM match_audit_events WHERE match_id = $1 AND frame_number = 1",
+      [matchUnderTest.id]
+    );
+    const initialDishEvents = await database.query(
+      "SELECT count(*)::integer AS count FROM match_frame_events WHERE match_id = $1 AND frame_number = 1",
+      [matchUnderTest.id]
+    );
+    await recordFrame(matchUnderTest.id, 1, firstFrameResult);
+    const afterFirstFrameAuditCount = await database.query(
+      "SELECT count(*)::integer AS count FROM match_audit_events WHERE match_id = $1 AND frame_number = 1",
+      [matchUnderTest.id]
+    );
+    const duplicateFrameResponses = await Promise.all([
+      matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, firstUserCookie, firstFrameResult),
+      matchPutJson(`/api/matches/${matchUnderTest.id}/frames/1/result`, firstUserCookie, firstFrameResult)
+    ]);
+    for (const duplicateResponse of duplicateFrameResponses) assert.equal(duplicateResponse.status, 200, await duplicateResponse.clone().text());
+    const duplicateFrameResult = await duplicateFrameResponses[0].json();
+    const afterDuplicateFrameAuditCount = await database.query(
+      "SELECT count(*)::integer AS count FROM match_audit_events WHERE match_id = $1 AND frame_number = 1",
+      [matchUnderTest.id]
+    );
+    const afterDuplicateDishEvents = await database.query(
+      "SELECT count(*)::integer AS count FROM match_frame_events WHERE match_id = $1 AND frame_number = 1",
+      [matchUnderTest.id]
+    );
+    assert.deepEqual([duplicateFrameResult.match.homeScore, duplicateFrameResult.match.awayScore], [1, 0],
+      "An exact repeated frame-result request preserves the stored score.");
+    assert.equal(afterDuplicateFrameAuditCount.rows[0].count, afterFirstFrameAuditCount.rows[0].count,
+      "An exact repeated frame-result request does not create a duplicate audit event.");
+    assert.equal(afterFirstFrameAuditCount.rows[0].count, initialFrameAuditCount.rows[0].count + 2,
+      "The initial frame and Dish are both recorded in the append-only audit history.");
+    assert.equal(afterDuplicateDishEvents.rows[0].count, initialDishEvents.rows[0].count + 1,
+      "An exact repeated frame result does not duplicate the Dish record.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/frames/1/result`, { method: "DELETE" });
+    assert.equal(response.status, 401, "Anonymous spectators cannot retract a frame result.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/frames/1/result`, {
+      method: "DELETE", headers: { cookie: fifthUserCookie }
+    });
+    assert.equal(response.status, 403, "Unrelated signed-in viewers cannot retract a frame result.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/frames/1/result`, {
+      method: "DELETE", headers: { cookie: sixthUserCookie }
+    });
+    assert.equal(response.status, 403, "A league organiser with finalization authority cannot retract a frame result without participant status.");
+    const concurrentFrameRetractions = await Promise.all([
+      fetchFromSite(`/api/matches/${matchUnderTest.id}/frames/1/result`, { method: "DELETE", headers: { cookie: firstUserCookie } }),
+      fetchFromSite(`/api/matches/${matchUnderTest.id}/frames/1/result`, { method: "DELETE", headers: { cookie: firstUserCookie } })
+    ]);
+    assert.deepEqual(concurrentFrameRetractions.map((item) => item.status).sort(), [200, 409],
+      "Concurrent frame retractions commit once and reject the duplicate without extra audit entries.");
+    response = concurrentFrameRetractions.find((item) => item.status === 200);
+    assert.ok(response);
+    const retractedFrameDetail = await response.json();
+    assert.deepEqual([retractedFrameDetail.match.homeScore, retractedFrameDetail.match.awayScore], [0, 0],
+      "Retracting the latest played frame removes only its derived frame point without assigning it to the opponent.");
+    assert.equal(retractedFrameDetail.frames[0].status, "scheduled", "The retracted frame is reopened for a corrected result.");
+    assert.equal(retractedFrameDetail.frames[0].event, null, "A Dish attached to a retracted result is removed from current statistics.");
+    const frameRetractionAudit = await database.query(
+      `SELECT action_type, count(*)::integer AS count FROM match_audit_events
+       WHERE match_id = $1 AND frame_number = 1 GROUP BY action_type`, [matchUnderTest.id]
+    );
+    assert.ok(frameRetractionAudit.rows.some((row) => row.action_type === "frame_result_changed" && row.count === 1),
+      "The result retraction is preserved as an append-only frame correction audit event.");
+    assert.ok(frameRetractionAudit.rows.some((row) => row.action_type === "frame_decoration_changed" && row.count === 2),
+      "The original Dish and its removal during retraction are both preserved in the audit history.");
+    const retractionAuditTotal = frameRetractionAudit.rows.reduce((total, row) => total + row.count, 0);
+    assert.equal(retractionAuditTotal, afterDuplicateFrameAuditCount.rows[0].count + 2,
+      "A successful result retraction writes one result audit event and one event-removal audit event.");
+    response = await fetchFromSite(`/api/matches/${matchUnderTest.id}/frames/1/result`, {
+      method: "DELETE", headers: { cookie: firstUserCookie }
+    });
+    assert.equal(response.status, 409, "A repeated retraction cannot create duplicate audit actions.");
+    const replayedFrameResult = await recordFrame(matchUnderTest.id, 1, firstFrameResult);
+    assert.deepEqual([replayedFrameResult.match.homeScore, replayedFrameResult.match.awayScore], [1, 0],
+      "A participant can record the reopened frame again through the normal result route.");
     response = await fetchFromSite("/api/matches/live");
     livePayload = await response.json();
     liveFixture = livePayload.matches.find((item) => item.id === matchUnderTest.id);
@@ -2439,6 +2515,10 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, thirdUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/finalize`, firstUserCookie, {});
     assert.equal(response.status, 200, await response.clone().text());
+    response = await fetchFromSite(`/api/matches/${playingDoublesMatch.id}/frames/2/result`, {
+      method: "DELETE", headers: { cookie: secondUserCookie }
+    });
+    assert.equal(response.status, 409, "Completed match participants cannot retract or change a finalized frame result.");
     response = await matchPatchJson(`/api/matches/${playingDoublesMatch.id}/schedule`, firstUserCookie, {
       scheduledAt: new Date(Date.now() + 90 * 86400000).toISOString(), venue: "Completed change"
     });
@@ -2638,7 +2718,21 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const practiceCategoryStats = await database.query("SELECT is_official,matches_played FROM match_player_statistics WHERE user_id=$1 AND match_type='practice'", [firstUserId]);
     assert.deepEqual(practiceCategoryStats.rows[0], { is_official: false, matches_played: 1 });
 
-    const testPracticeParticipants = [thirdProfile.userId, fourthProfile.userId];
+    const testPracticeParticipantCookies = await Promise.all([
+      signUpPlayer("Profileless Test Participant One"),
+      signUpPlayer("Profileless Test Participant Two")
+    ]);
+    const testPracticeParticipants = [];
+    for (const cookie of testPracticeParticipantCookies) {
+      const accountResponse = await fetchFromSite("/api/me", { headers: { cookie } });
+      assert.equal(accountResponse.status, 200, await accountResponse.clone().text());
+      testPracticeParticipants.push((await accountResponse.json()).user.id);
+    }
+    const testParticipantProfiles = await database.query(
+      "SELECT count(*)::integer AS count FROM player_profiles WHERE user_id=ANY($1::text[])", [testPracticeParticipants]
+    );
+    assert.equal(testParticipantProfiles.rows[0].count, 0,
+      "Fresh, genuine Better Auth accounts do not need player_profiles rows to participate in a standalone test match.");
     const testPracticeBody = {
       type: "practice",
       participants: [{ userId: testPracticeParticipants[0], side: 1 }, { userId: testPracticeParticipants[1], side: 2 }],
@@ -2646,6 +2740,48 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       formatName: "Controlled Match Centre lifecycle test"
     };
     const testPracticeKey = crypto.randomUUID();
+    const missingParticipantKey = crypto.randomUUID();
+    const failedCreationCounts = await database.query(`
+      SELECT
+        (SELECT count(*) FROM matches) AS matches,
+        (SELECT count(*) FROM match_format_snapshots) AS snapshots,
+        (SELECT count(*) FROM match_format_snapshot_frames) AS snapshot_frames,
+        (SELECT count(*) FROM match_frames) AS frames,
+        (SELECT count(*) FROM match_participants) AS participants,
+        (SELECT count(*) FROM match_frame_players) AS frame_players,
+        (SELECT count(*) FROM match_frame_events) AS frame_events,
+        (SELECT count(*) FROM match_confirmations) AS confirmations,
+        (SELECT count(*) FROM match_disputes) AS disputes,
+        (SELECT count(*) FROM match_dispute_resolutions) AS dispute_resolutions,
+        (SELECT count(*) FROM match_audit_events) AS audit_events
+    `);
+    response = await matchPostJson("/api/platform/test-practice-matches", superAdminCookie, {
+      ...testPracticeBody,
+      participants: [{ userId: `missing-${crypto.randomUUID()}`, side: 1 }, { userId: testPracticeParticipants[1], side: 2 }]
+    }, { "Idempotency-Key": missingParticipantKey });
+    assert.equal(response.status, 404, "A missing participant is reported as a safe not-found response by the mounted endpoint.");
+    assert.deepEqual(await response.json(), { error: "A referenced player, team, season or match could not be found." });
+    const failedCreationCount = await database.query(
+      "SELECT count(*)::integer AS count FROM matches WHERE test_request_key=$1", [missingParticipantKey]
+    );
+    assert.equal(failedCreationCount.rows[0].count, 0, "The transaction rolls back the match row when a participant reference is invalid.");
+    const afterFailedCreationCounts = await database.query(`
+      SELECT
+        (SELECT count(*) FROM matches) AS matches,
+        (SELECT count(*) FROM match_format_snapshots) AS snapshots,
+        (SELECT count(*) FROM match_format_snapshot_frames) AS snapshot_frames,
+        (SELECT count(*) FROM match_frames) AS frames,
+        (SELECT count(*) FROM match_participants) AS participants,
+        (SELECT count(*) FROM match_frame_players) AS frame_players,
+        (SELECT count(*) FROM match_frame_events) AS frame_events,
+        (SELECT count(*) FROM match_confirmations) AS confirmations,
+        (SELECT count(*) FROM match_disputes) AS disputes,
+        (SELECT count(*) FROM match_dispute_resolutions) AS dispute_resolutions,
+        (SELECT count(*) FROM match_audit_events) AS audit_events
+    `);
+    assert.deepEqual(afterFailedCreationCounts.rows, failedCreationCounts.rows,
+      "The failed creation leaves no match, snapshot, frames, participants, scoring records, confirmations, disputes or audit events.");
+
     response = await matchPostJson("/api/platform/test-practice-matches", "", testPracticeBody, { "Idempotency-Key": crypto.randomUUID() });
     assert.equal(response.status, 401, "Anonymous users cannot create test-only Practice Matches.");
     response = await matchPostJson("/api/platform/test-practice-matches", platformAdminCookie, testPracticeBody, { "Idempotency-Key": crypto.randomUUID() });
@@ -2714,10 +2850,19 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       markerClient.release();
     }
 
-    response = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`);
-    assert.equal(response.status, 401, "Test-only Practice Match detail remains private to signed-in participants or its creator.");
-    response = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`, { headers: { cookie: fifthUserCookie } });
-    assert.equal(response.status, 403, "An unrelated signed-in account cannot view a test-only Practice Match.");
+    const anonymousTestDetails = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`);
+    assert.equal(anonymousTestDetails.status, 401, "Test-only Practice Match detail requires authentication.");
+    const unrelatedTestDetails = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`, { headers: { cookie: fifthUserCookie } });
+    assert.equal(unrelatedTestDetails.status, 403, "An unrelated signed-in account cannot view a test-only Practice Match.");
+    const platformAdminTestDetails = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`, { headers: { cookie: platformAdminCookie } });
+    assert.equal(platformAdminTestDetails.status, 403,
+      "Platform Admin role alone does not reveal a private test-only Practice Match.");
+    for (const deniedDetails of [anonymousTestDetails, unrelatedTestDetails, platformAdminTestDetails]) {
+      const deniedBody = await deniedDetails.json();
+      assert.equal(deniedBody.match, undefined, "Denied detail responses must not disclose private match data.");
+      assert.equal(deniedBody.frames, undefined, "Denied detail responses must not disclose frame history.");
+      assert.equal(deniedBody.permissions, undefined, "Denied detail responses must not disclose match capabilities.");
+    }
     response = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`, { headers: { cookie: superAdminCookie } });
     assert.equal(response.status, 200);
     let testMatchDetail = await response.json();
@@ -2727,40 +2872,59 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(testMatchDetail.permissions.canScore, false);
     response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/start`, superAdminCookie, {});
     assert.equal(response.status, 403, "Super Admin creator cannot start or score solely by role or creation authority.");
-    response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/start`, thirdUserCookie, {});
+    response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/start`, testPracticeParticipantCookies[0], {});
     assert.equal(response.status, 200, await response.clone().text());
     const activePublicTestListing = await fetchFromSite("/api/matches/live");
     assert.equal(activePublicTestListing.status, 200);
     assert.equal((await activePublicTestListing.json()).matches.some((item) => item.id === testPracticeMatch.id), false,
       "An in-progress test-only Practice Match is excluded from public live-match discovery.");
-    response = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`, { headers: { cookie: thirdUserCookie } });
+    const privateScoreRequest = {
+      outcome: "played", winnerSide: 1
+    };
+    const anonymousScore = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/frames/1/result`, {
+      method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(privateScoreRequest)
+    });
+    assert.equal(anonymousScore.status, 401,
+      "Anonymous users cannot submit score changes to a private test-only Practice Match.");
+    const unrelatedScore = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/result`, fifthUserCookie, privateScoreRequest);
+    assert.equal(unrelatedScore.status, 403,
+      "An unrelated signed-in account cannot submit score changes to a private test-only Practice Match.");
+    const platformAdminScore = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/result`, platformAdminCookie, privateScoreRequest);
+    assert.equal(platformAdminScore.status, 403,
+      "Platform Admin role alone does not grant score changes on a private test-only Practice Match.");
+    for (const deniedScore of [anonymousScore, unrelatedScore, platformAdminScore]) {
+      const deniedBody = await deniedScore.json();
+      assert.equal(deniedBody.match, undefined, "Rejected scoring responses must not expose private match details.");
+      assert.equal(deniedBody.permissions, undefined, "Rejected scoring responses must not expose match capabilities.");
+    }
+    response = await fetchFromSite(`/api/matches/${testPracticeMatch.id}`, { headers: { cookie: testPracticeParticipantCookies[0] } });
     assert.equal(response.status, 200);
     testMatchDetail = await response.json();
     assert.equal(testMatchDetail.match.testOnly, true, "The participant detail API marks the test match for display.");
     assert.equal(testMatchDetail.permissions.canScore, true);
-    response = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/players`, thirdUserCookie,
+    response = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/players`, testPracticeParticipantCookies[0],
       { side: 1, players: [testPracticeParticipants[0]] });
     assert.equal(response.status, 200, await response.clone().text());
-    response = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/players`, fourthUserCookie,
+    response = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/players`, testPracticeParticipantCookies[1],
       { side: 2, players: [testPracticeParticipants[1]] });
     assert.equal(response.status, 200, await response.clone().text());
-    response = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/result`, thirdUserCookie,
+    response = await matchPutJson(`/api/matches/${testPracticeMatch.id}/frames/1/result`, testPracticeParticipantCookies[0],
       { outcome: "played", winnerSide: 1, dishEvent: "dish", dishPlayerId: testPracticeParticipants[0] });
     assert.equal(response.status, 200, await response.clone().text());
-    response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/disputes`, fourthUserCookie,
+    response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/disputes`, testPracticeParticipantCookies[1],
       { reason: "Controlled test dispute" });
     assert.equal(response.status, 201, await response.clone().text());
     const testDispute = (await response.json()).disputes[0];
     response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/disputes/${testDispute.id}/resolve`, superAdminCookie,
       { resolution: "Test frame was checked; recorded result stands." });
     assert.equal(response.status, 200, "The creator has only the specific dispute-resolution authority already allowed for a standalone match.");
-    await matchPostJson(`/api/matches/${testPracticeMatch.id}/confirm`, thirdUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
-    await matchPostJson(`/api/matches/${testPracticeMatch.id}/confirm`, fourthUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
-    response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/finalize`, thirdUserCookie, {});
+    await matchPostJson(`/api/matches/${testPracticeMatch.id}/confirm`, testPracticeParticipantCookies[0], {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    await matchPostJson(`/api/matches/${testPracticeMatch.id}/confirm`, testPracticeParticipantCookies[1], {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+    response = await matchPostJson(`/api/matches/${testPracticeMatch.id}/finalize`, testPracticeParticipantCookies[0], {});
     assert.equal(response.status, 200, await response.clone().text());
     assert.equal((await response.json()).match.testOnly, true, "Finalization retains the test-only classification.");
 
-    const privateTestListing = await fetchFromSite("/api/matches", { headers: { cookie: thirdUserCookie } });
+    const privateTestListing = await fetchFromSite("/api/matches", { headers: { cookie: testPracticeParticipantCookies[0] } });
     assert.equal((await privateTestListing.json()).matches.find((item) => item.id === testPracticeMatch.id)?.testOnly, true,
       "An authorized participant can still find and identify the private test record.");
     for (const headers of [{}, { cookie: fifthUserCookie }]) {
@@ -2770,8 +2934,26 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
         "Anonymous and unrelated viewers cannot discover a private test-only Practice Match in general listings.");
     }
 
-    const retainedTestAudit = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/audit`, { headers: { cookie: thirdUserCookie } });
+    const retainedTestAudit = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/audit`, { headers: { cookie: testPracticeParticipantCookies[0] } });
     assert.equal(retainedTestAudit.status, 200);
+    const anonymousTestAudit = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/audit`);
+    assert.equal(anonymousTestAudit.status, 401,
+      "The audit route requires authentication before it checks private-match authorization.");
+    const unrelatedTestAudit = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/audit`, { headers: { cookie: fifthUserCookie } });
+    assert.equal(unrelatedTestAudit.status, 403,
+      "Unrelated signed-in viewers cannot access private test-match audit history.");
+    const platformAdminTestAudit = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/audit`, { headers: { cookie: platformAdminCookie } });
+    assert.equal(platformAdminTestAudit.status, 403,
+      "Platform Admin role alone does not expose private test-match audit history.");
+    const creatorTestAudit = await fetchFromSite(`/api/matches/${testPracticeMatch.id}/audit`, { headers: { cookie: superAdminCookie } });
+    assert.equal(creatorTestAudit.status, 200,
+      "The Super Admin who created the private test match may inspect its audit without receiving scoring authority.");
+    for (const deniedAudit of [anonymousTestAudit, unrelatedTestAudit, platformAdminTestAudit]) {
+      const deniedBody = await deniedAudit.json();
+      assert.equal(deniedBody.events, undefined, "Denied audit responses must not disclose private audit history.");
+      assert.equal(deniedBody.match, undefined, "Denied audit responses must not disclose private match details.");
+      assert.equal(deniedBody.permissions, undefined, "Denied audit responses must not disclose match capabilities.");
+    }
     const testAuditEvents = (await retainedTestAudit.json()).events;
     const testAuditActions = testAuditEvents.map((event) => event.action_type);
     for (const action of ["match_created", "frame_result_entered", "dispute_raised", "dispute_resolved", "confirmation_confirmed", "match_finalized"]) {

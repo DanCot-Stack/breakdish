@@ -17,6 +17,7 @@ test("login page sends the checked state of Remember me as a boolean", async () 
 
 test("match API keeps public reads available and requires an authenticated user for scoreboard mutations", async () => {
   process.env.ALLOWED_ORIGINS = "http://localhost:5500,https://break-dish.com";
+  process.env.PORT = "0";
   const { createApp } = await import("./server.js");
   const calls = [];
   const match = { id: "123e4567-e89b-42d3-a456-426614174000", type: "team_league", status: "scheduled" };
@@ -211,18 +212,102 @@ test("test-only Practice Match creation is Super Admin-only and cannot be reques
   }
 });
 
+test("production startup path mounts the protected test Practice Match endpoint", async () => {
+  const { start, shutDown } = await import("./server.js");
+  const calls = [];
+  const auth = { api: { async getSession({ headers }) {
+    const userId = headers.get("x-test-session");
+    return userId ? { user: { id: userId } } : null;
+  } } };
+  const matchStore = { async createMatch(actorId, details, options) {
+    calls.push({ actorId, details, options });
+    return { match: { id: "123e4567-e89b-42d3-a456-426614174000", type: details.type, testOnly: options.testOnly } };
+  } };
+  const platformRoleStore = { async requireSuperAdmin(userId) {
+    if (userId !== "super-admin") throw new PlatformRoleError(403, "This action requires the BREAK DISH Super Admin.");
+  } };
+  const server = await start({
+    emailSender: { async sendContactEmail() {} },
+    getAuthInstance: async () => auth,
+    getMatchStore: async () => matchStore,
+    getPlatformRoleStore: async () => platformRoleStore
+  });
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  const body = JSON.stringify({
+    participants: [{ userId: "player-a", side: 1 }, { userId: "player-b", side: 2 }],
+    frames: [{ type: "singles" }]
+  });
+  try {
+    const packageJson = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"));
+    assert.equal(packageJson.scripts.start, "node server.js", "Render's package start command launches this server entry point.");
+
+    let response = await fetch(`${endpoint}/api/platform/test-practice-matches`, {
+      method: "POST", headers: { "content-type": "application/json" }, body
+    });
+    assert.equal(response.status, 401, "The running server recognizes the route and requires authentication rather than returning 404.");
+    assert.equal(calls.length, 0);
+
+    response = await fetch(`${endpoint}/api/platform/test-practice-matches`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-test-session": "super-admin", "Idempotency-Key": "123e4567-e89b-42d3-a456-426614174099" },
+      body
+    });
+    assert.equal(response.status, 201);
+    assert.equal((await response.json()).match.testOnly, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].actorId, "super-admin");
+    assert.equal(calls[0].options.testOnly, true);
+  } finally {
+    await shutDown();
+  }
+});
+
 test("Match Centre renders controls only from server-granted match permissions", async () => {
   const matchScript = await readFile(new URL("../match.js", import.meta.url), "utf8");
   const matchStoreScript = await readFile(new URL("./match-store.js", import.meta.url), "utf8");
+  const serverScript = await readFile(new URL("./server.js", import.meta.url), "utf8");
   const stylesheet = await readFile(new URL("../styles.css", import.meta.url), "utf8");
+  const matchPageHtml = await readFile(new URL("../match.html", import.meta.url), "utf8");
+  const scoreboardHeader = matchScript.match(/function buildCardHeader\([\s\S]*?return header;\n  \}/)?.[0] || "";
+  assert.ok(scoreboardHeader, "The detailed match header renderer is present.");
   assert.match(matchScript, /permissions\.canFinalize\s*===\s*true\s*&&\s*confirmed\.length\s*===\s*2/,
     "The finalization control requires both server authorization and two confirmed sides.");
   assert.match(matchScript, /const canManagePlayers\s*=\s*permissions\.canScore\s*===\s*true\s*&&\s*match\.status\s*===\s*"in_progress"\s*&&\s*frame\.status\s*!==\s*"completed"/,
     "Authorized match scorers can manage any unfinished frame after the match starts.");
-  assert.match(matchScript, /const canEditFrameResult\s*=\s*canScore\s*&&\s*\(isCurrent\s*\|\|\s*frame\.status\s*===\s*"completed"\)/,
-    "Upcoming frame result forms are withheld until the frame is current; authorized completed-frame corrections remain available while live.");
-  assert.match(matchScript, /if\s*\(canEditFrameResult\)\s*\{[\s\S]*?score-frame-result-form/,
-    "Frame result and Dish controls are rendered only when the server grants scoring permission.");
+  assert.match(matchScript, /permissions\.canScore\s*===\s*true\s*&&\s*match\.status\s*===\s*"in_progress"/,
+    "Score controls are rendered only for active matches and server-authorized participants.");
+  assert.match(matchScript, /isAutomaticSinglesMatch\(match, frame\)/);
+  assert.match(matchScript, /\["singles_league", "tournament_flyer", "practice", "money_match"\]\.includes\(match\.type\)/,
+    "Singles-format tournament matches also use their registered participants automatically.");
+  assert.match(matchScript, /if\s*\(canManagePlayers\s*&&\s*!isAutoSingles\)/,
+    "Manual frame-player selection is retained for team formats and omitted for standalone Singles matches.");
+  assert.match(matchScript, /setFramePlayers\(match, frame, targetSide, \[eligible\[0\]\.userId\]\)/,
+    "Singles frame slots are populated from the two registered match participants.");
+  assert.match(matchScript, /scoreFrameForSide\s*=\s*\(side\)/);
+  assert.match(matchScript, /winnerSide:\s*outcome\s*===\s*"played"\s*\?\s*side/,
+    "The plus control records a frame result through the authoritative result endpoint.");
+  assert.match(matchScript, /Retract the latest played frame awarded to/);
+  assert.match(matchScript, /method:\s*"DELETE"/,
+    "The minus control retracts a frame through an authenticated, audited endpoint instead of decrementing totals.");
+  assert.match(serverScript, /app\.delete\("\/api\/matches\/:matchId\/frames\/:frameNumber\/result"/,
+    "The frame result retraction endpoint is mounted on the API.");
+  assert.match(matchStoreScript, /async retractFrameResult\([\s\S]*?match\.status !== "in_progress"[\s\S]*?requireMatchOperator\(client, match, actorId, \["in_progress"\]\)[\s\S]*?set_config\('breakdish\.audit_action', 'frame_result_changed'/,
+    "The server store restricts audited retraction to in-progress matches and registered match operators.");
+  assert.match(matchStoreScript, /SET status = 'scheduled', outcome_type = NULL, winner_side = NULL/,
+    "Retraction reopens the frame and lets scoreboard totals continue to derive from frame records.");
+  assert.match(matchScript, /window\.confirm\(/,
+    "Score corrections require an explicit confirmation before the audited API mutation.");
+  assert.match(matchScript, /Completed frames ·/);
+  assert.match(matchScript, /Upcoming frames ·/);
+  assert.match(matchScript, /Save players/,
+    "Authorized Team match operators retain the existing saved roster workflow.");
+  assert.doesNotMatch(matchScript, /Frame winner/,
+    "The duplicate winner dropdown is removed; the side-specific plus action selects the frame winner.");
+  assert.match(matchScript, /Dish and Counter Dish are recorded with the frame result/);
+  assert.match(matchScript, /frame\.number\s*\+\s*"\/event"/,
+    "Dish and Counter Dish corrections continue using the existing authorized event route.");
+  assert.doesNotMatch(matchScript, /Record set|Set score/i,
+    "The frontend does not simulate unsupported set-scoring functionality.");
   assert.match(matchScript, /permissions\.canStart\s*===\s*true/,
     "Start Match is rendered only when the API grants start permission.");
   assert.match(matchScript, /permissions\.canRaiseDispute\s*===\s*true/,
@@ -234,10 +319,47 @@ test("Match Centre renders controls only from server-granted match permissions",
     "The public UI renders player names only when the API marks a frame selection visible.");
   assert.doesNotMatch(matchScript, /signedIn\s*&&\s*match\.status\s*===\s*"in_progress"/,
     "A signed-in session alone never grants scoreboard controls.");
-  assert.match(matchScript, /SCHEDULED · This match has not started yet/,
-    "Scheduled fixtures are clearly described as not started.");
+  assert.match(matchScript, /scheduled:\s*"Scheduled"/);
+  assert.match(scoreboardHeader, /displayMatchStatus\(match\.status\)/,
+    "Scheduled fixtures are clearly labelled in the scoreboard status row.");
   assert.match(matchScript, /TEST MATCH — EXCLUDED FROM STATISTICS/,
     "Authorized viewers receive a prominent test-only exclusion label.");
+  assert.match(matchScript, /page\.classList\.add\("has-match-detail"\)/,
+    "The compact scoreboard layout is scoped to an open match detail view.");
+  assert.doesNotMatch(scoreboardHeader, /matchLabel\(match\)/,
+    "The detailed scoreboard does not repeat the player-versus-player heading.");
+  assert.doesNotMatch(scoreboardHeader, /match-score-player-names/,
+    "Each registered singles player is named once beside their score.");
+  assert.match(scoreboardHeader, /match-scoreboard-labels/);
+  assert.match(scoreboardHeader, /if\s*\(timer\)\s*header\.append\(timer\)/,
+    "The elapsed timer is a centered scoreboard row, separate from category and status.");
+  assert.match(matchScript, /isAutomaticSinglesMatch\(match, frame\)\s*&&\s*frame\.status\s*!==\s*"completed"[\s\S]*?sideName\(match, 1\)\s*\+\s*" · "\s*\+\s*sideName\(match, 2\)/,
+    "Current and upcoming automatic Singles frames use their registered participants without selector messages.");
+  assert.match(matchScript, /score-frame-history-row/);
+  assert.match(matchScript, /score-frame-history-number/);
+  assert.match(matchScript, /score-frame-history-event/,
+    "Completed frames render as compact winner/event summaries with expandable details.");
+  assert.match(matchPageHtml, /<meta name="breakdish-api-url" content="https:\/\/api\.break-dish\.com">/,
+    "The tracked Match Centre page is configured for the production API origin.");
+  assert.match(matchPageHtml, /<script src="script\.js" defer><\/script>/);
+  assert.match(matchPageHtml, /<script src="match\.js" defer><\/script>/);
+  assert.match(matchPageHtml, /data-match-page/);
+  assert.match(matchPageHtml, /data-match-detail/,
+    "The actual Match Centre page contains the detail mount used by the real browser interface.");
+  assert.match(stylesheet, /\.match-main\.has-match-detail\s+\.match-hero/,
+    "The detail view hides its oversized introductory hero without affecting other pages.");
+  assert.match(stylesheet, /\.match-score-control\s*\{[^}]*color:\s*#fff/s,
+    "Score controls use explicit high-contrast text.");
+  assert.match(stylesheet, /\.match-score-control\.is-add\s*\{[^}]*background:\s*#087/s,
+    "The score addition action has a high-contrast green treatment.");
+  assert.match(stylesheet, /\.match-score-control\.is-correct\s*\{[^}]*background:\s*#9b/s,
+    "The correction action has a high-contrast red treatment.");
+  assert.match(stylesheet, /\.match-score-control\s*\{[^}]*min-height:\s*50px/s,
+    "The score controls meet the intended touch-target size.");
+  assert.match(stylesheet, /\.match-score-control:focus-visible\s*\{[^}]*outline:/s,
+    "Score controls provide a visible keyboard-focus indicator.");
+  assert.match(stylesheet, /@media\s*\(max-width:\s*760px\)[\s\S]*?match-score-summary/,
+    "Score controls adapt to tablet and mobile widths.");
   assert.match(stylesheet, /\.match-test-label\s*\{[^}]*background:[^}]*color:/s,
     "The test-only label has explicit contrast styling in the site palette.");
   assert.match(matchScript, /if\s*\(retractableSides\.length\)/,

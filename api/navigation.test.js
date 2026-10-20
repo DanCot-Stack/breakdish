@@ -62,7 +62,8 @@ test("signed-in navigation, filtered Match Centre and league management shortcut
   assert.match(matchScript, /previousMatches \? "View Match" : "Open scoreboard"/);
   assert.match(matchScript, /const isFinal = match\.status === "completed"/);
   assert.match(matchScript, /permissions\.canOperate !== true/);
-  assert.match(matchScript, /SCHEDULED · This match has not started yet/);
+  assert.match(matchScript, /scheduled: "Scheduled"/,
+    "Scheduled fixtures keep an explicit scheduled state in the Match Centre.");
   assert.match(matchScript, /\/api\/matches\/\$\{encodeURIComponent\(matchId\)\}/);
   assert.match(matchScript, /match\.startedAt/);
   assert.match(matchScript, /showModal\(\)/);
@@ -82,6 +83,7 @@ test("all site headers use the required navigation groups without Contact Us or 
   const pages = (await readdir(projectRoot)).filter((name) => name.endsWith(".html"));
   for (const name of pages) {
     const html = await readFile(join(projectRoot, name), "utf8");
+    if (/<meta name="breakdish-local-preview" content="true">/.test(html)) continue;
     const nav = html.match(/<nav id="primary-nav"[\s\S]*?<\/nav>/)?.[0];
     assert.ok(nav, `${name} must have the shared main navigation.`);
     assert.doesNotMatch(nav, /Contact Us|Log out|Log In|Sign Up/i, `${name} must not put contact or auth actions in the global navigation.`);

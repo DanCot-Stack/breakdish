@@ -1059,6 +1059,18 @@ function createApp({
     } catch (error) { return next(error); }
   });
 
+  app.delete("/api/matches/:matchId/frames/:frameNumber/result", matchMutationLimiter, async (req, res, next) => {
+    try {
+      if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
+      const frameNumber = parseFrameNumber(req.params.frameNumber);
+      if (!frameNumber) return res.status(400).json({ error: "Enter a valid frame number." });
+      const session = await matchSession(req);
+      if (!session) return res.status(401).json({ error: "Sign in to correct a frame result." });
+      const match = await (await matchStore()).retractFrameResult(req.params.matchId, frameNumber, session.user.id);
+      return res.json(match);
+    } catch (error) { return next(error); }
+  });
+
   app.put("/api/matches/:matchId/frames/:frameNumber/event", matchMutationLimiter, async (req, res, next) => {
     try {
       if (!isUuid(req.params.matchId)) return res.status(400).json({ error: "Enter a valid match ID." });
