@@ -92,6 +92,166 @@ test("match API keeps public reads available and requires an authenticated user 
   }
 });
 
+test("league and fixture format routes accept bounded Race-to frame patterns", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  const { createApp } = await import("./server.js");
+  const calls = [];
+  const store = {
+    async setLeagueFormat(leagueId, actorId, details) {
+      calls.push(["league", leagueId, actorId, details]);
+      return { raceTo: details.raceTo, framePattern: details.framePattern };
+    },
+    async setMatchFormat(matchId, actorId, details) {
+      calls.push(["match", matchId, actorId, details]);
+      return { match: { id: matchId, raceTo: details.raceTo } };
+    }
+  };
+  const auth = { api: { async getSession({ headers }) {
+    return headers.get("x-test-session") === "league-owner" ? { user: { id: "league-owner" } } : null;
+  } } };
+  const app = createApp({ getAuthInstance: async () => auth, getMatchStore: async () => store });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  const leagueId = "123e4567-e89b-42d3-a456-426614174001";
+  const matchId = "123e4567-e89b-42d3-a456-426614174002";
+  const request = (path, body) => fetch(`${endpoint}${path}`, {
+    method: "PUT",
+    headers: { origin: "http://localhost:5500", "content-type": "application/json", "x-test-session": "league-owner" },
+    body: JSON.stringify(body)
+  });
+  try {
+    const patternFormat = { name: "Maximum Race-to test", raceTo: 250, framePattern: [{ type: "singles" }] };
+    let response = await request(`/api/leagues/${leagueId}/match-format`, patternFormat);
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.deepEqual(calls.at(-1), ["league", leagueId, "league-owner", patternFormat]);
+
+    response = await request(`/api/matches/${matchId}/format`, patternFormat);
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.deepEqual(calls.at(-1), ["match", matchId, "league-owner", patternFormat]);
+
+    const maxLengthPattern = {
+      name: "Maximum bounded pattern", raceTo: 250,
+      framePattern: Array.from({ length: 99 }, () => ({ type: "singles" }))
+    };
+    response = await request(`/api/leagues/${leagueId}/match-format`, maxLengthPattern);
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal(calls.length, 3, "A 99-step pattern remains within the supported route limit.");
+
+    response = await request(`/api/leagues/${leagueId}/match-format`, {
+      name: "Overlong pattern", raceTo: 250,
+      framePattern: Array.from({ length: 100 }, () => ({ type: "singles" }))
+    });
+    assert.equal(response.status, 400);
+    assert.equal(calls.length, 3, "A pattern over the 99-step route limit never reaches the format store.");
+
+    response = await request(`/api/leagues/${leagueId}/match-format`, {
+      name: "Ambiguous pattern", raceTo: 3,
+      frames: Array.from({ length: 5 }, () => ({ type: "singles" })),
+      framePattern: [{ type: "singles" }]
+    });
+    assert.equal(response.status, 400);
+    assert.equal(calls.length, 3, "Requests cannot provide both exact frames and a repeating pattern.");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("match mutation rate limit still applies per client IP", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500,https://break-dish.com";
+  const { createApp } = await import("./server.js");
+  let createCalls = 0;
+  const match = { id: "123e4567-e89b-42d3-a456-426614174000", type: "practice", status: "scheduled" };
+  const store = {
+    async createMatch() {
+      createCalls += 1;
+      return { match };
+    }
+  };
+  const auth = { api: { async getSession({ headers }) {
+    return headers.get("x-test-session") === "player-1" ? { user: { id: "player-1" } } : null;
+  } } };
+  const app = createApp({ getAuthInstance: async () => auth, getMatchStore: async () => store });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const response = await fetch(`${endpoint}/api/matches`, {
+        method: "POST",
+        headers: {
+          origin: "http://localhost:5500",
+          "content-type": "application/json",
+          "x-test-session": "player-1",
+          "x-forwarded-for": "198.51.100.200"
+        },
+        body: JSON.stringify({ type: "practice" })
+      });
+      assert.equal(response.status, 201, `Request ${attempt + 1} should be within the per-IP limit.`);
+    }
+
+    const limited = await fetch(`${endpoint}/api/matches`, {
+      method: "POST",
+      headers: {
+        origin: "http://localhost:5500",
+        "content-type": "application/json",
+        "x-test-session": "player-1",
+        "x-forwarded-for": "198.51.100.200"
+      },
+      body: JSON.stringify({ type: "practice" })
+    });
+    assert.equal(limited.status, 429, "The 121st mutation from one client IP remains rate-limited.");
+    assert.match(await limited.text(), /too many scoreboard changes/i);
+    assert.equal(createCalls, 120, "Rate-limited requests must not reach match creation.");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("season and team mutation limiter still returns 429 after 60 requests from one connection", async () => {
+  process.env.ALLOWED_ORIGINS = "http://localhost:5500";
+  const { createApp } = await import("./server.js");
+  let createDivisionCalls = 0;
+  const store = {
+    async createDivision(seasonId, actorId, name) {
+      createDivisionCalls += 1;
+      return { id: "123e4567-e89b-42d3-a456-426614174009", seasonId, actorId, name };
+    }
+  };
+  const auth = { api: { async getSession({ headers }) {
+    return headers.get("x-test-session") === "league-owner" ? { user: { id: "league-owner" } } : null;
+  } } };
+  const app = createApp({ getAuthInstance: async () => auth, getCompetitionStore: async () => store });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  const seasonId = "123e4567-e89b-42d3-a456-426614174001";
+  try {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const response = await fetch(`${endpoint}/api/seasons/${seasonId}/divisions`, {
+        method: "POST",
+        headers: { origin: "http://localhost:5500", "content-type": "application/json", "x-test-session": "league-owner" },
+        body: JSON.stringify({ name: `Division ${attempt + 1}` })
+      });
+      assert.equal(response.status, 201, `Request ${attempt + 1} should be within the competition mutation limit.`);
+    }
+
+    const limited = await fetch(`${endpoint}/api/seasons/${seasonId}/divisions`, {
+      method: "POST",
+      headers: { origin: "http://localhost:5500", "content-type": "application/json", "x-test-session": "league-owner" },
+      body: JSON.stringify({ name: "Rate limited division" })
+    });
+    assert.equal(limited.status, 429, "The 61st season/team mutation from this connection remains rate-limited.");
+    assert.match(await limited.text(), /too many season or team changes/i);
+    assert.equal(createDivisionCalls, 60, "Rate-limited requests do not reach the competition store.");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("CORS preflight permits Idempotency-Key only for configured origins and retains credential support", async () => {
   process.env.ALLOWED_ORIGINS = "http://localhost:5500,https://break-dish.com";
   const { createApp } = await import("./server.js");

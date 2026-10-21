@@ -3,6 +3,7 @@ const page = document.querySelector("[data-match-page]");
 if (page) {
   const api = window.BreakDishApi;
   const status = page.querySelector("[data-match-status]");
+  if (status) status.tabIndex = -1;
   const list = page.querySelector("[data-match-list]");
   const detail = page.querySelector("[data-match-detail]");
   const title = page.querySelector("[data-match-page-title]");
@@ -184,6 +185,9 @@ if (page) {
       textElement("span", "match-category-tag", labels[match.type] || "Match"),
       textElement("span", "match-state-tag is-" + match.status, displayMatchStatus(match.status))
     );
+    if (Number.isInteger(match.raceTo)) {
+      labelsRow.append(textElement("span", "match-category-tag", "Race to " + match.raceTo));
+    }
     identity.append(labelsRow);
     if (context) identity.append(textElement("p", "match-list-meta", context));
     if (match.testOnly === true) {
@@ -217,8 +221,10 @@ if (page) {
       }
       score.append(team);
     }
-    score.append(textElement("small", "match-score-progress",
-      match.framesCompleted + " of " + match.framesTotal + " frames played · " + match.framesRemaining + " remaining"));
+    const progressText = Number.isInteger(match.raceTo)
+      ? `${match.framesCompleted} of ${match.framesTotal} possible frames · Race to ${match.raceTo}`
+      : match.framesCompleted + " of " + match.framesTotal + " frames played · " + match.framesRemaining + " remaining";
+    score.append(textElement("small", "match-score-progress", progressText));
     header.append(identity);
     if (timer) header.append(timer);
     header.append(score);
@@ -570,8 +576,6 @@ if (page) {
       history.append(textElement("summary", "", `Completed frames · ${completedFrames.length}`));
       const cards = textElement("div", "score-frame-list");
       for (const frame of completedFrames) {
-        const view = await buildFrameCard(frame, match, permissions, false);
-        view.element.classList.add("score-frame-history-detail");
         const row = textElement("details", "score-frame-history-row");
         const summary = document.createElement("summary");
         const winner = [1, 2].includes(Number(frame.winnerSide))
@@ -587,7 +591,19 @@ if (page) {
           textElement("span", "score-frame-history-winner", ["Draw", "Result pending"].includes(winner) ? winner : `${winner} won`),
           textElement("span", "score-frame-history-event", eventPlayer ? `${eventLabel} · ${eventPlayer}` : eventLabel)
         );
-        row.append(summary, view.element);
+        row.append(summary);
+        row.addEventListener("toggle", async () => {
+          if (!row.open || row.dataset.loaded === "true" || row.dataset.loading === "true") return;
+          row.dataset.loading = "true";
+          try {
+            const view = await buildFrameCard(frame, match, permissions, false);
+            view.element.classList.add("score-frame-history-detail");
+            row.append(view.element);
+            row.dataset.loaded = "true";
+          } finally {
+            delete row.dataset.loading;
+          }
+        });
         cards.append(row);
       }
       history.append(cards);
@@ -596,11 +612,15 @@ if (page) {
     const upcomingFrames = framesList.filter((frame) => frame.status !== "completed" && frame.number !== currentFrame?.number);
     if (upcomingFrames.length) {
       const upcoming = textElement("details", "score-frame-group is-upcoming");
+      const visibleUpcoming = upcomingFrames.slice(0, 10);
       upcoming.append(textElement("summary", "", `Upcoming frames · ${upcomingFrames.length}`));
       const cards = textElement("div", "score-frame-list");
-      for (const frame of upcomingFrames) {
+      for (const frame of visibleUpcoming) {
         const view = await buildFrameCard(frame, match, permissions, false);
         cards.append(view.element);
+      }
+      if (visibleUpcoming.length < upcomingFrames.length) {
+        cards.append(textElement("p", "match-read-only-note", `The next ${visibleUpcoming.length} frames are shown. Later frames will appear as the match progresses.`));
       }
       upcoming.append(cards);
       detail.append(upcoming);
@@ -759,6 +779,8 @@ if (page) {
   async function mutate(action, successMessage) {
     if (mutationPending) return false;
     mutationPending = true;
+    const scrollPosition = window.scrollY;
+    const focusedControlLabel = document.activeElement?.closest?.("button")?.getAttribute("aria-label") || null;
     const buttons = detail.querySelectorAll("button");
     buttons.forEach((button) => { button.disabled = true; });
     setStatus("Saving scoreboard update…", "pending");
@@ -768,6 +790,13 @@ if (page) {
       const id = new URLSearchParams(window.location.search).get("id");
       await loadMatch(id, { quiet: true });
       if (successMessage) setStatus(successMessage, "success");
+      const replacementControl = focusedControlLabel
+        ? Array.from(detail.querySelectorAll("button[aria-label]")).find((button) => button.getAttribute("aria-label") === focusedControlLabel && !button.disabled)
+        : null;
+      const focusTarget = replacementControl || status;
+      focusTarget?.focus?.({ preventScroll: true });
+      window.scrollTo(0, scrollPosition);
+      requestAnimationFrame(() => window.scrollTo(0, scrollPosition));
       return true;
     } catch (error) {
       setStatus(error instanceof TypeError ? "We couldn't reach the match service. Your changes were not confirmed." : error.message, "error");

@@ -316,7 +316,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       "SELECT user_id, assignment_type FROM platform_roles WHERE role = 'super_admin'"
     );
     assert.deepEqual(founderAssignmentBeforeUpgrade.rows, [{ user_id: superAdminUserId, assignment_type: "founder" }]);
-    await runLatestApplicationMigration("down", 2);
+    await runLatestApplicationMigration("down", 3);
     const founderAfterLegacySchema = await database.query("SELECT user_id FROM platform_roles WHERE role = 'super_admin'");
     assert.deepEqual(founderAfterLegacySchema.rows, [{ user_id: superAdminUserId }],
       "Rolling back 011 before any recovery grant keeps the original migration-010 founder assignment.");
@@ -408,6 +408,12 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const post012Permissions = await captureViewPermissionVerification("post", migrationApiTestRole);
     assert.equal(post012Permissions.success, true, "All required grants pass post-migration verification when restored.");
     assert.equal(post012Permissions.migrationRoleIsApiRole, false);
+    await runLatestApplicationMigration("up");
+    const raceToMigration = await database.query(
+      "SELECT name FROM breakdish_app_migrations ORDER BY run_on DESC, id DESC LIMIT 1"
+    );
+    assert.equal(raceToMigration.rows[0].name, "013_race_to_match_formats",
+      "The new additive Race-to migration is applied only after the existing 012 permission checks.");
 
     const founderAfterUpgrade = await database.query(
       "SELECT user_id, assignment_type FROM platform_roles WHERE role = 'super_admin'"
@@ -715,6 +721,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       "Founder audit history cannot be deleted."
     );
     await runLatestApplicationMigration("down");
+    await runLatestApplicationMigration("down");
     const migration011Rollback = runLatestApplicationMigration("down");
     await assert.rejects(
       migration011Rollback,
@@ -726,6 +733,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     );
     assert.match(latestMigration.rows[0].name, /^011_backup_super_admin$/,
       "A blocked 011 rollback leaves the tested role schema in place.");
+    await runLatestApplicationMigration("up");
     await runLatestApplicationMigration("up");
     const retainedRoleHistory = await database.query(
       "SELECT action, actor_user_id, reason FROM platform_role_events WHERE target_user_id=$1 AND role='platform_admin' ORDER BY created_at",
@@ -953,9 +961,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       body: JSON.stringify(body)
     });
     const signingTestIp = "203.0.113.77";
-    const signingPostJson = (path, sessionCookie, body) => fetchFromSite(path, {
+    const signingPostJson = (path, sessionCookie, body, clientIp = signingTestIp) => fetchFromSite(path, {
       method: "POST",
-      headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": signingTestIp },
+      headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": clientIp },
       body: JSON.stringify(body)
     });
     const signingPatchJson = (path, sessionCookie, body) => fetchFromSite(path, {
@@ -1409,13 +1417,39 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(competingSignings.filter((item) => item.status === 201).length, 1, "Concurrent signings to different teams serialize to one active registration.");
     assert.equal(competingSignings.filter((item) => item.status === 409).length, 1);
     const winningTeam = competingSignings[0].status === 201 ? concurrentTeamOne : concurrentTeamTwo;
+    const transferDestinations = [concurrentTeamOne, concurrentTeamTwo, concurrentTeamThree]
+      .filter((team) => team.id !== winningTeam.id);
+    assert.equal(transferDestinations.length, 2,
+      "The sequential transfer test must use two distinct destinations other than the initial signing team.");
     const racingTransfers = await Promise.all([
-      signingPostJson(`/api/teams/${concurrentTeamTwo.id === winningTeam.id ? concurrentTeamThree.id : concurrentTeamTwo.id}/transfers`, firstUserCookie, { userId: fifthProfile.userId }),
-      signingPostJson(`/api/teams/${concurrentTeamThree.id === winningTeam.id ? concurrentTeamTwo.id : concurrentTeamThree.id}/transfers`, firstUserCookie, { userId: fifthProfile.userId })
+      ...transferDestinations.map((team) =>
+        signingPostJson(`/api/teams/${team.id}/transfers`, firstUserCookie, { userId: fifthProfile.userId })
+      )
     ]);
     const racingTransferResults = await Promise.all(racingTransfers.map(async (item) => ({ status: item.status, body: await item.clone().text() })));
     assert.ok(racingTransfers.every((item) => item.status === 201),
       `Concurrent authorised transfers are serialized as sequential, non-overlapping history: ${JSON.stringify(racingTransferResults)}`);
+    const transferHistory = await database.query(
+      `SELECT team_id,signing_type,started_at,ended_at,end_event_type FROM team_registrations
+       WHERE league_id=$1 AND season_id=$2 AND user_id=$3 ORDER BY started_at,id`,
+      [approval.league.id, signingSeason.id, fifthProfile.userId]
+    );
+    assert.equal(transferHistory.rows.length, 3, "The initial signing and both transfers are recorded exactly once.");
+    assert.equal(new Set(transferHistory.rows.map(({ team_id }) => team_id)).size, 3,
+      "Each transfer history entry belongs to its distinct destination team.");
+    assert.deepEqual(transferHistory.rows.map(({ signing_type }) => signing_type), ["new_signing", "transfer", "transfer"]);
+    assert.equal(transferHistory.rows.slice(0, -1).every((registration, index) =>
+      registration.ended_at !== null && registration.end_event_type === "transferred_out" &&
+      registration.ended_at <= transferHistory.rows[index + 1].started_at
+    ), true, "Each prior registration ends no later than its successor begins.");
+    const transferEventCount = await database.query(
+      `SELECT count(*)::integer AS count FROM team_registration_events e
+       JOIN team_registrations r ON r.id=e.registration_id
+       WHERE r.league_id=$1 AND r.season_id=$2 AND r.user_id=$3`,
+      [approval.league.id, signingSeason.id, fifthProfile.userId]
+    );
+    assert.equal(transferEventCount.rows[0].count, 5,
+      "The initial signing and two transfers preserve one signed and one transfer-out audit event per operation.");
     const activeRegistration = await database.query(
       "SELECT team_id FROM team_registrations WHERE league_id=$1 AND season_id=$2 AND user_id=$3 AND ended_at IS NULL",
       [approval.league.id, signingSeason.id, fifthProfile.userId]
@@ -1443,16 +1477,31 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       "Draft seasons remain private to league managers.");
 
     // Match Engine Phase 1 uses only the disposable local PostgreSQL test database.
+    // The production mutation limiter is per client IP. Give this long-running
+    // integration flow deterministic TEST-NET identities so unrelated scenarios
+    // do not consume one another's rate-limit budget; server.test.js covers the
+    // actual per-IP limit separately.
+    const matchMutationTestNetworks = ["192.0.2", "198.51.100", "203.0.113"];
+    let matchMutationTestIpOrdinal = 0;
+    const nextMatchMutationTestIp = () => {
+      const networkIndex = Math.floor(matchMutationTestIpOrdinal / 254);
+      if (networkIndex >= matchMutationTestNetworks.length) {
+        throw new Error("The integration test exhausted its reserved mutation test identities.");
+      }
+      const hostOctet = (matchMutationTestIpOrdinal % 254) + 1;
+      matchMutationTestIpOrdinal += 1;
+      return `${matchMutationTestNetworks[networkIndex]}.${hostOctet}`;
+    };
     const matchPostJson = (path, sessionCookie, body, extraHeaders = {}) => fetchFromSite(path, {
-      method: "POST", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.141", ...extraHeaders },
+      method: "POST", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": nextMatchMutationTestIp(), ...extraHeaders },
       body: JSON.stringify(body)
     });
     const matchPutJson = (path, sessionCookie, body) => fetchFromSite(path, {
-      method: "PUT", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.142" },
+      method: "PUT", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": nextMatchMutationTestIp() },
       body: JSON.stringify(body)
     });
     const matchPatchJson = (path, sessionCookie, body) => fetchFromSite(path, {
-      method: "PATCH", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.143" },
+      method: "PATCH", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": nextMatchMutationTestIp() },
       body: JSON.stringify(body)
     });
     const matchSeasonResponse = await signingPostJson(`/api/leagues/${approval.league.id}/seasons`, firstUserCookie, {
@@ -1499,22 +1548,94 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     const formatV1Frames = ["singles", "singles", "doubles", "singles", "doubles"].map((type) => ({ type }));
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Match engine integration format v1", frames: formatV1Frames
+      name: "Invalid Race-to frame count", raceTo: 3, frames: formatV1Frames.slice(0, 3)
+    });
+    assert.equal(response.status, 400, "The API rejects a Race-to target unless the format has exactly 2N−1 possible frames.");
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Match engine integration format v1", raceTo: 3, frames: formatV1Frames
     });
     assert.equal(response.status, 200, await response.clone().text());
+    const savedRaceFormat = (await response.json()).format;
+    await assert.rejects(
+      database.query("UPDATE league_match_format_templates SET race_to=2 WHERE id=$1", [savedRaceFormat.id]),
+      (error) => error.code === "55000" && /published league match format versions are immutable/i.test(error.message),
+      "The existing database guard keeps a published format version immutable; Race-to changes require a new version."
+    );
+    const invalidDraftClient = await database.connect();
+    let invalidDraftGuardError;
+    try {
+      await invalidDraftClient.query("BEGIN");
+      const invalidDraft = await invalidDraftClient.query(
+        `INSERT INTO league_match_format_templates(league_id,version,name,race_to,created_by)
+         VALUES($1,$2,$3,$4,$5) RETURNING id`,
+        [approval.league.id, savedRaceFormat.version + 1, "Invalid unpublished draft", 3, firstUserId]
+      );
+      for (const [index, frame] of formatV1Frames.slice(0, 3).entries()) {
+        await invalidDraftClient.query(
+          `INSERT INTO league_match_format_template_frames(template_id,frame_number,frame_type)
+           VALUES($1,$2,$3)`,
+          [invalidDraft.rows[0].id, index + 1, frame.type]
+        );
+      }
+      try {
+        await invalidDraftClient.query("SET CONSTRAINTS ALL IMMEDIATE");
+      } catch (error) {
+        invalidDraftGuardError = error;
+      }
+      await invalidDraftClient.query("ROLLBACK");
+    } finally {
+      try { await invalidDraftClient.query("ROLLBACK"); } catch { /* Preserve the original test result. */ }
+      invalidDraftClient.release();
+    }
+    assert.equal(invalidDraftGuardError?.code, "23514",
+      "The deferred database guard rejects an unpublished Race-to draft with too few possible frames.");
+    assert.equal(invalidDraftGuardError?.constraint, "match_format_race_frame_count");
+    const unchangedRaceFormat = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
+    assert.equal((await unchangedRaceFormat.json()).format.raceTo, 3,
+      "Rejected direct mutation and rolled-back invalid draft both preserve the published saved format.");
+    const templateCountBeforeOverLimit = await database.query(
+      "SELECT count(*)::integer AS count FROM league_match_format_templates WHERE league_id=$1",
+      [approval.league.id]
+    );
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Rejected over-ceiling format", raceTo: 251, framePattern: [{ type: "singles" }]
+    });
+    assert.equal(response.status, 400, await response.clone().text());
+    assert.match((await response.json()).error, /Race-to target from 1 to 250/i);
+    const unchangedAfterOverLimit = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
+    assert.equal((await unchangedAfterOverLimit.json()).format.raceTo, 3,
+      "The API rejects Race to 251 before changing the published default.");
+    const templateCountAfterOverLimit = await database.query(
+      "SELECT count(*)::integer AS count FROM league_match_format_templates WHERE league_id=$1",
+      [approval.league.id]
+    );
+    assert.deepEqual(templateCountAfterOverLimit.rows, templateCountBeforeOverLimit.rows,
+      "An API target above the per-match frame ceiling creates no format template.");
+    await assert.rejects(
+      database.query(
+        `INSERT INTO league_match_format_templates(league_id,version,name,race_to,created_by)
+         VALUES($1,$2,$3,$4,$5)`,
+        [approval.league.id, savedRaceFormat.version + 1, "Direct database over-ceiling format", 251, firstUserId]
+      ),
+      (error) => error.code === "23514" && error.constraint === "match_format_race_to_required",
+      "The database itself rejects a direct Race-to target above 250."
+    );
 
     const roundRobinPostJson = (path, sessionCookie, body) => fetchFromSite(path, {
       method: "POST", headers: { cookie: sessionCookie, "content-type": "application/json", "x-forwarded-for": "203.0.113.244" },
       body: JSON.stringify(body)
     });
+    // Keep this fixture-setup workflow in its own synthetic test IP bucket.
+    // It does not change production proxy/IP handling or any rate-limit value.
+    const roundRobinMutationTestIp = "203.0.113.78";
     const rrPath = `/api/leagues/${approval.league.id}/seasons`;
     const rrSeasonResponse = await signingPostJson(rrPath, firstUserCookie, {
       name: `Round Robin ${crypto.randomUUID()}`, startsOn: tomorrow, endsOn: "2027-10-13"
-    });
+    }, roundRobinMutationTestIp);
     assert.equal(rrSeasonResponse.status, 201, await rrSeasonResponse.clone().text());
     const rrSeason = (await rrSeasonResponse.json()).season;
     const createRoundRobinDivision = async (name) => {
-      const created = await signingPostJson(`/api/seasons/${rrSeason.id}/divisions`, firstUserCookie, { name });
+      const created = await signingPostJson(`/api/seasons/${rrSeason.id}/divisions`, firstUserCookie, { name }, roundRobinMutationTestIp);
       assert.equal(created.status, 201, await created.clone().text());
       return (await created.json()).division;
     };
@@ -1525,7 +1646,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const createRoundRobinTeam = async (divisionId, label, homeVenue) => {
       const created = await signingPostJson(`/api/seasons/${rrSeason.id}/teams`, firstUserCookie, {
         name: `${label} ${crypto.randomUUID()}`, divisionId, homeVenue
-      });
+      }, roundRobinMutationTestIp);
       assert.equal(created.status, 201, await created.clone().text());
       return (await created.json()).team;
     };
@@ -1627,6 +1748,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(rrPreview.rounds.reduce((sum, round) => sum + round.fixtures.length, 0), 10);
     assert.ok(rrPreview.rounds.every((round) => round.fixtures.length === 2 && round.bye));
     assert.equal(rrPreview.format.version, 1);
+    assert.equal(rrPreview.format.possibleFrames, 5, "Fixture previews report a compact possible-frame count rather than repeating every frame object.");
     assert.equal(rrPreview.rounds.flatMap((round) => round.fixtures).some((fixture) => !fixture.sideOne.id || !fixture.sideTwo.id), false,
       "A bye is shown separately and never creates a fake match.");
     let rrDatabaseCount = await database.query("SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND match_type='team_league'", [rrSeason.id]);
@@ -1869,7 +1991,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       "A fixture stores the exact league format revision and ordered frame snapshot.");
 
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Single-frame revision", frames: [{ type: "singles" }]
+      name: "Single-frame revision", raceTo: 1, frames: [{ type: "singles" }]
     });
     assert.equal(response.status, 200, await response.clone().text());
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
@@ -1889,7 +2011,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       [approval.league.id]
     );
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Restored mixed format", frames: formatV1Frames, applyToFuture: true
+      name: "Restored mixed format", raceTo: 3, frames: formatV1Frames, applyToFuture: true
     });
     assert.equal(response.status, 200, await response.clone().text());
     assert.equal((await response.json()).format.updatedMatches, expectedFutureFixtures.rows[0].count,
@@ -1910,33 +2032,76 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(changedMatch.match.venue, "Updated local venue");
     assert.equal(new Date(changedMatch.match.scheduledAt).toISOString(), changedSchedule);
 
-    const fixtureFrames = [{ type: "doubles" }, { type: "singles" }];
+    const fixtureFrames = [{ type: "doubles" }, { type: "singles" }, { type: "singles" }];
+    const versionBeforeOneOffFormat = await database.query(
+      "SELECT coalesce(max(version), 0)::integer AS version FROM league_match_format_templates WHERE league_id=$1",
+      [approval.league.id]
+    );
+    const expectedOneOffFormatVersion = versionBeforeOneOffFormat.rows[0].version + 1;
     response = await matchPutJson(`/api/matches/${untouchedFutureMatch.id}/format`, thirdUserCookie, {
-      name: "Unauthorised fixture format", frames: fixtureFrames
+      name: "Unauthorised fixture format", raceTo: 2, frames: fixtureFrames
     });
     assert.equal(response.status, 403, "An ordinary member cannot change a fixture format.");
     response = await matchPutJson(`/api/matches/${untouchedFutureMatch.id}/format`, firstUserCookie, {
-      name: "One-off fixture format", frames: fixtureFrames, makeDefault: false
+      name: "One-off fixture format", raceTo: 2, frames: fixtureFrames, makeDefault: false
     });
     assert.equal(response.status, 200, await response.clone().text());
     changedMatch = await response.json();
-    assert.deepEqual(changedMatch.frames.map((frame) => frame.type), ["doubles", "singles"]);
+    assert.equal(changedMatch.match.id, untouchedFutureMatch.id,
+      "The fixture-format response belongs only to the requested match.");
+    assert.deepEqual(changedMatch.frames.map((frame) => frame.type), fixtureFrames.map((frame) => frame.type),
+      "Race to 2 has three possible frames; the API returns the complete immutable match snapshot.");
+    assert.equal(changedMatch.match.raceTo, 2);
+    assert.equal(changedMatch.match.framesTotal, 3);
+    const oneOffSnapshot = await database.query(
+      `SELECT s.template_id AS format_id, s.template_version AS snapshot_version,
+         s.race_to AS snapshot_race_to, t.version AS template_version,
+         t.race_to AS template_race_to, sf.frame_number, sf.frame_type
+       FROM match_format_snapshots s
+       JOIN league_match_format_templates t ON t.id=s.template_id
+       JOIN match_format_snapshot_frames sf ON sf.snapshot_id=s.id
+       WHERE s.match_id=$1 ORDER BY sf.frame_number`,
+      [untouchedFutureMatch.id]
+    );
+    assert.equal(oneOffSnapshot.rows.length, 3);
+    assert.equal(new Set(oneOffSnapshot.rows.map((row) => row.format_id)).size, 1,
+      "All three returned frames belong to one format snapshot, not duplicate format records.");
+    assert.equal(oneOffSnapshot.rows[0].snapshot_version, expectedOneOffFormatVersion);
+    assert.equal(oneOffSnapshot.rows[0].template_version, expectedOneOffFormatVersion);
+    assert.equal(oneOffSnapshot.rows[0].snapshot_race_to, 2);
+    assert.equal(oneOffSnapshot.rows[0].template_race_to, 2);
+    assert.ok(oneOffSnapshot.rows.every((row) =>
+      row.snapshot_version === expectedOneOffFormatVersion && row.template_version === expectedOneOffFormatVersion &&
+      row.snapshot_race_to === 2 && row.template_race_to === 2
+    ));
+    assert.deepEqual(oneOffSnapshot.rows.map(({ frame_number, frame_type }) => ({ number: frame_number, type: frame_type })),
+      fixtureFrames.map((frame, index) => ({ number: index + 1, type: frame.type })));
     response = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
-    assert.deepEqual((await response.json()).format.frames.map((frame) => frame.type), formatV1Frames.map((frame) => frame.type),
-      "A match-only edit leaves the league default unchanged.");
+    let currentLeagueFormat = (await response.json()).format;
+    assert.deepEqual(currentLeagueFormat.frames.map((frame) => frame.type), formatV1Frames.map((frame) => frame.type),
+      "A match-only edit leaves the league default version unchanged.");
+    assert.equal(currentLeagueFormat.raceTo, 3);
+    assert.equal(currentLeagueFormat.version, expectedOneOffFormatVersion - 1);
     response = await matchPutJson(`/api/matches/${untouchedFutureMatch.id}/format`, firstUserCookie, {
-      name: "Default from fixture edit", frames: fixtureFrames, makeDefault: true
+      name: "Default from fixture edit", raceTo: 2, frames: fixtureFrames, makeDefault: true
     });
     assert.equal(response.status, 200, await response.clone().text());
     response = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
-    assert.deepEqual((await response.json()).format.frames.map((frame) => frame.type), fixtureFrames.map((frame) => frame.type),
+    currentLeagueFormat = (await response.json()).format;
+    assert.deepEqual(currentLeagueFormat.frames.map((frame) => frame.type), fixtureFrames.map((frame) => frame.type),
       "The optional make-default action updates the format for newly created fixtures.");
+    assert.equal(currentLeagueFormat.version, expectedOneOffFormatVersion + 1,
+      "Making the fixture format the league default creates a new immutable version instead of reusing the one-off version.");
+    assert.equal(currentLeagueFormat.raceTo, 2);
+    assert.notEqual(currentLeagueFormat.id, oneOffSnapshot.rows[0].format_id,
+      "The separately published default retains its own format identity.");
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Restore current league default", frames: formatV1Frames
+      name: "Restore current league default", raceTo: 3, frames: formatV1Frames
     });
     assert.equal(response.status, 200, await response.clone().text());
     const newDefaultMatch = await createTeamMatch();
     assert.equal(newDefaultMatch.framesTotal, formatV1Frames.length, "New fixtures snapshot the current league default.");
+    assert.equal(newDefaultMatch.raceTo, 3, "The restored league default publishes a new Race-to-3 format for later fixtures.");
 
     response = await fetchFromSite(`/api/matches?leagueId=${approval.league.id}`);
     assert.equal(response.status, 200, await response.clone().text());
@@ -2012,7 +2177,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.ok(!livePayload.matches.some((item) => item.id === untouchedFutureMatch.id), "Scheduled fixtures do not appear as live.");
     assert.ok(livePayload.matches.every((item) => item.status === "in_progress"), "The Live Matches endpoint returns only in-progress status.");
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/format`, firstUserCookie, {
-      name: "Too late", frames: [{ type: "singles" }]
+      name: "Too late", raceTo: 1, frames: [{ type: "singles" }]
     });
     assert.equal(response.status, 409, "Started match snapshots are locked.");
     response = await matchPatchJson(`/api/matches/${matchUnderTest.id}/schedule`, firstUserCookie, {
@@ -2022,7 +2187,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/cancel`, firstUserCookie, {});
     assert.equal(response.status, 409, "Started fixtures cannot be cancelled as unstarted fixtures.");
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Future fixtures only", frames: [{ type: "singles" }], applyToFuture: true
+      name: "Future fixtures only", raceTo: 1, frames: [{ type: "singles" }], applyToFuture: true
     });
     assert.equal(response.status, 200, await response.clone().text());
     response = await fetchFromSite(`/api/matches/${matchUnderTest.id}`);
@@ -2045,6 +2210,200 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
       assert.equal(result.status, 200, await result.clone().text());
       return result.json();
     };
+
+    const createRaceToThreePractice = async (label) => {
+      const created = await matchPostJson("/api/matches", firstUserCookie, {
+        type: "practice", raceTo: 3, formatName: label,
+        participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
+        frames: Array.from({ length: 5 }, () => ({ type: "singles" }))
+      });
+      assert.equal(created.status, 201, await created.clone().text());
+      const match = (await created.json()).match;
+      assert.equal(match.raceTo, 3);
+      assert.equal(match.framesTotal, 5);
+      const started = await matchPostJson(`/api/matches/${match.id}/start`, firstUserCookie, {});
+      assert.equal(started.status, 200, await started.clone().text());
+      const prematureConfirmation = await matchPostJson(`/api/matches/${match.id}/confirm`, firstUserCookie, { side: 1 });
+      assert.equal(prematureConfirmation.status, 409, "A Race-to result cannot be confirmed before the winning target is reached.");
+      const premature = await matchPostJson(`/api/matches/${match.id}/finalize`, firstUserCookie, {});
+      assert.equal(premature.status, 409, "A Race-to match cannot be finalized before reaching its target and entering confirmation.");
+      const unrelated = await matchPutJson(`/api/matches/${match.id}/frames/1/result`, fifthUserCookie, {
+        outcome: "played", winnerSide: 1
+      });
+      assert.equal(unrelated.status, 403, "An unrelated Platform Admin cannot score a private Race-to match.");
+      return match;
+    };
+
+    const enterRaceFrame = async (matchId, frameNumber, winnerSide) => {
+      await setFrameSideAs(matchId, frameNumber, 1, { players: [firstUserId] }, firstUserCookie);
+      await setFrameSideAs(matchId, frameNumber, 2, { players: [secondProfile.userId] }, secondUserCookie);
+      return recordFrame(matchId, frameNumber, { outcome: "played", winnerSide }, firstUserCookie);
+    };
+
+    const confirmAndFinalizeRace = async (matchId, score) => {
+      const detail = await fetchFromSite(`/api/matches/${matchId}`, { headers: { cookie: firstUserCookie } });
+      assert.equal(detail.status, 200);
+      const payload = await detail.json();
+      assert.equal(payload.match.status, "awaiting_confirmation");
+      assert.deepEqual([payload.match.homeScore, payload.match.awayScore], score);
+      await matchPostJson(`/api/matches/${matchId}/confirm`, firstUserCookie, { side: 1 })
+        .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+      await matchPostJson(`/api/matches/${matchId}/confirm`, secondUserCookie, { side: 2 })
+        .then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
+      const finalized = await matchPostJson(`/api/matches/${matchId}/finalize`, firstUserCookie, {});
+      assert.equal(finalized.status, 200, await finalized.clone().text());
+      assert.equal((await finalized.json()).match.status, "completed");
+    };
+
+    const raceThreeZero = await createRaceToThreePractice("Race to three — 3–0");
+    let scoreSnapshot = await enterRaceFrame(raceThreeZero.id, 1, 1);
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [1, 0]);
+    response = await fetchFromSite(`/api/matches/${raceThreeZero.id}/frames/1/result`, {
+      method: "DELETE", headers: { cookie: firstUserCookie }
+    });
+    assert.equal(response.status, 200, await response.clone().text(), "The authorised red-minus correction retracts the frame through the audited API.");
+    scoreSnapshot = await response.json();
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [0, 0], "Retraction recalculates the derived score without going negative.");
+    assert.equal(scoreSnapshot.match.status, "in_progress");
+    await enterRaceFrame(raceThreeZero.id, 1, 1);
+    const concurrentRaceResult = await Promise.all([
+      matchPutJson(`/api/matches/${raceThreeZero.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1 }),
+      matchPutJson(`/api/matches/${raceThreeZero.id}/frames/1/result`, firstUserCookie, { outcome: "played", winnerSide: 1 })
+    ]);
+    assert.deepEqual(concurrentRaceResult.map((item) => item.status), [200, 200], "Concurrent duplicate frame-result submissions are idempotent.");
+    const duplicateRaceAudit = await database.query(
+      "SELECT count(*)::integer AS count FROM match_audit_events WHERE match_id=$1 AND frame_number=1 AND action_type='frame_result_entered'",
+      [raceThreeZero.id]
+    );
+    assert.equal(duplicateRaceAudit.rows[0].count, 2, "Only the first recording and the post-retraction re-record are audited as new results.");
+    await enterRaceFrame(raceThreeZero.id, 2, 1);
+    scoreSnapshot = await enterRaceFrame(raceThreeZero.id, 3, 1);
+    assert.equal(scoreSnapshot.match.status, "awaiting_confirmation", "Race to 3 reaches confirmation at 3–0 without playing the two remaining frames.");
+    assert.equal(scoreSnapshot.match.framesCompleted, 3);
+    assert.equal(scoreSnapshot.match.framesRemaining, 2);
+    response = await matchPutJson(`/api/matches/${raceThreeZero.id}/frames/4/result`, firstUserCookie, { outcome: "played", winnerSide: 1 });
+    assert.equal(response.status, 409, "A frame cannot be scored after a side reaches the Race-to target.");
+    response = await matchPutJson(`/api/matches/${raceThreeZero.id}/frames/4/players`, firstUserCookie, {
+      side: 1, players: [firstUserId]
+    });
+    assert.equal(response.status, 409, "Player selections cannot be changed after the Race-to target closes the scoreboard.");
+    response = await matchPostJson(`/api/matches/${raceThreeZero.id}/disputes`, firstUserCookie, {
+      reason: "Verify a disputed correction below the Race-to target."
+    });
+    assert.equal(response.status, 201, await response.clone().text());
+    const targetDispute = await response.json();
+    assert.equal(targetDispute.match.status, "disputed");
+    await assert.rejects(
+      database.query("UPDATE matches SET status='in_progress' WHERE id=$1", [raceThreeZero.id]),
+      (error) => error.code === "23514" && error.constraint === "matches_status_transition",
+      "A direct status update cannot bypass the dispute resolver's transaction-scoped Race-to reopen authorization."
+    );
+    response = await matchPutJson(`/api/matches/${raceThreeZero.id}/frames/3/result`, firstUserCookie, {
+      outcome: "played", winnerSide: 2
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    scoreSnapshot = await response.json();
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [2, 1]);
+    assert.equal(scoreSnapshot.match.status, "disputed",
+      "A score correction remains inside the dispute and cannot silently resume the match.");
+    response = await matchPostJson(
+      `/api/matches/${raceThreeZero.id}/disputes/${targetDispute.disputes[0].id}/resolve`,
+      firstUserCookie,
+      { resolution: "The frame result was reviewed and corrected." }
+    );
+    assert.equal(response.status, 200, await response.clone().text());
+    scoreSnapshot = await response.json();
+    assert.equal(scoreSnapshot.match.status, "in_progress",
+      "Resolving a correction below target reopens a Race-to match for the remaining frames.");
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [2, 1]);
+    const replayFrameSelections = await database.query(
+      `SELECT side,slot_number,user_id FROM match_frame_players
+       WHERE match_id=$1 AND frame_number=3 ORDER BY side,slot_number`,
+      [raceThreeZero.id]
+    );
+    assert.deepEqual(replayFrameSelections.rows, [
+      { side: 1, slot_number: 1, user_id: firstUserId },
+      { side: 2, slot_number: 1, user_id: secondProfile.userId }
+    ], "The disputed completed frame retains its original eligible player selections.");
+    response = await matchPutJson(`/api/matches/${raceThreeZero.id}/frames/3/players`, firstUserCookie, {
+      side: 1, players: [secondProfile.userId]
+    });
+    assert.equal(response.status, 409,
+      "A corrected completed frame still cannot have its player selection changed without an authorised amendment.");
+    scoreSnapshot = await recordFrame(raceThreeZero.id, 3, { outcome: "played", winnerSide: 1 });
+    assert.equal(scoreSnapshot.match.status, "awaiting_confirmation");
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [3, 0]);
+    const replayFrameSelectionsAfter = await database.query(
+      `SELECT side,slot_number,user_id FROM match_frame_players
+       WHERE match_id=$1 AND frame_number=3 ORDER BY side,slot_number`,
+      [raceThreeZero.id]
+    );
+    assert.deepEqual(replayFrameSelectionsAfter.rows, replayFrameSelections.rows,
+      "Correcting the frame winner reuses the unchanged player selections.");
+    const targetCorrectionAudit = await database.query(
+      `SELECT action_type, count(*)::integer AS count FROM match_audit_events
+       WHERE match_id=$1 AND frame_number=3
+         AND action_type IN ('frame_result_entered','admin_amendment','frame_result_changed')
+       GROUP BY action_type`,
+      [raceThreeZero.id]
+    );
+    assert.deepEqual(Object.fromEntries(targetCorrectionAudit.rows.map((row) => [row.action_type, row.count])), {
+      frame_result_entered: 1, admin_amendment: 1, frame_result_changed: 1
+    }, "The initial result, disputed correction and replayed result remain separately retained in append-only audit history.");
+    await confirmAndFinalizeRace(raceThreeZero.id, [3, 0]);
+
+    const raceThreeOne = await createRaceToThreePractice("Race to three — 3–1");
+    await enterRaceFrame(raceThreeOne.id, 1, 1);
+    await enterRaceFrame(raceThreeOne.id, 2, 2);
+    await enterRaceFrame(raceThreeOne.id, 3, 1);
+    scoreSnapshot = await enterRaceFrame(raceThreeOne.id, 4, 1);
+    assert.equal(scoreSnapshot.match.status, "awaiting_confirmation", "Race to 3 reaches confirmation at 3–1.");
+    assert.equal(scoreSnapshot.match.framesCompleted, 4);
+    assert.equal(scoreSnapshot.match.framesRemaining, 1);
+    await confirmAndFinalizeRace(raceThreeOne.id, [3, 1]);
+
+    const raceThreeTwo = await createRaceToThreePractice("Race to three — corrected 3–2");
+    await enterRaceFrame(raceThreeTwo.id, 1, 1);
+    scoreSnapshot = await recordFrame(raceThreeTwo.id, 1, { outcome: "played", winnerSide: 2 }, secondUserCookie);
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [0, 1], "An authorised correction recalculates the score before the target is reached.");
+    await enterRaceFrame(raceThreeTwo.id, 2, 1);
+    await enterRaceFrame(raceThreeTwo.id, 3, 2);
+    scoreSnapshot = await recordFrame(raceThreeTwo.id, 1, { outcome: "played", winnerSide: 1 }, secondUserCookie);
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [2, 1],
+      "Correcting a frame result recalculates the current Race-to score from authoritative frame records.");
+    assert.equal(scoreSnapshot.match.status, "in_progress");
+    response = await matchPostJson(`/api/matches/${raceThreeTwo.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 409, "A 2–1 score in a Race to 3 remains in progress and cannot be finalized prematurely.");
+    const beforeTargetFinalize = await fetchFromSite(`/api/matches/${raceThreeTwo.id}`, { headers: { cookie: firstUserCookie } });
+    assert.equal((await beforeTargetFinalize.json()).match.status, "in_progress");
+    scoreSnapshot = await enterRaceFrame(raceThreeTwo.id, 4, 2);
+    assert.deepEqual([scoreSnapshot.match.homeScore, scoreSnapshot.match.awayScore], [2, 2],
+      "The fourth frame ties the corrected 2–1 score without reaching either side's target.");
+    assert.equal(scoreSnapshot.match.status, "in_progress",
+      "The scoreboard remains active at 2–2 so the fifth frame can be played.");
+    response = await matchPostJson(`/api/matches/${raceThreeTwo.id}/confirm`, firstUserCookie, { side: 1 });
+    assert.equal(response.status, 409, "A tied 2–2 Race-to score cannot be confirmed as a completed result.");
+    response = await matchPostJson(`/api/matches/${raceThreeTwo.id}/finalize`, firstUserCookie, {});
+    assert.equal(response.status, 409, "A tied 2–2 Race-to score cannot be finalized before a side reaches three.");
+    scoreSnapshot = await enterRaceFrame(raceThreeTwo.id, 5, 1);
+    assert.equal(scoreSnapshot.match.status, "awaiting_confirmation", "Race to 3 reaches confirmation at 3–2 after at most five frames.");
+    await confirmAndFinalizeRace(raceThreeTwo.id, [3, 2]);
+    const raceToPracticeStats = await database.query(
+      "SELECT matches_played,matches_won,dishes FROM practice_player_statistics WHERE user_id=$1",
+      [firstUserId]
+    );
+    assert.equal(Number(raceToPracticeStats.rows[0].matches_played), 3,
+      "The three completed Race-to Practice Matches contribute to practice statistics.");
+    assert.equal(Number(raceToPracticeStats.rows[0].matches_won), 3,
+      "Each finalized Race-to Practice Match records the winning player's match result once.");
+    assert.equal(Number(raceToPracticeStats.rows[0].dishes), 0,
+      "Race-to scenarios without a Dish event do not add Dish statistics.");
+
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Rejected legacy Best-of option", raceTo: 3, bestOf: 5, frames: formatV1Frames
+    });
+    assert.equal(response.status, 400, "The API rejects Best-of instead of silently treating it as Race-to.");
+
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/2/players`, "", { side: 1, bye: true, players: [] });
     assert.equal(response.status, 401, "Anonymous spectators cannot submit future-frame player selections.");
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/frames/2/players`, fifthUserCookie, { side: 1, bye: true, players: [] });
@@ -2318,7 +2677,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await matchPostJson(`/api/matches/${matchUnderTest.id}/cancel`, firstUserCookie, {});
     assert.equal(response.status, 409, "Completed matches cannot be cancelled.");
     response = await matchPutJson(`/api/matches/${matchUnderTest.id}/format`, firstUserCookie, {
-      name: "Completed change rejected", frames: [{ type: "singles" }]
+      name: "Completed change rejected", raceTo: 1, frames: [{ type: "singles" }]
     });
     assert.equal(response.status, 409, "Completed match format snapshots remain immutable.");
     const officialTeamStats = await database.query("SELECT matches_played, matches_won, matches_lost FROM official_competitive_player_statistics WHERE user_id=$1", [firstUserId]);
@@ -2330,7 +2689,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const tournamentEvent = (await response.json()).event;
     response = await matchPostJson("/api/matches", fifthUserCookie, {
       type: "tournament_flyer", tournamentEventId: tournamentEvent.id,
-      frames: [{ type: "doubles" }],
+      raceTo: 1, frames: [{ type: "doubles" }],
       participants: [
         { userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 1 },
         { userId: thirdProfile.userId, side: 2 }, { userId: fourthProfile.userId, side: 2 }
@@ -2398,9 +2757,9 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     });
     assert.equal(response.status, 403, "Only an active league owner or administrator can create a Doubles League fixture.");
 
-    const doublesFormat = [{ type: "doubles" }, { type: "singles" }];
+    const doublesFormat = [{ type: "doubles" }, { type: "singles" }, { type: "singles" }];
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Doubles League test format", frames: doublesFormat
+      name: "Doubles League test format", raceTo: 2, frames: doublesFormat
     });
     assert.equal(response.status, 200, await response.clone().text());
     const createDoublesFixture = (entryIds, cookie = firstUserCookie) => matchPostJson("/api/matches", cookie, {
@@ -2511,6 +2870,29 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     await setFrameSideAs(playingDoublesMatch.id, 2, 1, { players: [fifthProfile.userId] }, secondUserCookie);
     await setFrameSideAs(playingDoublesMatch.id, 2, 2, { players: [thirdProfile.userId] }, thirdUserCookie);
     await recordFrame(playingDoublesMatch.id, 2, { outcome: "played", winnerSide: 2 }, secondUserCookie);
+    response = await fetchFromSite(`/api/matches/${playingDoublesMatch.id}`, { headers: { cookie: secondUserCookie } });
+    assert.equal(response.status, 200);
+    let doublesMatchState = (await response.json()).match;
+    assert.equal(doublesMatchState.status, "in_progress");
+    assert.deepEqual([doublesMatchState.homeScore, doublesMatchState.awayScore], [1, 1]);
+    assert.equal(doublesMatchState.framesCompleted, 2);
+    assert.equal(doublesMatchState.framesRemaining, 1,
+      "A tied Race-to-2 Doubles match remains active with its third possible frame unplayed.");
+    response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, secondUserCookie, {});
+    assert.equal(response.status, 409,
+      "A tied 1–1 Race-to-2 result cannot be confirmed before either side reaches two frame wins.");
+    const prematureDoublesConfirmations = await database.query(
+      "SELECT count(*)::integer AS count FROM match_confirmations WHERE match_id=$1", [playingDoublesMatch.id]
+    );
+    assert.equal(prematureDoublesConfirmations.rows[0].count, 0,
+      "Rejected premature confirmation does not create a confirmation event.");
+    await setFrameSideAs(playingDoublesMatch.id, 3, 1, { players: [secondProfile.userId] }, secondUserCookie);
+    await setFrameSideAs(playingDoublesMatch.id, 3, 2, { players: [thirdProfile.userId] }, thirdUserCookie);
+    const doublesRaceResult = await recordFrame(playingDoublesMatch.id, 3, { outcome: "played", winnerSide: 1 }, secondUserCookie);
+    assert.equal(doublesRaceResult.match.status, "awaiting_confirmation");
+    assert.deepEqual([doublesRaceResult.match.homeScore, doublesRaceResult.match.awayScore], [2, 1]);
+    assert.equal(doublesRaceResult.match.framesCompleted, 3);
+    assert.equal(doublesRaceResult.match.framesRemaining, 0);
     await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, secondUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     await matchPostJson(`/api/matches/${playingDoublesMatch.id}/confirm`, thirdUserCookie, {}).then(async (item) => assert.equal(item.status, 200, await item.clone().text()));
     response = await matchPostJson(`/api/matches/${playingDoublesMatch.id}/finalize`, firstUserCookie, {});
@@ -2527,7 +2909,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(response.status, 409, "Completed Doubles League fixtures cannot be cancelled.");
 
     response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
-      name: "Single-frame dispute test", frames: [{ type: "singles" }]
+      name: "Single-frame dispute test", raceTo: 1, frames: [{ type: "singles" }]
     });
     assert.equal(response.status, 200, await response.clone().text());
     response = await matchPostJson("/api/matches", firstUserCookie, {
@@ -2632,7 +3014,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "money_match", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
-      frames: [{ type: "singles" }],
+      raceTo: 1, frames: [{ type: "singles" }],
       moneyTerms: { wagerAmount: 5, adminUserId: thirdProfile.userId }
     });
     assert.equal(response.status, 201, await response.clone().text());
@@ -2681,7 +3063,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
 
     response = await matchPostJson("/api/matches", firstUserCookie, {
       type: "practice", participants: [{ userId: firstUserId, side: 1 }, { userId: secondProfile.userId, side: 2 }],
-      frames: [{ type: "singles" }], formatName: "Friendly singles practice"
+      raceTo: 1, frames: [{ type: "singles" }], formatName: "Friendly singles practice"
     });
     assert.equal(response.status, 201, await response.clone().text());
     const practiceMatch = (await response.json()).match;
@@ -2711,12 +3093,13 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     response = await matchPostJson(`/api/matches/${practiceMatch.id}/finalize`, firstUserCookie, {});
     assert.equal(response.status, 200, await response.clone().text());
     const practiceStats = await database.query("SELECT matches_played,matches_won,dishes,practice_win_percentage FROM practice_player_statistics WHERE user_id=$1", [firstUserId]);
-    assert.equal(Number(practiceStats.rows[0].matches_played), 1);
-    assert.equal(Number(practiceStats.rows[0].matches_won), 1);
+    assert.equal(Number(practiceStats.rows[0].matches_played), 4,
+      "The normal Practice Match adds to the three already-finalized Race-to Practice Matches.");
+    assert.equal(Number(practiceStats.rows[0].matches_won), 4);
     assert.equal(Number(practiceStats.rows[0].dishes), 1);
     assert.equal(Number(practiceStats.rows[0].practice_win_percentage), 100);
     const practiceCategoryStats = await database.query("SELECT is_official,matches_played FROM match_player_statistics WHERE user_id=$1 AND match_type='practice'", [firstUserId]);
-    assert.deepEqual(practiceCategoryStats.rows[0], { is_official: false, matches_played: 1 });
+    assert.deepEqual(practiceCategoryStats.rows[0], { is_official: false, matches_played: 4 });
 
     const testPracticeParticipantCookies = await Promise.all([
       signUpPlayer("Profileless Test Participant One"),
@@ -2736,6 +3119,7 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     const testPracticeBody = {
       type: "practice",
       participants: [{ userId: testPracticeParticipants[0], side: 1 }, { userId: testPracticeParticipants[1], side: 2 }],
+      raceTo: 1,
       frames: [{ type: "singles" }],
       formatName: "Controlled Match Centre lifecycle test"
     };
@@ -3095,6 +3479,12 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     assert.equal(historicTeamResult.awayTeam, awayMatchTeam.name);
     assert.deepEqual([historicTeamResult.homeScore, historicTeamResult.awayScore], [2, 3]);
     assert.ok(historicTeamResult.completedAt, "Final results use the stored completion timestamp.");
+    const historicDoublesResult = historicMatches.find((item) => item.id === playingDoublesMatch.id);
+    assert.ok(historicDoublesResult, "The finalized Race-to Doubles result appears in historical competition records.");
+    assert.equal(historicDoublesResult.type, "doubles_league");
+    assert.deepEqual([historicDoublesResult.homeScore, historicDoublesResult.awayScore], [2, 1]);
+    assert.equal(historicDoublesResult.homeSideName, "Fifth Player / Second Player Updated");
+    assert.equal(historicDoublesResult.awaySideName, "Fourth Player / Third Player");
 
     const unrelatedSeasonResults = await fetchFromSite(
       `/api/historic-results/${approval.league.id}/seasons/${season.id}/matches`
@@ -3109,6 +3499,138 @@ test("Better Auth, league management and the Match Engine use PostgreSQL", {
     );
     assert.deepEqual(historicDataCountsAfter.rows[0], historicDataCountsBefore.rows[0],
       "Reading the historic results directory does not modify native match data.");
+
+    const largeRaceCreated = await matchPostJson("/api/matches", firstUserCookie, {
+      type: "practice",
+      raceTo: 250,
+      framePattern: [{ type: "singles" }],
+      formatName: "Large Race-to boundary verification",
+      participants: [
+        { userId: firstUserId, side: 1 },
+        { userId: secondProfile.userId, side: 2 }
+      ]
+    });
+    assert.equal(largeRaceCreated.status, 201, await largeRaceCreated.clone().text());
+    const largeRaceMatch = (await largeRaceCreated.json()).match;
+    assert.equal(largeRaceMatch.raceTo, 250);
+    assert.equal(largeRaceMatch.framesTotal, 499);
+    assert.equal(largeRaceMatch.status, "scheduled", "Large-target coverage creates but does not play the match.");
+    const largeRaceFormatRows = await database.query(
+      `SELECT s.race_to, count(sf.frame_number)::integer AS possible_frames,
+         min(sf.frame_number)::integer AS first_frame, max(sf.frame_number)::integer AS last_frame,
+         count(*) FILTER (WHERE sf.frame_type='singles')::integer AS singles_frames,
+         count(*) FILTER (WHERE sf.frame_type='doubles')::integer AS doubles_frames
+       FROM match_format_snapshots s
+       JOIN match_format_snapshot_frames sf ON sf.snapshot_id=s.id
+       WHERE s.match_id=$1 GROUP BY s.id`, [largeRaceMatch.id]
+    );
+    assert.deepEqual(largeRaceFormatRows.rows[0], {
+      race_to: 250, possible_frames: 499, first_frame: 1, last_frame: 499,
+      singles_frames: 499, doubles_frames: 0
+    }, "Race to 250 is the largest format under the 500-frame ceiling and expands without playing the frames.");
+
+    const futureFormatCandidates = await database.query(
+      `SELECT count(*)::integer AS count FROM matches m
+       JOIN match_format_snapshots s ON s.match_id=m.id
+       JOIN seasons sea ON sea.id=m.season_id
+       WHERE m.league_id=$1 AND m.status='scheduled' AND m.started_at IS NULL
+         AND sea.status <> 'completed' AND m.scheduled_at > now()
+         AND NOT EXISTS (SELECT 1 FROM match_frame_players fp WHERE fp.match_id=m.id)`,
+      [approval.league.id]
+    );
+    assert.ok(futureFormatCandidates.rows[0].count >= 20,
+      "At least 20 valid future fixtures plus their new template are available to exceed the workload guard at 499 frames each.");
+    assert.ok((futureFormatCandidates.rows[0].count + 1) * 499 > 10_000,
+      "The valid 1-step Race-to-250 pattern exceeds the 10,000-row operation limit including the template.");
+    const futureSnapshotStateQuery = `SELECT m.id AS match_id, s.id AS snapshot_id, s.template_id,
+        s.template_version, s.race_to,
+        array_agg(sf.frame_number::text || ':' || sf.frame_type ORDER BY sf.frame_number) AS frames
+      FROM matches m
+      JOIN match_format_snapshots s ON s.match_id=m.id
+      JOIN match_format_snapshot_frames sf ON sf.snapshot_id=s.id
+      JOIN seasons sea ON sea.id=m.season_id
+      WHERE m.league_id=$1 AND m.status='scheduled' AND m.started_at IS NULL
+        AND sea.status <> 'completed' AND m.scheduled_at > now()
+        AND NOT EXISTS (SELECT 1 FROM match_frame_players fp WHERE fp.match_id=m.id)
+      GROUP BY m.id, s.id ORDER BY m.id`;
+    const futureSnapshotStateBefore = await database.query(futureSnapshotStateQuery, [approval.league.id]);
+    const formatTemplateStateQuery = `SELECT t.id, t.version, t.name, t.race_to,
+        coalesce(array_agg(f.frame_number::text || ':' || f.frame_type ORDER BY f.frame_number)
+          FILTER (WHERE f.frame_number IS NOT NULL), ARRAY[]::text[]) AS frames
+      FROM league_match_format_templates t
+      LEFT JOIN league_match_format_template_frames f ON f.template_id=t.id
+      WHERE t.league_id=$1 GROUP BY t.id ORDER BY t.version, t.id`;
+    const formatTemplateStateBefore = await database.query(formatTemplateStateQuery, [approval.league.id]);
+    const publishedDefaultBeforeBulk = (await (await fetchFromSite(
+      `/api/leagues/${approval.league.id}/match-format`
+    )).json()).format;
+    assert.equal(publishedDefaultBeforeBulk.raceTo, 1,
+      "An earlier test intentionally changed the published default to Race to 1 for future fixtures.");
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "Rejected oversized future update", raceTo: 250,
+      framePattern: [{ type: "singles" }], applyToFuture: true
+    });
+    assert.equal(response.status, 400, await response.clone().text());
+    assert.match((await response.json()).error, /10000 possible-frame records/i,
+      "Applying a high Race-to format across too many fixtures is rejected before any snapshot is rewritten.");
+    const unchangedAfterBulkReject = await fetchFromSite(`/api/leagues/${approval.league.id}/match-format`);
+    assert.deepEqual((await unchangedAfterBulkReject.json()).format, publishedDefaultBeforeBulk,
+      "A rejected bulk update rolls back its candidate template and preserves the exact currently published default.");
+    const futureSnapshotStateAfter = await database.query(futureSnapshotStateQuery, [approval.league.id]);
+    assert.deepEqual(futureSnapshotStateAfter.rows, futureSnapshotStateBefore.rows,
+      "Rejected bulk application leaves every eligible fixture snapshot and ordered frame configuration unchanged.");
+    const formatTemplateStateAfter = await database.query(formatTemplateStateQuery, [approval.league.id]);
+    assert.deepEqual(formatTemplateStateAfter.rows, formatTemplateStateBefore.rows,
+      "Rejected bulk application preserves every saved format version and rolls back its candidate template.");
+
+    response = await matchPutJson(`/api/leagues/${approval.league.id}/match-format`, firstUserCookie, {
+      name: "High target round-robin budget test", raceTo: 250,
+      framePattern: [{ type: "singles" }], applyToFuture: false
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const largeRoundRobinFormat = (await response.json()).format;
+    const largeRoundRobinDivision = await createRoundRobinDivision("Race-to 250 workload guard");
+    const largeRoundRobinTeams = [];
+    for (let index = 1; index <= 7; index++) {
+      largeRoundRobinTeams.push(await createRoundRobinTeam(
+        largeRoundRobinDivision.id, `Large RR Team ${index}`, `Large RR Venue ${index}`
+      ));
+    }
+    const largeRoundRobinConfig = {
+      ...teamRoundRobin,
+      divisionId: largeRoundRobinDivision.id,
+      meetings: 1,
+      participantIds: largeRoundRobinTeams.map((team) => team.id)
+    };
+    const largeRoundRobinPreview = await roundRobinPostJson(
+      `/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/preview`,
+      firstUserCookie,
+      { ...largeRoundRobinConfig, formatVersion: largeRoundRobinFormat.version }
+    );
+    assert.equal(largeRoundRobinPreview.status, 200, await largeRoundRobinPreview.clone().text());
+    const largeRoundRobinPlan = (await largeRoundRobinPreview.json()).preview;
+    assert.equal(largeRoundRobinPlan.fixtureCount, 21,
+      "Seven registered test teams produce a valid, collision-free 21-fixture single round robin.");
+    assert.equal(largeRoundRobinPlan.format.possibleFrames, 499);
+    assert.equal(largeRoundRobinPlan.format.frames, undefined,
+      "A large fixture preview does not return thousands of expanded frame objects.");
+    const existingLargeSchedule = await database.query(
+      "SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND division_id=$2 AND match_type='team_league'",
+      [rrSeason.id, largeRoundRobinDivision.id]
+    );
+    const largeRoundRobinSave = await roundRobinPostJson(
+      `/api/leagues/${approval.league.id}/seasons/${rrSeason.id}/round-robin/save`,
+      firstUserCookie,
+      { ...largeRoundRobinConfig, formatVersion: largeRoundRobinFormat.version }
+    );
+    assert.equal(largeRoundRobinSave.status, 400, await largeRoundRobinSave.clone().text());
+    assert.match((await largeRoundRobinSave.json()).error, /10000 possible-frame records/i);
+    const scheduleAfterLargeReject = await database.query(
+      "SELECT count(*)::integer AS count FROM matches WHERE season_id=$1 AND division_id=$2 AND match_type='team_league'",
+      [rrSeason.id, largeRoundRobinDivision.id]
+    );
+    assert.deepEqual(scheduleAfterLargeReject.rows, existingLargeSchedule.rows,
+      "Rejected oversized round-robin generation leaves the existing schedule untouched and creates no partial matches.");
 
     response = await fetchFromSite("/api/auth/sign-out", {
       method: "POST", headers: { cookie: thirdUserCookie, "content-type": "application/json" }, body: "{}"

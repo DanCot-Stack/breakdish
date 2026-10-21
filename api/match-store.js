@@ -1,11 +1,11 @@
 import { LeagueStoreError } from "./league-store.js";
 import { generateRoundRobin, roundRobinFixtureCount, scheduledAtForRound } from "./round-robin.js";
+import { assertFormatFrameBudget, normalizeRaceFormat } from "./race-format.js";
 
 const MATCH_TYPES = new Set([
   "team_league", "singles_league", "doubles_league", "tournament_flyer", "money_match", "practice"
 ]);
 const MATCH_STATUSES = new Set(["scheduled", "in_progress", "awaiting_confirmation", "disputed", "completed", "cancelled"]);
-const FRAME_TYPES = new Set(["singles", "doubles"]);
 const ROUND_ROBIN_TYPES = new Set(["team_league", "singles_league", "doubles_league"]);
 const MAX_ROUND_ROBIN_FIXTURES = 500;
 
@@ -95,9 +95,10 @@ async function withReadOnlyTransaction(database, work) {
 
 async function requireMatch(client, matchId, lock = false) {
   const result = await client.query(
-    `SELECT m.*, sb.frames_total, sb.frames_completed, sb.frames_remaining,
+    `SELECT m.*, fs.race_to, sb.frames_total, sb.frames_completed, sb.frames_remaining,
        sb.home_score, sb.away_score, sb.winner_side
      FROM matches m JOIN match_scoreboard sb ON sb.match_id = m.id
+     LEFT JOIN match_format_snapshots fs ON fs.match_id = m.id
      WHERE m.id = $1 ${lock ? "FOR UPDATE OF m" : ""}`,
     [matchId]
   );
@@ -444,19 +445,23 @@ async function roundRobinParticipants(client, leagueId, seasonId, actorId, type,
 
 async function getLeagueRoundRobinFormat(client, leagueId) {
   const format = await client.query(
-    `SELECT t.id, t.version, t.name FROM league_match_format_defaults d
+    `SELECT t.id, t.version, t.name, t.race_to FROM league_match_format_defaults d
      JOIN league_match_format_templates t ON t.id = d.template_id WHERE d.league_id = $1`, [leagueId]
   );
   if (!format.rows[0]) throw new LeagueStoreError(409, "Configure a league match format before generating fixtures.");
+  if (format.rows[0].race_to == null) throw new LeagueStoreError(409, "Update the league format and set its Race-to target before generating new fixtures.");
+  const raceTo = Number(format.rows[0].race_to);
   const frames = await client.query(
     "SELECT frame_number, frame_type FROM league_match_format_template_frames WHERE template_id = $1 ORDER BY frame_number",
     [format.rows[0].id]
   );
   if (!frames.rows.length) throw new LeagueStoreError(409, "The league match format does not contain any frames.");
+  if (frames.rows.length !== (2 * raceTo - 1)) throw new LeagueStoreError(409, "The saved league format does not match its Race-to target. Update the format before generating fixtures.");
   return {
     id: format.rows[0].id,
     version: Number(format.rows[0].version),
     name: format.rows[0].name,
+    raceTo,
     frames: frames.rows.map((row) => ({ frameNumber: Number(row.frame_number), type: row.frame_type }))
   };
 }
@@ -491,7 +496,7 @@ function buildRoundRobinPlan(participants, config, format) {
     rounds,
     fixtures,
     byes: rounds.filter((round) => round.bye).map((round) => ({ roundNumber: round.roundNumber, participant: round.bye })),
-    format: { version: format.version, name: format.name, frames: format.frames }
+    format: { version: format.version, name: format.name, raceTo: format.raceTo, possibleFrames: format.frames.length }
   };
 }
 
@@ -580,21 +585,16 @@ async function insertRoundRobinMatch(client, actorId, leagueId, seasonId, type, 
     }
   }
   const snapshot = await client.query(
-    `INSERT INTO match_format_snapshots(match_id,template_id,template_version,name,created_by)
-     VALUES($1,$2,$3,$4,$5) RETURNING id`,
-    [matchId, format.id, format.version, format.name, actorId]
+    `INSERT INTO match_format_snapshots(match_id,template_id,template_version,name,race_to,created_by)
+     VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [matchId, format.id, format.version, format.name, format.raceTo, actorId]
   );
-  for (const frame of format.frames) {
-    await client.query(
-      "INSERT INTO match_format_snapshot_frames(snapshot_id,frame_number,frame_type) VALUES($1,$2,$3)",
-      [snapshot.rows[0].id, frame.frameNumber, frame.type]
-    );
-  }
+  await insertSnapshotFrames(client, snapshot.rows[0].id, format.frames);
   return {
     id: matchId, type, status: "scheduled", leagueId, seasonId, divisionId,
     homeTeamId, awayTeamId, homeSideName: fixture.sideOne.label, awaySideName: fixture.sideTwo.label,
     roundNumber: fixture.roundNumber, scheduledAt: fixture.scheduledAt, venue: fixture.venue,
-    formatVersion: format.version, formatName: format.name, frameCount: format.frames.length
+    formatVersion: format.version, formatName: format.name, raceTo: format.raceTo, frameCount: format.frames.length
   };
 }
 
@@ -658,6 +658,7 @@ function toMatch(row) {
     tournamentEventId: row.tournament_event_id,
     tournamentName: row.tournament_name ?? null,
     roundNumber: row.round_number == null ? null : Number(row.round_number),
+    raceTo: row.race_to == null ? null : Number(row.race_to),
     scheduledAt: row.scheduled_at,
     venue: row.venue,
     framesTotal: Number(row.frames_total || 0),
@@ -679,11 +680,12 @@ function toMatch(row) {
 
 async function matchWithDetails(client, matchId, viewerId = null) {
   const matchResult = await client.query(
-    `SELECT sb.*, m.round_number AS round_number, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
+    `SELECT sb.*, m.round_number AS round_number, fs.race_to, l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
        at.name AS away_team_name, te.name AS tournament_name,
        hp.display_names AS home_side_name, ap.display_names AS away_side_name
      FROM match_scoreboard sb
      JOIN matches m ON m.id = sb.match_id
+     LEFT JOIN match_format_snapshots fs ON fs.match_id = sb.match_id
      LEFT JOIN leagues l ON l.id = sb.league_id
      LEFT JOIN divisions d ON d.id = sb.division_id
      LEFT JOIN teams ht ON ht.id = sb.home_team_id
@@ -783,15 +785,26 @@ async function matchWithDetails(client, matchId, viewerId = null) {
   };
 }
 
-function validateFrames(frames) {
-  if (!Array.isArray(frames) || frames.length < 1 || frames.length > 99) {
-    invalid("Add between 1 and 99 ordered Singles or Doubles frames.");
+function raceFormatFromDetails(details) {
+  try {
+    return normalizeRaceFormat(details);
+  } catch (error) {
+    invalid(error.message);
   }
-  return frames.map((frame, index) => {
-    const type = frame?.type ?? frame?.frameType;
-    if (!FRAME_TYPES.has(type)) invalid(`Frame ${index + 1} must be Singles or Doubles.`);
-    return { frameNumber: index + 1, type };
-  });
+}
+
+function assertFrameMaterializationBudget(matchCount, framesPerMatch) {
+  try {
+    return assertFormatFrameBudget(matchCount, framesPerMatch);
+  } catch (error) {
+    invalid(error.message);
+  }
+}
+
+function rejectBestOf(details) {
+  if (Object.hasOwn(details, "bestOf")) {
+    invalid("Best-of is not supported. Configure the number of frame wins required to win the match.");
+  }
 }
 
 export function createMatchStore(database) {
@@ -923,12 +936,13 @@ export function createMatchStore(database) {
            ) current_frame ON true` : "";
         const limitClause = options.unlimited === true ? "" : "LIMIT 100";
         const result = await client.query(
-          `SELECT sb.*, m.round_number AS round_number, ${currentFrameSelect},
+          `SELECT sb.*, m.round_number AS round_number, fs.race_to, ${currentFrameSelect},
              l.name AS league_name, d.name AS division_name, ht.name AS home_team_name,
              at.name AS away_team_name, te.name AS tournament_name,
              hp.display_names AS home_side_name, ap.display_names AS away_side_name
            FROM match_scoreboard sb
            JOIN matches m ON m.id = sb.match_id
+           LEFT JOIN match_format_snapshots fs ON fs.match_id = sb.match_id
            LEFT JOIN leagues l ON l.id = sb.league_id
            LEFT JOIN divisions d ON d.id = sb.division_id
            LEFT JOIN teams ht ON ht.id = sb.home_team_id
@@ -1042,7 +1056,7 @@ export function createMatchStore(database) {
     async getLeagueFormat(leagueId) {
       return withTransaction(database, null, async (client) => {
         const result = await client.query(
-          `SELECT t.id, t.league_id, t.version, t.name, t.created_at
+          `SELECT t.id, t.league_id, t.version, t.name, t.race_to, t.created_at
            FROM league_match_format_defaults d
            JOIN league_match_format_templates t ON t.id = d.template_id
            WHERE d.league_id = $1`,
@@ -1057,6 +1071,7 @@ export function createMatchStore(database) {
         return {
           id: result.rows[0].id, leagueId: result.rows[0].league_id,
           version: Number(result.rows[0].version), name: result.rows[0].name,
+          raceTo: result.rows[0].race_to == null ? null : Number(result.rows[0].race_to),
           frames: frameRows.rows.map((frame) => ({ number: Number(frame.frame_number), type: frame.frame_type }))
         };
       });
@@ -1197,6 +1212,7 @@ export function createMatchStore(database) {
         const plan = buildRoundRobinPlan(participants, config, format);
         const fixtures = fixturesWithPreviewChanges(plan, config);
         if (!fixtures.length) invalid("Keep at least one fixture in the preview before saving.");
+        assertFrameMaterializationBudget(fixtures.length, format.frames.length);
         await assertNoExistingRoundRobinCollisions(client, leagueKey, seasonKey, config.divisionId, config.type, fixtures);
         const created = [];
         for (const fixture of fixtures) {
@@ -1216,8 +1232,9 @@ export function createMatchStore(database) {
     },
 
     async setLeagueFormat(leagueId, actorId, details) {
+      rejectBestOf(details);
       const name = typeof details.name === "string" && details.name.trim() ? details.name.trim().slice(0, 120) : "Standard league format";
-      const frames = validateFrames(details.frames);
+      const { frames, raceTo } = raceFormatFromDetails(details);
       return withTransaction(database, actorId, async (client) => {
         await requireLeagueManager(client, leagueId, actorId);
         const league = await client.query("SELECT id FROM leagues WHERE id = $1 FOR UPDATE", [leagueId]);
@@ -1225,16 +1242,11 @@ export function createMatchStore(database) {
         const latest = await client.query("SELECT coalesce(max(version), 0)::integer AS version FROM league_match_format_templates WHERE league_id = $1", [leagueId]);
         const version = Number(latest.rows[0].version) + 1;
         const inserted = await client.query(
-          `INSERT INTO league_match_format_templates(league_id, version, name, created_by)
-           VALUES($1, $2, $3, $4) RETURNING id`, [leagueId, version, name, actorId]
+          `INSERT INTO league_match_format_templates(league_id, version, name, race_to, created_by)
+           VALUES($1, $2, $3, $4, $5) RETURNING id`, [leagueId, version, name, raceTo, actorId]
         );
         const templateId = inserted.rows[0].id;
-        for (const frame of frames) {
-          await client.query(
-            "INSERT INTO league_match_format_template_frames(template_id, frame_number, frame_type) VALUES($1, $2, $3)",
-            [templateId, frame.frameNumber, frame.type]
-          );
-        }
+        await insertTemplateFrames(client, templateId, frames);
         await client.query(
           `INSERT INTO league_match_format_defaults(league_id, template_id, changed_by)
            VALUES($1, $2, $3)
@@ -1253,12 +1265,13 @@ export function createMatchStore(database) {
                AND NOT EXISTS (SELECT 1 FROM match_frame_players fp WHERE fp.match_id = m.id)
              FOR UPDATE OF m, s`, [leagueId]
           );
+          assertFrameMaterializationBudget(fixtures.rowCount + 1, frames.length); // include the new league template
           for (const fixture of fixtures.rows) {
-            await replaceSnapshotFrames(client, fixture.id, fixture.snapshot_id, templateId, version, name, actorId);
+            await replaceSnapshotFrames(client, fixture.id, fixture.snapshot_id, templateId, version, name, raceTo, actorId);
             updatedMatches++;
           }
         }
-        return { id: templateId, leagueId, version, name, frames: frames.map((frame) => ({ number: frame.frameNumber, type: frame.type })), updatedMatches };
+        return { id: templateId, leagueId, version, name, raceTo, frames: frames.map((frame) => ({ number: frame.frameNumber, type: frame.type })), updatedMatches };
       });
     },
 
@@ -1270,21 +1283,23 @@ export function createMatchStore(database) {
         }
         await assertFixtureSeasonEditable(client, match);
         const current = await client.query(
-          `SELECT t.id, t.version, t.name FROM league_match_format_defaults d
+          `SELECT t.id, t.version, t.name, t.race_to FROM league_match_format_defaults d
            JOIN league_match_format_templates t ON t.id = d.template_id WHERE d.league_id = $1`, [match.league_id]
         );
         if (!current.rows[0]) throw new LeagueStoreError(409, "This league has not configured a match format yet.");
+        if (current.rows[0].race_to == null) throw new LeagueStoreError(409, "Update the league format and set its Race-to target before applying it to a fixture.");
         const snapshot = await client.query("SELECT id FROM match_format_snapshots WHERE match_id = $1", [match.id]);
         if (!snapshot.rows[0]) throw new LeagueStoreError(409, "This fixture has no match-format snapshot.");
-        await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, current.rows[0].id, current.rows[0].version, current.rows[0].name, actorId);
+        await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, current.rows[0].id, current.rows[0].version, current.rows[0].name, Number(current.rows[0].race_to), actorId);
         return matchWithDetails(client, match.id, actorId);
       });
     },
 
     async setMatchFormat(matchId, actorId, details) {
+      rejectBestOf(details);
       const name = typeof details.name === "string" && details.name.trim()
         ? details.name.trim().slice(0, 120) : "Agreed match format";
-      const frames = validateFrames(details.frames);
+      const { frames, raceTo } = raceFormatFromDetails(details);
       return withTransaction(database, actorId, async (client) => {
         const match = await lockManagedLeagueMatch(client, matchId, actorId);
         if (!match.league_id || match.status !== "scheduled" || match.started_at) {
@@ -1296,16 +1311,11 @@ export function createMatchStore(database) {
         const latest = await client.query("SELECT coalesce(max(version), 0)::integer AS version FROM league_match_format_templates WHERE league_id = $1", [match.league_id]);
         const version = Number(latest.rows[0].version) + 1;
         const inserted = await client.query(
-          `INSERT INTO league_match_format_templates(league_id, version, name, created_by)
-           VALUES($1, $2, $3, $4) RETURNING id`, [match.league_id, version, name, actorId]
+          `INSERT INTO league_match_format_templates(league_id, version, name, race_to, created_by)
+           VALUES($1, $2, $3, $4, $5) RETURNING id`, [match.league_id, version, name, raceTo, actorId]
         );
         const templateId = inserted.rows[0].id;
-        for (const frame of frames) {
-          await client.query(
-            "INSERT INTO league_match_format_template_frames(template_id, frame_number, frame_type) VALUES($1, $2, $3)",
-            [templateId, frame.frameNumber, frame.type]
-          );
-        }
+        await insertTemplateFrames(client, templateId, frames);
         if (details.makeDefault === true) {
           await client.query(
             `INSERT INTO league_match_format_defaults(league_id, template_id, changed_by)
@@ -1316,7 +1326,7 @@ export function createMatchStore(database) {
         }
         const snapshot = await client.query("SELECT id FROM match_format_snapshots WHERE match_id = $1", [match.id]);
         if (!snapshot.rows[0]) throw new LeagueStoreError(409, "This fixture has no match-format snapshot.");
-        await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, templateId, version, name, actorId);
+        await replaceSnapshotFrames(client, match.id, snapshot.rows[0].id, templateId, version, name, raceTo, actorId);
         return matchWithDetails(client, match.id, actorId);
       });
     },
@@ -1353,6 +1363,7 @@ export function createMatchStore(database) {
 
     async createMatch(actorId, details, options = {}) {
       const type = details.type;
+      rejectBestOf(details);
       if (!MATCH_TYPES.has(type)) invalid("Choose a supported match category.");
       if (Object.hasOwn(details, "testOnly") || Object.hasOwn(details, "testRequestKey")) {
         invalid("Test-only matches must be created through the Super Admin test-practice endpoint.");
@@ -1388,6 +1399,7 @@ export function createMatchStore(database) {
         }
         let template = null;
         let frameList;
+        let raceTo;
         let doublesEntries = null;
 
         if (["team_league", "singles_league", "doubles_league"].includes(type)) {
@@ -1463,22 +1475,25 @@ export function createMatchStore(database) {
             if (!division.rows[0]) invalid("Choose a division from the selected season.");
           }
           const format = await client.query(
-            `SELECT t.id, t.version, t.name FROM league_match_format_defaults d
+            `SELECT t.id, t.version, t.name, t.race_to FROM league_match_format_defaults d
              JOIN league_match_format_templates t ON t.id = d.template_id WHERE d.league_id = $1`, [leagueId]
           );
           if (!format.rows[0]) throw new LeagueStoreError(409, "Configure a league match format before creating a fixture.");
           template = format.rows[0];
+          if (template.race_to == null) throw new LeagueStoreError(409, "Update the league format and set its Race-to target before creating new fixtures.");
+          raceTo = Number(template.race_to);
           const rows = await client.query("SELECT frame_number, frame_type FROM league_match_format_template_frames WHERE template_id = $1 ORDER BY frame_number", [template.id]);
           frameList = rows.rows.map((row) => ({ frameNumber: Number(row.frame_number), type: row.frame_type }));
           if (!frameList.length) throw new LeagueStoreError(409, "The league match format does not contain any frames.");
+          raceFormatFromDetails({ raceTo, frames: frameList });
         } else if (type === "tournament_flyer") {
           if (!tournamentEventId) invalid("Select a tournament or flyer event.");
           const event = await client.query("SELECT id, created_by FROM tournament_events WHERE id = $1 FOR UPDATE", [tournamentEventId]);
           if (!event.rows[0]) throw new LeagueStoreError(404, "This tournament or flyer could not be found.");
           if (event.rows[0].created_by !== actorId) throw new LeagueStoreError(403, "Only the tournament organiser can create matches for this event.");
-          frameList = validateFrames(details.frames);
+          ({ frames: frameList, raceTo } = raceFormatFromDetails(details));
         } else {
-          frameList = validateFrames(details.frames);
+          ({ frames: frameList, raceTo } = raceFormatFromDetails(details));
           if (type === "practice" || type === "money_match") {
             if (!Array.isArray(details.participants) || details.participants.length !== 2 || new Set(details.participants.map((p) => p.side)).size !== 2) {
               invalid("Record one registered player on each side before creating this match.");
@@ -1516,16 +1531,11 @@ export function createMatchStore(database) {
           }
         }
         const snapshot = await client.query(
-          `INSERT INTO match_format_snapshots(match_id, template_id, template_version, name, created_by)
-           VALUES($1,$2,$3,$4,$5) RETURNING id`,
-          [matchId, template?.id ?? null, template?.version ?? null, template?.name ?? String(details.formatName || "Agreed match format").slice(0, 120), actorId]
+          `INSERT INTO match_format_snapshots(match_id, template_id, template_version, name, race_to, created_by)
+           VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [matchId, template?.id ?? null, template?.version ?? null, template?.name ?? String(details.formatName || "Agreed match format").slice(0, 120), raceTo, actorId]
         );
-        for (const frame of frameList) {
-          await client.query(
-            "INSERT INTO match_format_snapshot_frames(snapshot_id, frame_number, frame_type) VALUES($1,$2,$3)",
-            [snapshot.rows[0].id, frame.frameNumber, frame.type]
-          );
-        }
+        await insertSnapshotFrames(client, snapshot.rows[0].id, frameList);
         if (Array.isArray(details.participants)) {
           for (const participant of details.participants) {
             const userId = typeof participant.userId === "string" ? participant.userId.trim() : "";
@@ -1980,13 +1990,32 @@ function cleanText(value, label) {
   return value.trim();
 }
 
-async function replaceSnapshotFrames(client, matchId, snapshotId, templateId, templateVersion, name, actorId) {
+async function replaceSnapshotFrames(client, matchId, snapshotId, templateId, templateVersion, name, raceTo, actorId) {
   await client.query("SELECT set_config('breakdish.audit_action', 'format_snapshot_changed', true)");
-  await client.query("UPDATE match_format_snapshots SET template_id=$2, template_version=$3, name=$4 WHERE match_id=$1", [matchId, templateId, templateVersion, name]);
+  await client.query("UPDATE match_format_snapshots SET template_id=$2, template_version=$3, name=$4, race_to=$5 WHERE match_id=$1", [matchId, templateId, templateVersion, name, raceTo]);
   await client.query("DELETE FROM match_format_snapshot_frames WHERE snapshot_id=$1", [snapshotId]);
-  const frames = await client.query("SELECT frame_number, frame_type FROM league_match_format_template_frames WHERE template_id=$1 ORDER BY frame_number", [templateId]);
-  if (!frames.rows.length) throw new LeagueStoreError(409, "The league match format does not contain any frames.");
-  for (const frame of frames.rows) {
-    await client.query("INSERT INTO match_format_snapshot_frames(snapshot_id, frame_number, frame_type) VALUES($1,$2,$3)", [snapshotId, frame.frame_number, frame.frame_type]);
-  }
+  const copied = await client.query(
+    `INSERT INTO match_format_snapshot_frames(snapshot_id, frame_number, frame_type)
+     SELECT $1, frame_number, frame_type FROM league_match_format_template_frames
+     WHERE template_id=$2 ORDER BY frame_number RETURNING frame_number`, [snapshotId, templateId]
+  );
+  if (!copied.rowCount) throw new LeagueStoreError(409, "The league match format does not contain any frames.");
+}
+
+async function insertTemplateFrames(client, templateId, frames) {
+  await client.query(
+    `INSERT INTO league_match_format_template_frames(template_id, frame_number, frame_type)
+     SELECT $1, input.frame_number, input.frame_type
+     FROM unnest($2::smallint[], $3::text[]) AS input(frame_number, frame_type)`,
+    [templateId, frames.map((frame) => frame.frameNumber), frames.map((frame) => frame.type)]
+  );
+}
+
+async function insertSnapshotFrames(client, snapshotId, frames) {
+  await client.query(
+    `INSERT INTO match_format_snapshot_frames(snapshot_id, frame_number, frame_type)
+     SELECT $1, input.frame_number, input.frame_type
+     FROM unnest($2::smallint[], $3::text[]) AS input(frame_number, frame_type)`,
+    [snapshotId, frames.map((frame) => frame.frameNumber), frames.map((frame) => frame.type)]
+  );
 }

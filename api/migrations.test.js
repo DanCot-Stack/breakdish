@@ -12,6 +12,7 @@ import * as fixtureRoundNumbersMigration from "./migrations/009_fixture_round_nu
 import * as platformRolesMigration from "./migrations/010_platform_roles.js";
 import * as backupSuperAdminMigration from "./migrations/011_backup_super_admin.js";
 import * as testOnlyPracticeMatchesMigration from "./migrations/012_test_only_practice_matches.js";
+import * as raceToMatchFormatsMigration from "./migrations/013_race_to_match_formats.js";
 
 test("initial schema migration defines profiles, league roles, statuses and automatic creator ownership", () => {
   const calls = [];
@@ -352,4 +353,41 @@ test("migration 012 protects immutable Super Admin-only test Practice Matches an
   assert.match(downSql, /Cannot roll back migration 012 while test-only match records exist/,
     "Rollback must retain test match records and their audit history.");
   assert.match(downSql, /CREATE VIEW match_scoreboard AS/);
+});
+
+test("migration 013 adds Race-to without inventing targets for legacy formats", () => {
+  const upCalls = [];
+  raceToMatchFormatsMigration.up(new Proxy({}, {
+    get: (_target, operation) => (...args) => upCalls.push({ operation, args })
+  }));
+
+  for (const table of ["league_match_format_templates", "match_format_snapshots"]) {
+    const added = upCalls.find(({ operation, args }) => operation === "addColumn" && args[0] === table);
+    assert.equal(added?.args[1].race_to?.type, "smallint");
+    assert.equal(added.args[1].race_to?.notNull, undefined,
+      "Legacy templates and snapshots remain NULL rather than receiving an invented target.");
+    const range = upCalls.find(({ operation, args }) => operation === "addConstraint" && args[0] === table);
+    assert.match(range.args[2].check, /race_to IS NULL OR race_to BETWEEN 1 AND 250/);
+  }
+
+  const sql = upCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(sql, /New match formats require a Race-to target/);
+  assert.match(sql, /match_format_race_frame_count/);
+  assert.match(sql, /2 \* target - 1/);
+  assert.match(sql, /Exactly one side must reach the configured Race-to target/);
+  assert.match(sql, /A Race-to match can reopen only when no side has reached its target/);
+  assert.match(sql, /coalesce\(current_setting\('breakdish\.allow_race_reopen', true\) = 'on', false\)/,
+    "A missing transaction-local reopen flag is an explicit denial, not SQL NULL.");
+  assert.match(sql, /CREATE OR REPLACE FUNCTION breakdish_auto_await_confirmation/);
+  assert.match(sql, /CREATE OR REPLACE FUNCTION breakdish_resolve_dispute/);
+  assert.match(sql, /New match formats require a Race-to target from 1 to 250 \(at most 499 possible frames\)/);
+  assert.match(sql, /CREATE CONSTRAINT TRIGGER match_frames_final_race_winner[\s\S]*DEFERRABLE INITIALLY DEFERRED/);
+
+  const downCalls = [];
+  raceToMatchFormatsMigration.down(new Proxy({}, {
+    get: (_target, operation) => (...args) => downCalls.push({ operation, args })
+  }));
+  const downSql = downCalls.filter(({ operation }) => operation === "sql").map(({ args }) => args[0]).join("\n");
+  assert.match(downSql, /Cannot roll back Race-to migration 013 after Race-to formats or match snapshots have been created/);
+  assert.match(downSql, /CREATE OR REPLACE FUNCTION breakdish_match_state_transition/);
 });

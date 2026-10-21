@@ -950,11 +950,28 @@ if (competitionPage) {
     ? match.homeTeam || match.homeSideName || "Home"
     : match.awayTeam || match.awaySideName || "Away";
 
+  const maxRaceTo = 250;
+  const maxFramePatternLength = 99;
+  const compactFramePattern = (frames) => {
+    const types = (Array.isArray(frames) ? frames : []).map((frame) => frame.type ?? frame.frameType);
+    if (!types.length) return [{ type: "singles" }];
+    for (let length = 1; length <= Math.min(maxFramePatternLength, types.length); length += 1) {
+      if (types.every((type, index) => type === types[index % length])) {
+        return types.slice(0, length).map((type) => ({ type }));
+      }
+    }
+    if (types.length > maxFramePatternLength) {
+      throw new Error("This long format has no supported compact repeating pattern and cannot be safely edited here.");
+    }
+    return types.map((type) => ({ type }));
+  };
+
   const createFrameEditor = (initialFrames = []) => {
     const list = createTextElement("div", "format-frame-list");
     const addFrame = (type = "singles") => {
+      if (list.children.length >= maxFramePatternLength) return false;
       const row = createTextElement("div", "format-frame-row");
-      const number = createTextElement("strong", "format-frame-number", `Frame ${list.children.length + 1}`);
+      const number = createTextElement("strong", "format-frame-number", `Pattern step ${list.children.length + 1}`);
       const field = createTextElement("label", "competition-field format-frame-type");
       field.append(createTextElement("span", "", "Frame type"));
       const select = document.createElement("select");
@@ -992,10 +1009,11 @@ if (competitionPage) {
       row.append(number, field, controls);
       list.append(row);
       updateNumbers();
+      return true;
     };
     const updateNumbers = () => {
       Array.from(list.children).forEach((row, index) => {
-        row.querySelector(".format-frame-number").textContent = `Frame ${index + 1}`;
+        row.querySelector(".format-frame-number").textContent = `Pattern step ${index + 1}`;
         row.querySelectorAll("button").forEach((button, buttonIndex) => {
           button.disabled = (buttonIndex === 0 && index === 0)
             || (buttonIndex === 1 && index === list.children.length - 1)
@@ -1003,7 +1021,7 @@ if (competitionPage) {
         });
       });
     };
-    (initialFrames.length ? initialFrames : [{ type: "singles" }]).forEach((frame) => addFrame(frame.type));
+    compactFramePattern(initialFrames).forEach((frame) => addFrame(frame.type));
     return { list, addFrame, getFrames: () => Array.from(list.querySelectorAll("[data-frame-type]")).map((select) => ({ type: select.value })) };
   };
 
@@ -1020,8 +1038,10 @@ if (competitionPage) {
       return panel;
     }
     if (current) {
-      const summary = current.frames.map((frame) => `${frame.number}. ${frame.type === "singles" ? "Singles" : "Doubles"}`).join(" · ");
-      panel.append(createTextElement("p", "management-help", `${current.name} · version ${current.version} · ${summary}`));
+      const pattern = compactFramePattern(current.frames);
+      const summary = pattern.map((frame, index) => `${index + 1}. ${frame.type === "singles" ? "Singles" : "Doubles"}`).join(" · ");
+      const raceSummary = current.raceTo == null ? " · legacy format; set Race-to before creating new fixtures" : ` · Race to ${current.raceTo}`;
+      panel.append(createTextElement("p", "management-help", `${current.name} · version ${current.version}${raceSummary} · frame pattern: ${summary}${current.frames.length > pattern.length ? ` · repeats to ${current.frames.length} possible frames` : ""}`));
     } else {
       panel.append(createTextElement("p", "management-help", "No match format has been configured. Set the ordered frame list before creating league fixtures."));
     }
@@ -1029,11 +1049,20 @@ if (competitionPage) {
 
     const form = makeForm("competition-form league-format-form", current ? "Create a new format version" : "Configure the first format");
     addField(form, "Format name", "name", "text", { value: current?.name || "League match format", maxLength: 120, required: true });
+    const raceToField = addField(form, "Race to (frames needed to win)", "raceTo", "number", {
+      value: current?.raceTo ?? "", min: 1, max: maxRaceTo, step: 1, required: true
+    });
+    form.append(createTextElement("p", "management-help", `Race to N means first to N frame wins. The frame-type pattern repeats to create exactly 2N−1 possible frames (up to ${2 * maxRaceTo - 1}). Choose up to ${maxFramePatternLength} pattern steps; existing snapshots change only when you explicitly apply the new format to eligible future fixtures.`));
     const editor = createFrameEditor(current?.frames || []);
     form.append(editor.list);
     const add = createTextElement("button", "button button-quiet button-compact", "Add a frame");
     add.type = "button";
-    add.addEventListener("click", () => editor.addFrame());
+    add.textContent = "Add pattern step";
+    add.disabled = editor.getFrames().length >= maxFramePatternLength;
+    add.addEventListener("click", () => {
+      editor.addFrame();
+      add.disabled = editor.getFrames().length >= maxFramePatternLength;
+    });
     form.append(add);
     addField(form, "When saving this default", "applyMode", "select", {
       choices: [["default", "Use for new fixtures only"], ["future", "Also update all eligible future, unplayed fixtures"]]
@@ -1041,11 +1070,13 @@ if (competitionPage) {
     form.append(createTextElement("p", "management-help", "Started and completed matches keep their existing snapshots. Future fixture updates apply only to scheduled matches without player selections."));
     form.append(makeButton(current ? "Save new format version" : "Save league format"), statusElement());
     wireForm(form, async (data) => {
-      const frames = editor.getFrames();
-      if (!frames.length || frames.length > 99) throw new Error("Add between 1 and 99 frames.");
+      const framePattern = editor.getFrames();
+      if (!framePattern.length || framePattern.length > maxFramePatternLength) throw new Error(`Add between 1 and ${maxFramePatternLength} frame pattern steps.`);
+      const raceTo = Number(raceToField.value);
+      if (!Number.isInteger(raceTo) || raceTo < 1 || raceTo > maxRaceTo) throw new Error(`Choose a whole Race-to target from 1 to ${maxRaceTo}.`);
       const result = await request(`/api/leagues/${encodeURIComponent(competition.league.id)}/match-format`, {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: data.get("name"), frames, applyToFuture: data.get("applyMode") === "future" })
+        body: JSON.stringify({ name: data.get("name"), raceTo, framePattern, applyToFuture: data.get("applyMode") === "future" })
       });
       return result;
     }, "League format saved. Existing started or completed match snapshots are unchanged.");
@@ -1527,7 +1558,7 @@ if (competitionPage) {
       latestRequest = requestBody;
       const summary = createTextElement("div", "round-robin-preview-summary");
       summary.append(createTextElement("h5", "", `${preview.fixtureCount} fixtures across ${preview.roundCount} rounds`),
-        createTextElement("p", "management-help", `Format snapshot: ${preview.format.name} · ${preview.format.frames.length} frames · format version ${preview.format.version}. Fixture weeks keep the selected UK local start time.`));
+        createTextElement("p", "management-help", `Format snapshot: ${preview.format.name} · Race to ${preview.format.raceTo} · up to ${preview.format.possibleFrames} frames · format version ${preview.format.version}. Fixture weeks keep the selected UK local start time.`));
       previewHost.append(summary);
       const editableRows = new Map();
       preview.rounds.forEach((round) => {
@@ -1668,11 +1699,19 @@ if (competitionPage) {
         const frames = (details.frames || []).map((frame) => ({ type: frame.type }));
         const form = makeForm("competition-form fixture-format-form", "Save a new fixture format version");
         addField(form, "Format name", "name", "text", { value: `Fixture format for ${formatFixtureDate(match.scheduledAt)}`, maxLength: 120, required: true });
+        const raceToField = addField(form, "Race to (frames needed to win)", "raceTo", "number", {
+          value: details.match?.raceTo ?? "", min: 1, max: maxRaceTo, step: 1, required: true
+        });
+        form.append(createTextElement("p", "management-help", `First to N frame wins takes the match. The pattern repeats to exactly 2N−1 possible frames, up to ${2 * maxRaceTo - 1}.`));
         const editor = createFrameEditor(frames);
         form.append(editor.list);
-        const add = createTextElement("button", "button button-quiet button-compact", "Add a frame");
+        const add = createTextElement("button", "button button-quiet button-compact", "Add pattern step");
         add.type = "button";
-        add.addEventListener("click", () => editor.addFrame());
+        add.disabled = editor.getFrames().length >= maxFramePatternLength;
+        add.addEventListener("click", () => {
+          editor.addFrame();
+          add.disabled = editor.getFrames().length >= maxFramePatternLength;
+        });
         form.append(add);
         const defaultLabel = createTextElement("label", "competition-inline-check");
         const makeDefault = document.createElement("input");
@@ -1682,11 +1721,13 @@ if (competitionPage) {
         form.append(defaultLabel, createTextElement("p", "management-help", "Leave unchecked to change this scheduled fixture only. Started and completed matches cannot be rewritten."));
         form.append(makeButton("Save fixture format"), statusElement());
         wireForm(form, async (data) => {
-          const nextFrames = editor.getFrames();
-          if (!nextFrames.length || nextFrames.length > 99) throw new Error("Add between 1 and 99 frames.");
+          const framePattern = editor.getFrames();
+          if (!framePattern.length || framePattern.length > maxFramePatternLength) throw new Error(`Add between 1 and ${maxFramePatternLength} frame pattern steps.`);
+          const raceTo = Number(raceToField.value);
+          if (!Number.isInteger(raceTo) || raceTo < 1 || raceTo > maxRaceTo) throw new Error(`Choose a whole Race-to target from 1 to ${maxRaceTo}.`);
           return request(`/api/matches/${encodeURIComponent(match.id)}/format`, {
             method: "PUT", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: data.get("name"), frames: nextFrames, makeDefault: data.has("makeDefault") })
+            body: JSON.stringify({ name: data.get("name"), raceTo, framePattern, makeDefault: data.has("makeDefault") })
           });
         }, "Fixture format saved. Other existing match snapshots are unchanged.");
         formatContent.replaceChildren(form);

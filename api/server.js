@@ -944,8 +944,8 @@ function createApp({
       const session = await matchSession(req);
       if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to set the match format." });
       const body = asRecord(req.body);
-      if (!Array.isArray(body.frames) || body.frames.length < 1 || body.frames.length > 99) {
-        return res.status(400).json({ error: "Add between 1 and 99 ordered Singles or Doubles frames." });
+      if (!hasBoundedFormatFrameInput(body)) {
+        return res.status(400).json({ error: "Provide 1–99 ordered Singles or Doubles frames or frame-pattern steps." });
       }
       const format = await (await matchStore()).setLeagueFormat(req.params.leagueId, session.user.id, body);
       return res.json({ format });
@@ -970,8 +970,8 @@ function createApp({
       const session = await matchSession(req);
       if (!session) return res.status(401).json({ error: "Sign in as a league owner or administrator to edit this fixture format." });
       const body = asRecord(req.body);
-      if (!Array.isArray(body.frames) || body.frames.length < 1 || body.frames.length > 99) {
-        return res.status(400).json({ error: "Add between 1 and 99 ordered Singles or Doubles frames." });
+      if (!hasBoundedFormatFrameInput(body)) {
+        return res.status(400).json({ error: "Provide 1–99 ordered Singles or Doubles frames or frame-pattern steps." });
       }
       const match = await (await matchStore()).setMatchFormat(req.params.matchId, session.user.id, body);
       return res.json(match);
@@ -1259,6 +1259,14 @@ function validateSigningReason(value) {
 
 function asRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function hasBoundedFormatFrameInput(details) {
+  const hasFrames = Object.hasOwn(details, "frames");
+  const hasPattern = Object.hasOwn(details, "framePattern");
+  if (hasFrames === hasPattern) return false;
+  const steps = hasPattern ? details.framePattern : details.frames;
+  return Array.isArray(steps) && steps.length >= 1 && steps.length <= 99;
 }
 
 function validateDateRange(startsOn, endsOn) {

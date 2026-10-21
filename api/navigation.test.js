@@ -68,6 +68,18 @@ test("signed-in navigation, filtered Match Centre and league management shortcut
   assert.match(matchScript, /match\.startedAt/);
   assert.match(matchScript, /showModal\(\)/);
   assert.match(matchScript, /setInterval\(refreshCurrentMatch, 4000\)/);
+  assert.match(matchScript, /const scrollPosition = window\.scrollY/,
+    "A scoreboard mutation captures the user's current reading position before rerendering.");
+  assert.match(matchScript, /focus\?\.\(\{ preventScroll: true \}\)/,
+    "Score result feedback restores keyboard focus without causing a browser scroll jump.");
+  assert.match(matchScript, /requestAnimationFrame\(\(\) => window\.scrollTo\(0, scrollPosition\)\)/,
+    "The Match Centre restores its position again after the rerender layout settles.");
+  assert.match(matchScript, /framesCompleted\} of \$\{match\.framesTotal\} possible frames · Race to \$\{match\.raceTo\}/,
+    "Race-to progress reports the maximum frame count without implying unplayed frames remain after the target is reached.");
+  assert.match(script, /const maxRaceTo = 250/,
+    "League and fixture format controls match the 500-possible-frame Race-to ceiling.");
+  assert.match(script, /framePattern/,
+    "Large formats use compact repeating frame patterns instead of thousands of manual frame controls.");
   assert.match(liveScript, /api\.request\("\/api\/matches\/live", \{ cache: "no-store" \}\)/);
   assert.match(liveScript, /setInterval\(refresh, 4000\)/);
   assert.match(liveScript, /match\.homeTeam \|\| match\.homeSideName/);

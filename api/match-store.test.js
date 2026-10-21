@@ -32,6 +32,7 @@ test("foreign-key failures log only SQLSTATE and a sanitized constraint name", a
   await assert.rejects(
     store.createMatch("synthetic-super-admin-id", {
       type: "practice",
+      raceTo: 1,
       participants: [
         { userId: "synthetic-player-a", side: 1 },
         { userId: "synthetic-player-b", side: 2 }
@@ -74,6 +75,7 @@ test("foreign-key diagnostic omits malformed constraint text", async (t) => {
 
   await assert.rejects(store.createMatch("synthetic-actor", {
     type: "practice",
+    raceTo: 1,
     participants: [
       { userId: "synthetic-player-a", side: 1 },
       { userId: "synthetic-player-b", side: 2 }
@@ -109,6 +111,7 @@ test("non-foreign-key database errors are not written to the diagnostic log", as
 
   await assert.rejects(store.createMatch("synthetic-actor", {
     type: "practice",
+    raceTo: 1,
     participants: [
       { userId: "synthetic-player-a", side: 1 },
       { userId: "synthetic-player-b", side: 2 }
